@@ -1,0 +1,63 @@
+{
+  "name": "@bworlds/launchkit",
+  "version": "0.2.0",
+  "description": "Monitoring and error capture SDK for AI-built apps",
+  "type": "module",
+  "main": "./dist/launchkit.js",
+  "module": "./dist/launchkit.js",
+  "browser": "./dist/launchkit.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "browser": "./dist/launchkit.js",
+      "import": "./dist/launchkit.js",
+      "require": "./dist/launchkit.cjs",
+      "default": "./dist/launchkit.js"
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "vite build && tsc --emitDeclarationOnly",
+    "lint": "eslint src --max-warnings=0",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "preact": "^10.25.4",
+    "rrweb": "^2.0.0-alpha.18",
+    "@eslint/js": "^9.28.0",
+    "@preact/preset-vite": "^2.9.4",
+    "@types/node": "^22.15.21",
+    "eslint": "^9.28.0",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.33.0",
+    "vite": "^6.3.5",
+    "vite-plugin-dts": "^4.5.4"
+  },
+  "peerDependencies": {},
+  "keywords": [
+    "launchkit",
+    "monitoring",
+    "error-tracking",
+    "heartbeat",
+    "bworlds",
+    "lovable",
+    "bolt",
+    "ai-builder"
+  ],
+  "author": "BWorlds",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vulk-corp/launchkit.git"
+  }
+}
