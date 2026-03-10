@@ -1,14 +1,6 @@
-/**
- * Error capture module: intercepts window.onerror and unhandledrejection
- * events, batches them, and sends to the BWORLDS API.
- *
- * Captures client-side JS errors only. Not a Sentry replacement.
- * Batch sends every 10 seconds or when queue hits 5 errors.
- */
-
 import { sendTelemetry } from './telemetry-sender';
 
-const BATCH_INTERVAL_MS = 10_000; // 10 seconds
+const BATCH_INTERVAL_MS = 10_000;
 const BATCH_SIZE_THRESHOLD = 5;
 
 interface CapturedError {
@@ -27,7 +19,6 @@ export function startErrorCapture(buildSlug: string): void {
   _installed = true;
   _buildSlug = buildSlug;
 
-  // Global error handler
   const originalOnError = window.onerror;
   window.onerror = (message, source, lineno, colno, error) => {
     enqueue({
@@ -41,7 +32,6 @@ export function startErrorCapture(buildSlug: string): void {
     return false;
   };
 
-  // Unhandled promise rejection handler
   window.addEventListener('unhandledrejection', (event) => {
     const reason = event.reason;
     enqueue({
@@ -51,7 +41,6 @@ export function startErrorCapture(buildSlug: string): void {
     });
   });
 
-  // Periodic flush
   _intervalId = setInterval(flush, BATCH_INTERVAL_MS);
 }
 
@@ -60,7 +49,8 @@ export function stopErrorCapture(): void {
     clearInterval(_intervalId);
     _intervalId = null;
   }
-  flush(); // Send remaining errors
+  flush();
+  _installed = false;
 }
 
 function enqueue(error: CapturedError): void {
@@ -70,11 +60,11 @@ function enqueue(error: CapturedError): void {
   }
 }
 
-async function flush(): Promise<void> {
+function flush(): void {
   if (_queue.length === 0 || !_buildSlug) return;
 
   const batch = _queue.splice(0);
-  await sendTelemetry('/api/telemetry/errors', {
+  sendTelemetry('/api/telemetry/errors', {
     buildSlug: _buildSlug,
     errors: batch,
   });

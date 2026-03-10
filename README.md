@@ -1,6 +1,6 @@
 # @bworlds/launchkit
 
-Monitoring and error capture SDK for AI-built apps. One line of code, two readiness checks pass.
+Monitoring SDK for AI-built apps. One line of code, two readiness checks pass.
 
 ## Install
 
@@ -18,7 +18,7 @@ init({ buildSlug: 'my-app' });
 
 That's it. The SDK will:
 - Send heartbeats every 5 minutes to confirm your app is alive
-- Capture uncaught JS errors (`window.onerror`, `unhandledrejection`) and report them
+- Capture uncaught JS errors and report them
 
 ## Lovable / Bolt
 
@@ -53,14 +53,10 @@ init({
 
 | Feature | How it works |
 |---------|-------------|
-| Heartbeat | `setInterval` sends `POST /api/telemetry/heartbeat` every 5 min |
+| Heartbeat | Sends `POST /api/telemetry/heartbeat` every 5 min |
 | Error capture | `window.onerror` + `unhandledrejection` batched and sent to `POST /api/telemetry/errors` |
 
-All requests are identified by `buildSlug`. No API key required. Write-only (the SDK never reads your data).
-
-## Demo Recording
-
-The SDK also includes demo recording (rrweb-based session replay). This is activated via URL parameters, not through `init()`. See the [BWORLDS docs](https://bworlds.co) for details.
+All requests are identified by `buildSlug`. No API key required. Write-only.
 
 ## License
 
