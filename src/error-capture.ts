@@ -13,33 +13,36 @@ let _queue: CapturedError[] = [];
 let _intervalId: ReturnType<typeof setInterval> | null = null;
 let _buildSlug: string | null = null;
 let _installed = false;
+let _originalOnError: OnErrorEventHandler = null;
+let _rejectionHandler: ((event: PromiseRejectionEvent) => void) | null = null;
 
 export function startErrorCapture(buildSlug: string): void {
   if (_installed) return;
   _installed = true;
   _buildSlug = buildSlug;
 
-  const originalOnError = window.onerror;
+  _originalOnError = window.onerror;
   window.onerror = (message, source, lineno, colno, error) => {
     enqueue({
       message: String(message),
       stack: error?.stack ?? null,
       url: source ?? window.location.href,
     });
-    if (originalOnError) {
-      return originalOnError.call(window, message, source, lineno, colno, error);
+    if (_originalOnError) {
+      return _originalOnError.call(window, message, source, lineno, colno, error);
     }
     return false;
   };
 
-  window.addEventListener('unhandledrejection', (event) => {
+  _rejectionHandler = (event: PromiseRejectionEvent) => {
     const reason = event.reason;
     enqueue({
       message: reason?.message ?? String(reason),
       stack: reason?.stack ?? null,
       url: window.location.href,
     });
-  });
+  };
+  window.addEventListener('unhandledrejection', _rejectionHandler);
 
   _intervalId = setInterval(flush, BATCH_INTERVAL_MS);
 }
@@ -50,6 +53,14 @@ export function stopErrorCapture(): void {
     _intervalId = null;
   }
   flush();
+
+  // Restore original handlers
+  window.onerror = _originalOnError;
+  if (_rejectionHandler) {
+    window.removeEventListener('unhandledrejection', _rejectionHandler);
+    _rejectionHandler = null;
+  }
+  _originalOnError = null;
   _installed = false;
 }
 
