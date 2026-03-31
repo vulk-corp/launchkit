@@ -1,6 +1,6 @@
 # @bworlds/launchkit
 
-Monitoring SDK for AI-built apps. One line of code, two readiness checks pass.
+Monitoring and access gating SDK for AI-built apps. Drop-in integration for Lovable, Bolt, and Base44.
 
 ## Install
 
@@ -13,20 +13,24 @@ npm install @bworlds/launchkit
 ```js
 import { init } from '@bworlds/launchkit';
 
-init({ buildSlug: 'my-app' });
+// ── 1. Initialize once (app entry point) ─────────────────
+const launchkit = init({ buildSlug: 'my-app' });
+// Activates heartbeat monitoring and error tracking automatically.
+
+// ── 2. Gate any protected page ────────────────────────────
+// Remove the 3 lines below to keep your app open to everyone.
+const session = await launchkit.check();
+if (!session.valid) redirect(launchkit.getGateUrl());
+// Redirects unauthenticated users to the BWORLDS access page.
+
+// session.email, session.accessType are available when valid
 ```
 
-That's it. The SDK will:
-- Send heartbeats every 5 minutes to confirm your app is alive
-- Capture uncaught JS errors and report them
-
-## Lovable / Bolt
-
-Paste this prompt into your AI builder:
-
-> Install @bworlds/launchkit and add `import { init } from '@bworlds/launchkit'; init({ buildSlug: 'my-app' });` to the app entry point.
-
 Replace `my-app` with your build slug from the BWORLDS dashboard.
+
+## Lovable / Bolt / Base44
+
+Paste the snippet above directly into your AI builder as a prompt. The AI will handle the integration.
 
 ## CDN (no bundler)
 
