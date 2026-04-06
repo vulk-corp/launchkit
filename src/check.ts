@@ -34,11 +34,7 @@ export async function check(
   buildSlug: string,
   apiEndpoint = DEFAULT_API_ENDPOINT,
 ): Promise<CheckResult> {
-  const token = readToken();
-
-  if (!token) {
-    return { valid: false, email: null, accessType: null, expiresAt: null };
-  }
+  const token = readToken() ?? '';
 
   try {
     const res = await fetch(`${apiEndpoint}/api/monetization/validate-token`, {

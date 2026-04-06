@@ -57,7 +57,7 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
 
   return {
     check: () => _check(config.buildSlug, apiEndpoint),
-    getGateUrl: () => `https://bworlds.co/access/${config.buildSlug}`,
+    getGateUrl: () => `https://app.bworlds.co/access/${config.buildSlug}`,
     stop: () => {
       stopHeartbeat();
       stopErrorCapture();
