@@ -5,6 +5,8 @@ export interface CheckResult {
   email: string | null;
   accessType: 'free' | 'paid' | null;
   expiresAt: string | null;
+  /** true when the backend was unreachable and fail-open was applied */
+  degraded: boolean;
 }
 
 /**
@@ -43,8 +45,13 @@ export async function check(
       body: JSON.stringify({ token, build_slug: buildSlug }),
     });
 
+    if (res.status === 401 || res.status === 403) {
+      return { valid: false, email: null, accessType: null, expiresAt: null, degraded: false };
+    }
+
     if (!res.ok) {
-      return { valid: false, email: null, accessType: null, expiresAt: null };
+      // Server error (5xx) — fail-open so the builder's app stays accessible
+      return { valid: true, email: null, accessType: null, expiresAt: null, degraded: true };
     }
 
     const data = (await res.json()) as { access_type: string; expires_at: string };
@@ -53,9 +60,10 @@ export async function check(
       email: null, // email not returned by validate-token (privacy)
       accessType: data.access_type as 'free' | 'paid',
       expiresAt: data.expires_at,
+      degraded: false,
     };
   } catch {
-    // Silent fail: never crash the host app on network error
-    return { valid: false, email: null, accessType: null, expiresAt: null };
+    // Network error / timeout — fail-open
+    return { valid: true, email: null, accessType: null, expiresAt: null, degraded: true };
   }
 }
