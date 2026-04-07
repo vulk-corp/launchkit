@@ -61,7 +61,9 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
           _stopReplay = stopReplay;
           return startReplay(config.buildSlug, apiEndpoint);
         })
-        .catch(() => {});
+        .catch((err) => {
+          console.warn('[@bworlds/launchkit] Session replay failed to start:', err);
+        });
     }
   }
 

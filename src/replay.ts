@@ -45,9 +45,9 @@ function _hasErrors(events: eventWithTime[]): boolean {
   );
 }
 
-async function _flushChunk(events: eventWithTime[]): Promise<void> {
+async function _flushChunk(events: eventWithTime[]): Promise<boolean> {
   if (!_buildSlug || !_apiEndpoint || !_sessionId || events.length === 0)
-    return;
+    return true;
 
   const payload = {
     buildSlug: _buildSlug,
@@ -63,9 +63,9 @@ async function _flushChunk(events: eventWithTime[]): Promise<void> {
   // Split oversized chunks recursively instead of dropping events
   if (bodyBytes > MAX_CHUNK_BYTES && events.length > 1) {
     const mid = Math.floor(events.length / 2);
-    await _flushChunk(events.slice(0, mid));
-    await _flushChunk(events.slice(mid));
-    return;
+    const a = await _flushChunk(events.slice(0, mid));
+    const b = await _flushChunk(events.slice(mid));
+    return a && b;
   }
 
   if (bodyBytes > MAX_CHUNK_BYTES) {
@@ -73,7 +73,7 @@ async function _flushChunk(events: eventWithTime[]): Promise<void> {
     console.warn(
       `${SDK_TAG} Replay event too large (${(bodyBytes / 1024).toFixed(0)} KB, limit ${MAX_CHUNK_BYTES / 1024} KB). Event dropped.`,
     );
-    return;
+    return true; // not retryable
   }
 
   try {
@@ -83,7 +83,6 @@ async function _flushChunk(events: eventWithTime[]): Promise<void> {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body,
-        keepalive: true,
       },
     );
 
@@ -93,23 +92,25 @@ async function _flushChunk(events: eventWithTime[]): Promise<void> {
         `${SDK_TAG} Session replay daily cap reached. Recording stopped.`,
       );
       stopReplay();
-      return;
+      return true; // not retryable
     }
 
     if (!resp.ok) {
       console.warn(
         `${SDK_TAG} Replay chunk upload failed (HTTP ${resp.status}).`,
       );
-      return;
+      return false;
     }
 
     // Increment only after confirmed delivery
     _sequenceNumber += 1;
+    return true;
   } catch (err: unknown) {
     console.warn(
       `${SDK_TAG} Replay chunk upload failed (network error).`,
       err,
     );
+    return false;
   }
 }
 
@@ -118,7 +119,11 @@ async function _flush(isFinal = false): Promise<void> {
   _flushing = true;
   try {
     const events = _eventBuffer.splice(0);
-    await _flushChunk(events);
+    const ok = await _flushChunk(events);
+    if (!ok) {
+      // Re-queue events at the front so the FullSnapshot is never lost
+      _eventBuffer.unshift(...events);
+    }
   } finally {
     _flushing = false;
   }
@@ -183,17 +188,10 @@ export async function startReplay(
   try {
     rrweb = await import('rrweb');
   } catch (err: unknown) {
-    const isModuleNotFound =
-      err instanceof Error &&
-      (err.message.includes('Cannot find module') ||
-        err.message.includes('Failed to resolve module') ||
-        err.message.includes('Module not found'));
-    if (!isModuleNotFound) {
-      console.warn(
-        `${SDK_TAG} Session replay failed to initialize. rrweb threw:`,
-        err,
-      );
-    }
+    console.warn(
+      `${SDK_TAG} Session replay failed to initialize. rrweb could not be loaded:`,
+      err,
+    );
     return;
   }
 
