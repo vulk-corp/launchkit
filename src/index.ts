@@ -9,6 +9,9 @@ export type { CheckResult } from './check';
 
 const DEFAULT_API_ENDPOINT = 'https://api.bworlds.co';
 
+// Module-level ref for the dynamically-imported stopReplay function
+let _stopReplay: (() => void) | null = null;
+
 export interface LaunchKitInstance {
   /**
    * Validate the current client's access token.
@@ -39,9 +42,9 @@ export interface LaunchKitInstance {
  * Activates heartbeat monitoring and error tracking automatically.
  */
 export function init(config: LaunchKitConfig): LaunchKitInstance {
-  if (typeof window !== 'undefined') {
-    const apiEndpoint = config.apiEndpoint ?? DEFAULT_API_ENDPOINT;
+  const apiEndpoint = config.apiEndpoint ?? DEFAULT_API_ENDPOINT;
 
+  if (typeof window !== 'undefined') {
     configureSender({ buildSlug: config.buildSlug, apiEndpoint });
 
     if (config.enableHeartbeat !== false) {
@@ -51,9 +54,16 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
     if (config.enableErrorCapture !== false) {
       startErrorCapture(config.buildSlug);
     }
-  }
 
-  const apiEndpoint = config.apiEndpoint ?? DEFAULT_API_ENDPOINT;
+    if (config.enableSessionReplay) {
+      import('./replay')
+        .then(({ startReplay, stopReplay }) => {
+          _stopReplay = stopReplay;
+          return startReplay(config.buildSlug, apiEndpoint);
+        })
+        .catch(() => {});
+    }
+  }
 
   return {
     check: () => _check(config.buildSlug, apiEndpoint),
@@ -61,6 +71,7 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
     stop: () => {
       stopHeartbeat();
       stopErrorCapture();
+      _stopReplay?.();
     },
   };
 }
@@ -71,4 +82,5 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
 export function stop(): void {
   stopHeartbeat();
   stopErrorCapture();
+  _stopReplay?.();
 }

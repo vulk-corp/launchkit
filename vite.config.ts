@@ -10,12 +10,14 @@ export default defineConfig({
     lib: {
       entry: resolve(__dirname, 'src/index.ts'),
       name: 'BWorldsLaunchKit',
-      formats: ['es', 'cjs', 'umd'],
+      formats: ['es', 'cjs'],
       fileName: (format) => {
         if (format === 'es') return 'launchkit.js';
-        if (format === 'cjs') return 'launchkit.cjs';
-        return 'launchkit.umd.js';
+        return 'launchkit.cjs';
       },
+    },
+    rollupOptions: {
+      external: ['rrweb'],
     },
     sourcemap: true,
     minify: 'esbuild',

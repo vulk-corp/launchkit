@@ -12,4 +12,6 @@ export interface LaunchKitConfig {
   enableErrorCapture?: boolean;
   /** Enable heartbeat (default: true) */
   enableHeartbeat?: boolean;
+  /** Enable session replay recording (default: false) */
+  enableSessionReplay?: boolean;
 }
