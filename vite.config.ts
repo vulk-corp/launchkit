@@ -4,7 +4,7 @@ import { resolve } from 'path';
 
 export default defineConfig({
   plugins: [
-    dts({ insertTypesEntry: true }),
+    dts({ insertTypesEntry: true, tsconfigPath: './tsconfig.build.json' }),
   ],
   build: {
     lib: {
