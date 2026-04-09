@@ -1,6 +1,6 @@
 {
   "name": "@bworlds/launchkit",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Monitoring, error capture, and access gating SDK for AI-built apps",
   "type": "module",
   "main": "./dist/launchkit.js",
