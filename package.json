@@ -20,18 +20,25 @@
   "files": [
     "dist"
   ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "build": "vite build && tsc --emitDeclarationOnly",
-    "type-check": "tsc --noEmit"
+    "build": "vite build && tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "rrweb": "2.0.0-alpha.18"
   },
   "devDependencies": {
     "@types/node": "^22.15.21",
+    "jsdom": "^29.0.2",
     "typescript": "^5.8.3",
     "vite": "^6.3.5",
-    "vite-plugin-dts": "^4.5.4"
+    "vite-plugin-dts": "^4.5.4",
+    "vitest": "^4.1.4"
   },
   "keywords": [
     "launchkit",
