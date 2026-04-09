@@ -2,6 +2,7 @@ import { configureSender } from './telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from './heartbeat';
 import { startErrorCapture, stopErrorCapture } from './error-capture';
 import { check as _check } from './check';
+import { fetchRemoteConfig } from './remote-config';
 import type { LaunchKitConfig } from './types';
 
 export type { LaunchKitConfig } from './types';
@@ -47,6 +48,7 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
   if (typeof window !== 'undefined') {
     configureSender({ buildSlug: config.buildSlug, apiEndpoint });
 
+    // Start with local defaults immediately (non-blocking)
     if (config.enableHeartbeat !== false) {
       startHeartbeat(config.buildSlug, config.heartbeatInterval);
     }
@@ -65,6 +67,40 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
           console.warn('[@bworlds/launchkit] Session replay failed to start:', err);
         });
     }
+
+    // Non-blocking remote config fetch — merges over local defaults when resolved.
+    // Falls back silently on any error (fetchRemoteConfig catches internally).
+    fetchRemoteConfig(apiEndpoint, config.buildSlug)
+      .then((remote) => {
+        if (!remote) return;
+
+        // Monitoring (heartbeat): remote off disables it. Remote on + local explicit off = local wins.
+        if (!remote.monitoring && config.enableHeartbeat !== false) {
+          stopHeartbeat();
+        }
+
+        // Error capture is derived from sessionReplay: remote off disables it.
+        if (!remote.sessionReplay && config.enableErrorCapture !== false) {
+          stopErrorCapture();
+        }
+
+        // Session replay: remote enables it (start if not already started)
+        if (remote.sessionReplay && !config.enableSessionReplay) {
+          import('./replay')
+            .then(({ startReplay, stopReplay }) => {
+              _stopReplay = stopReplay;
+              return startReplay(config.buildSlug, apiEndpoint);
+            })
+            .catch((err) => {
+              console.warn('[@bworlds/launchkit] Remote-triggered session replay failed:', err);
+            });
+        } else if (!remote.sessionReplay && config.enableSessionReplay) {
+          _stopReplay?.();
+        }
+      })
+      .catch(() => {
+        // fetchRemoteConfig already handles errors internally — this is belt-and-suspenders
+      });
   }
 
   return {
