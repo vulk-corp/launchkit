@@ -35,12 +35,13 @@ export interface LaunchKitInstance {
 }
 
 /**
- * Initialize LaunchKit monitoring (heartbeat + error capture) and return
- * an instance for access gating.
+ * Initialize LaunchKit monitoring and return an instance for access gating.
  *
  *   const launchkit = init({ buildSlug: 'my-app' })
  *
- * Activates heartbeat monitoring and error tracking automatically.
+ * All features start enabled by default. Remote config from the BWORLDS
+ * dashboard can disable individual features. If the backend is unreachable,
+ * everything stays on (fail-open).
  */
 export function init(config: LaunchKitConfig): LaunchKitInstance {
   const apiEndpoint = config.apiEndpoint ?? DEFAULT_API_ENDPOINT;
@@ -48,59 +49,22 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
   if (typeof window !== 'undefined') {
     configureSender({ buildSlug: config.buildSlug, apiEndpoint });
 
-    // Start with local defaults immediately (non-blocking)
-    if (config.enableHeartbeat !== false) {
-      startHeartbeat(config.buildSlug, config.heartbeatInterval);
-    }
+    // Start everything immediately (defaults: all on)
+    startHeartbeat(config.buildSlug);
+    startErrorCapture(config.buildSlug);
+    startReplayModule(config.buildSlug, apiEndpoint);
 
-    if (config.enableErrorCapture !== false) {
-      startErrorCapture(config.buildSlug);
-    }
-
-    if (config.enableSessionReplay) {
-      import('./replay')
-        .then(({ startReplay, stopReplay }) => {
-          _stopReplay = stopReplay;
-          return startReplay(config.buildSlug, apiEndpoint);
-        })
-        .catch((err) => {
-          console.warn('[@bworlds/launchkit] Session replay failed to start:', err);
-        });
-    }
-
-    // Non-blocking remote config fetch — merges over local defaults when resolved.
-    // Falls back silently on any error (fetchRemoteConfig catches internally).
+    // Remote config can disable features. Fail-open: if fetch fails, keep defaults.
     fetchRemoteConfig(apiEndpoint, config.buildSlug)
       .then((remote) => {
         if (!remote) return;
-
-        // Monitoring (heartbeat): remote off disables it. Remote on + local explicit off = local wins.
-        if (!remote.monitoring && config.enableHeartbeat !== false) {
-          stopHeartbeat();
-        }
-
-        // Error capture is derived from sessionReplay: remote off disables it.
-        if (!remote.sessionReplay && config.enableErrorCapture !== false) {
+        if (!remote.monitoring) stopHeartbeat();
+        if (!remote.sessionReplay) {
           stopErrorCapture();
-        }
-
-        // Session replay: remote enables it (start if not already started)
-        if (remote.sessionReplay && !config.enableSessionReplay) {
-          import('./replay')
-            .then(({ startReplay, stopReplay }) => {
-              _stopReplay = stopReplay;
-              return startReplay(config.buildSlug, apiEndpoint);
-            })
-            .catch((err) => {
-              console.warn('[@bworlds/launchkit] Remote-triggered session replay failed:', err);
-            });
-        } else if (!remote.sessionReplay && config.enableSessionReplay) {
           _stopReplay?.();
         }
       })
-      .catch(() => {
-        // fetchRemoteConfig already handles errors internally — this is belt-and-suspenders
-      });
+      .catch(() => {});
   }
 
   return {
@@ -112,6 +76,17 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
       _stopReplay?.();
     },
   };
+}
+
+function startReplayModule(buildSlug: string, apiEndpoint: string): void {
+  import('./replay')
+    .then(({ startReplay, stopReplay }) => {
+      _stopReplay = stopReplay;
+      return startReplay(buildSlug, apiEndpoint);
+    })
+    .catch((err) => {
+      console.warn('[@bworlds/launchkit] Session replay failed to start:', err);
+    });
 }
 
 /**

@@ -3,6 +3,7 @@ import { configureSender } from '../src/telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from '../src/heartbeat';
 import { startErrorCapture, stopErrorCapture } from '../src/error-capture';
 import { check } from '../src/check';
+import { fetchRemoteConfig } from '../src/remote-config';
 
 vi.mock('../src/telemetry-sender', () => ({
   configureSender: vi.fn(),
@@ -23,8 +24,20 @@ vi.mock('../src/check', () => ({
   check: vi.fn().mockResolvedValue({ valid: true, email: null, accessType: 'free', expiresAt: null, degraded: false }),
 }));
 
+vi.mock('../src/replay', () => ({
+  startReplay: vi.fn().mockResolvedValue(undefined),
+  stopReplay: vi.fn(),
+}));
+
+vi.mock('../src/remote-config', () => ({
+  fetchRemoteConfig: vi.fn().mockResolvedValue(null),
+}));
+
+const mockFetchRemoteConfig = vi.mocked(fetchRemoteConfig);
+
 beforeEach(() => {
   vi.clearAllMocks();
+  mockFetchRemoteConfig.mockResolvedValue(null);
 });
 
 describe('init()', () => {
@@ -39,7 +52,7 @@ describe('init()', () => {
 
   it('starts heartbeat by default', () => {
     init({ buildSlug: 'test-app' });
-    expect(startHeartbeat).toHaveBeenCalledWith('test-app', undefined);
+    expect(startHeartbeat).toHaveBeenCalledWith('test-app');
   });
 
   it('starts error capture by default', () => {
@@ -47,19 +60,39 @@ describe('init()', () => {
     expect(startErrorCapture).toHaveBeenCalledWith('test-app');
   });
 
-  it('skips heartbeat when enableHeartbeat: false', () => {
-    init({ buildSlug: 'test-app', enableHeartbeat: false });
-    expect(startHeartbeat).not.toHaveBeenCalled();
+  it('fetches remote config', () => {
+    init({ buildSlug: 'test-app' });
+    expect(mockFetchRemoteConfig).toHaveBeenCalledWith('https://api.bworlds.co', 'test-app');
   });
 
-  it('skips error capture when enableErrorCapture: false', () => {
-    init({ buildSlug: 'test-app', enableErrorCapture: false });
-    expect(startErrorCapture).not.toHaveBeenCalled();
+  it('stops heartbeat when remote config disables monitoring', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({ monitoring: false, sessionReplay: true });
+
+    init({ buildSlug: 'test-app' });
+    await vi.waitFor(() => {
+      expect(stopHeartbeat).toHaveBeenCalled();
+    });
   });
 
-  it('passes custom heartbeat interval', () => {
-    init({ buildSlug: 'test-app', heartbeatInterval: 60_000 });
-    expect(startHeartbeat).toHaveBeenCalledWith('test-app', 60_000);
+  it('stops error capture and replay when remote config disables sessionReplay', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({ monitoring: true, sessionReplay: false });
+
+    init({ buildSlug: 'test-app' });
+    await vi.waitFor(() => {
+      expect(stopErrorCapture).toHaveBeenCalled();
+    });
+  });
+
+  it('keeps everything running when remote config fetch fails', async () => {
+    mockFetchRemoteConfig.mockResolvedValue(null);
+
+    init({ buildSlug: 'test-app' });
+
+    // Let promises settle
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(stopHeartbeat).not.toHaveBeenCalled();
+    expect(stopErrorCapture).not.toHaveBeenCalled();
   });
 });
 
