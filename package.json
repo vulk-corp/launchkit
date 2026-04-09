@@ -45,6 +45,7 @@
   "publishConfig": {
     "access": "public"
   },
+  "homepage": "https://www.npmjs.com/package/@bworlds/launchkit",
   "repository": {
     "type": "git",
     "url": "https://github.com/vulk-corp/launchkit.git"
