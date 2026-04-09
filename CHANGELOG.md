@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.2] — 2026-04-07
+
+### Fixed
+
+- Access check now **fails open** when the backend returns a server error (5xx / network failure). Previously, a backend outage would lock users out.
+
+## [1.0.1] — 2026-04-06
+
+### Fixed
+
+- `check()` sends an empty token instead of returning early when no token is found (lets the backend return the proper "no access" response).
+- Gate URL now uses the correct domain.
+
 ## [1.0.0] — 2026-03-31
 
 ### Breaking changes
