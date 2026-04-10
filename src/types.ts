@@ -12,4 +12,7 @@ export interface LaunchKitConfig {
   enableErrorCapture?: boolean;
   /** Enable heartbeat (default: true) */
   enableHeartbeat?: boolean;
+  /** Enable access gating (default: true). Validates visitor tokens
+   *  and redirects unauthorized visitors to the BWORLDS access page. */
+  gate?: boolean;
 }

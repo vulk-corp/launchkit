@@ -71,6 +71,16 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
     if (config.enableErrorCapture !== false && !sandboxed) {
       startErrorCapture(_buildSlug);
     }
+
+    // Access gating: check visitor token and redirect if invalid.
+    // Skipped in sandboxed iframes (editor previews).
+    if (config.gate !== false && !sandboxed) {
+      check().then((session) => {
+        if (!session.valid) {
+          window.location.href = getGateUrl();
+        }
+      });
+    }
   }
 
   return { check, getGateUrl, stop };
