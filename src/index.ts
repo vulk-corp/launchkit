@@ -9,6 +9,17 @@ export type { CheckResult } from './check';
 
 const DEFAULT_API_ENDPOINT = 'https://api.bworlds.co';
 
+/** True when the app runs inside a cross-origin iframe (e.g. Lovable editor). */
+function isSandboxed(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.self !== window.top;
+  } catch {
+    // Cross-origin restriction — definitely sandboxed
+    return true;
+  }
+}
+
 export interface LaunchKitInstance {
   /**
    * Validate the current client's access token.
@@ -41,6 +52,7 @@ export interface LaunchKitInstance {
 export function init(config: LaunchKitConfig): LaunchKitInstance {
   if (typeof window !== 'undefined') {
     const apiEndpoint = config.apiEndpoint ?? DEFAULT_API_ENDPOINT;
+    const sandboxed = isSandboxed();
 
     configureSender({ buildSlug: config.buildSlug, apiEndpoint });
 
@@ -48,7 +60,9 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
       startHeartbeat(config.buildSlug, config.heartbeatInterval);
     }
 
-    if (config.enableErrorCapture !== false) {
+    // Error capture only runs in production (top-level window).
+    // Sandboxed iframes (e.g. Lovable/Bolt editor) are skipped.
+    if (config.enableErrorCapture !== false && !sandboxed) {
       startErrorCapture(config.buildSlug);
     }
   }
