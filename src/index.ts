@@ -9,6 +9,10 @@ export type { CheckResult } from './check';
 
 const DEFAULT_API_ENDPOINT = 'https://api.bworlds.co';
 
+// Module-level state set by init(), read by standalone check/getGateUrl.
+let _buildSlug: string | null = null;
+let _apiEndpoint = DEFAULT_API_ENDPOINT;
+
 /** True when the app runs inside a cross-origin iframe (e.g. Lovable editor). */
 function isSandboxed(): boolean {
   if (typeof window === 'undefined') return false;
@@ -50,37 +54,64 @@ export interface LaunchKitInstance {
  * Activates heartbeat monitoring and error tracking automatically.
  */
 export function init(config: LaunchKitConfig): LaunchKitInstance {
+  _buildSlug = config.buildSlug;
+  _apiEndpoint = config.apiEndpoint ?? DEFAULT_API_ENDPOINT;
+
   if (typeof window !== 'undefined') {
-    const apiEndpoint = config.apiEndpoint ?? DEFAULT_API_ENDPOINT;
     const sandboxed = isSandboxed();
 
-    configureSender({ buildSlug: config.buildSlug, apiEndpoint });
+    configureSender({ buildSlug: _buildSlug, apiEndpoint: _apiEndpoint });
 
     if (config.enableHeartbeat !== false) {
-      startHeartbeat(config.buildSlug, config.heartbeatInterval);
+      startHeartbeat(_buildSlug, config.heartbeatInterval);
     }
 
     // Error capture only runs in production (top-level window).
     // Sandboxed iframes (e.g. Lovable/Bolt editor) are skipped.
     if (config.enableErrorCapture !== false && !sandboxed) {
-      startErrorCapture(config.buildSlug);
+      startErrorCapture(_buildSlug);
     }
   }
 
-  const apiEndpoint = config.apiEndpoint ?? DEFAULT_API_ENDPOINT;
-
-  return {
-    check: () => _check(config.buildSlug, apiEndpoint),
-    getGateUrl: () => `https://app.bworlds.co/access/${config.buildSlug}`,
-    stop: () => {
-      stopHeartbeat();
-      stopErrorCapture();
-    },
-  };
+  return { check, getGateUrl, stop };
 }
 
 /**
- * Stop all monitoring. Convenience export — prefer instance.stop() instead.
+ * Validate the current client's access token.
+ * Standalone export — works after init() has been called.
+ *
+ *   import { check, getGateUrl } from '@bworlds/launchkit';
+ *   const session = await check();
+ *   if (!session.valid) window.location.href = getGateUrl();
+ */
+export function check(): ReturnType<typeof _check> {
+  if (!_buildSlug) {
+    console.warn('[LaunchKit] check() called before init(). Failing open.');
+    return Promise.resolve({
+      valid: true,
+      email: null,
+      accessType: null,
+      expiresAt: null,
+      degraded: true,
+    });
+  }
+  return _check(_buildSlug, _apiEndpoint);
+}
+
+/**
+ * Returns the BWORLDS gate page URL.
+ * Standalone export — works after init() has been called.
+ */
+export function getGateUrl(): string {
+  if (!_buildSlug) {
+    console.warn('[LaunchKit] getGateUrl() called before init().');
+    return '';
+  }
+  return `https://app.bworlds.co/access/${_buildSlug}`;
+}
+
+/**
+ * Stop all monitoring.
  */
 export function stop(): void {
   stopHeartbeat();
