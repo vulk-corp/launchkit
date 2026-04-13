@@ -24,6 +24,43 @@ function isSandboxed(): boolean {
   }
 }
 
+/**
+ * Inject a full-screen overlay that hides the app while the access check
+ * is in flight. Prevents the "flash of protected content" before redirect.
+ * Returns a handle with a `remove()` method to tear it down on success.
+ */
+function showGateOverlay(): { remove: () => void } {
+  const el = document.createElement('div');
+  el.id = 'bworlds-gate-overlay';
+  el.setAttribute('aria-live', 'polite');
+  el.setAttribute('role', 'status');
+  Object.assign(el.style, {
+    position: 'fixed',
+    inset: '0',
+    zIndex: '2147483647',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    background: '#fff',
+  } as CSSStyleDeclaration);
+
+  // Spinner + text
+  el.innerHTML = `
+    <div style="display:flex;flex-direction:column;align-items:center;gap:12px">
+      <div style="width:32px;height:32px;border:3px solid #e5e5e5;border-top-color:#333;border-radius:50%;animation:bw-spin .7s linear infinite"></div>
+      <p style="font-family:system-ui,sans-serif;font-size:14px;color:#666;margin:0">Verifying access…</p>
+    </div>
+    <style>@keyframes bw-spin{to{transform:rotate(360deg)}}</style>`;
+
+  document.body.appendChild(el);
+
+  return {
+    remove() {
+      el.remove();
+    },
+  };
+}
+
 export interface LaunchKitInstance {
   /**
    * Validate the current client's access token.
@@ -72,12 +109,15 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
       startErrorCapture(_buildSlug);
     }
 
-    // Access gating: check visitor token and redirect if invalid.
+    // Access gating: show loading screen, check token, redirect or reveal app.
     // Skipped in sandboxed iframes (editor previews).
     if (config.gate !== false && !sandboxed) {
+      const overlay = showGateOverlay();
       check().then((session) => {
         if (!session.valid) {
           window.location.href = getGateUrl();
+        } else {
+          overlay.remove();
         }
       });
     }

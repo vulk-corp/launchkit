@@ -25,6 +25,7 @@ vi.mock('../src/check', () => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  document.getElementById('bworlds-gate-overlay')?.remove();
 });
 
 describe('init()', () => {
@@ -92,5 +93,64 @@ describe('top-level stop()', () => {
 
     expect(stopHeartbeat).toHaveBeenCalled();
     expect(stopErrorCapture).toHaveBeenCalled();
+  });
+});
+
+describe('gate overlay', () => {
+  it('shows overlay during access check', async () => {
+    init({ buildSlug: 'test-app' });
+
+    // Overlay should be in the DOM while check is pending
+    expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+
+    // Let the check() promise resolve (mocked as valid)
+    await vi.waitFor(() => {
+      expect(document.getElementById('bworlds-gate-overlay')).toBeNull();
+    });
+  });
+
+  it('removes overlay when check returns valid', async () => {
+    vi.mocked(check).mockResolvedValueOnce({
+      valid: true, email: null, accessType: 'paid', expiresAt: null, degraded: false,
+    });
+
+    init({ buildSlug: 'test-app' });
+    expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+
+    await vi.waitFor(() => {
+      expect(document.getElementById('bworlds-gate-overlay')).toBeNull();
+    });
+  });
+
+  it('keeps overlay when redirecting (invalid check)', async () => {
+    const hrefSetter = vi.fn();
+    Object.defineProperty(window, 'location', {
+      value: { href: 'http://localhost/' },
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(window.location, 'href', {
+      set: hrefSetter,
+      get: () => 'http://localhost/',
+      configurable: true,
+    });
+
+    vi.mocked(check).mockResolvedValueOnce({
+      valid: false, email: null, accessType: null, expiresAt: null, degraded: false,
+    });
+
+    init({ buildSlug: 'test-app' });
+
+    // Wait for the promise to settle
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Overlay stays in DOM during redirect
+    expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+    expect(hrefSetter).toHaveBeenCalledWith('https://app.bworlds.co/access/test-app');
+  });
+
+  it('does not show overlay when gate is disabled', () => {
+    init({ buildSlug: 'test-app', gate: false });
+    expect(document.getElementById('bworlds-gate-overlay')).toBeNull();
   });
 });
