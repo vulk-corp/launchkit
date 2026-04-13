@@ -1,13 +1,20 @@
 import { check } from '../src/check';
 
 const mockFetch = vi.fn();
+const mockReplaceState = vi.fn();
 
 beforeEach(() => {
   vi.stubGlobal('fetch', mockFetch);
   mockFetch.mockClear();
+  mockReplaceState.mockClear();
   // Reset location and cookies
   Object.defineProperty(window, 'location', {
     value: new URL('http://localhost/'),
+    writable: true,
+    configurable: true,
+  });
+  Object.defineProperty(window, 'history', {
+    value: { replaceState: mockReplaceState, state: null },
     writable: true,
     configurable: true,
   });
@@ -129,5 +136,66 @@ describe('check()', () => {
 
     const url = mockFetch.mock.calls[0][0] as string;
     expect(url).toBe('https://custom.api/api/monetization/validate-token');
+  });
+
+  it('persists token in cookie after successful validation', async () => {
+    Object.defineProperty(window, 'location', {
+      value: new URL('http://localhost/?bworlds_token=jwt-from-url'),
+      writable: true,
+      configurable: true,
+    });
+    mockFetch.mockResolvedValueOnce(mockResponse(200, { access_type: 'paid', expires_at: '2026-12-31T00:00:00Z' }));
+
+    await check('test-app');
+
+    expect(document.cookie).toContain('bworlds_token=jwt-from-url');
+  });
+
+  it('strips bworlds_token from URL after successful validation', async () => {
+    Object.defineProperty(window, 'location', {
+      value: new URL('http://localhost/page?bworlds_token=jwt-from-url&other=keep'),
+      writable: true,
+      configurable: true,
+    });
+    mockFetch.mockResolvedValueOnce(mockResponse(200, { access_type: 'free', expires_at: '2026-12-31' }));
+
+    await check('test-app');
+
+    expect(mockReplaceState).toHaveBeenCalledOnce();
+    const newUrl = mockReplaceState.mock.calls[0][2] as string;
+    expect(newUrl).not.toContain('bworlds_token');
+    expect(newUrl).toContain('other=keep');
+  });
+
+  it('does not strip URL when token came from cookie', async () => {
+    document.cookie = 'bworlds_token=cookie-token';
+    mockFetch.mockResolvedValueOnce(mockResponse(200, { access_type: 'paid', expires_at: '2026-12-31' }));
+
+    await check('test-app');
+
+    expect(mockReplaceState).not.toHaveBeenCalled();
+  });
+
+  it('clears cookie on 401', async () => {
+    document.cookie = 'bworlds_token=stale-token';
+    mockFetch.mockResolvedValueOnce(mockResponse(401));
+
+    await check('test-app');
+
+    // After clearing, the cookie value should be empty/gone
+    expect(document.cookie).not.toContain('stale-token');
+  });
+
+  it('does not persist token on 5xx (degraded)', async () => {
+    Object.defineProperty(window, 'location', {
+      value: new URL('http://localhost/?bworlds_token=jwt-from-url'),
+      writable: true,
+      configurable: true,
+    });
+    mockFetch.mockResolvedValueOnce(mockResponse(500));
+
+    await check('test-app');
+
+    expect(document.cookie).not.toContain('jwt-from-url');
   });
 });

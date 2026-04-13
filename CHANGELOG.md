@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.0] — 2026-04-14
+
+### Added
+
+- **Automatic token persistence**: `check()` now saves the `bworlds_token` in a cookie after successful validation. Subsequent page loads use the cookie, so the token no longer needs to stay in the URL.
+- **URL cleanup**: when the token comes from `?bworlds_token=` in the URL, it is stripped from the address bar after validation via `history.replaceState`. Other query params are preserved.
+- **Cookie cleanup on rejection**: on 401/403 the stale cookie is cleared to prevent redirect loops.
+
 ## [1.0.2] — 2026-04-07
 
 ### Fixed
