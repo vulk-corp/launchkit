@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.3.0] — 2026-04-14
+
+### Added
+
+- **Session replay**: records user sessions via rrweb (lazy-loaded, ~3.5 kB chunk). Flushes compressed snapshots to the BWORLDS API every 10 seconds.
+- **Remote config**: features are now controlled from the BWORLDS dashboard. Config is fetched on init and cached in sessionStorage. Fail-open: if the backend is unreachable, all features stay enabled.
+- **Sandboxed iframe detection**: error capture and replay are skipped inside cross-origin iframes (e.g. Lovable/Bolt editor previews).
+
+### Changed
+
+- `LaunchKitConfig` simplified to `{ buildSlug, apiEndpoint?, gate? }`. The `enableHeartbeat`, `enableErrorCapture`, and `heartbeatInterval` options have been removed in favor of remote config.
+- Standalone `check()` and `getGateUrl()` exports now work after `init()` has been called.
+
 ## [1.2.0] — 2026-04-14
 
 ### Added
@@ -32,7 +45,7 @@
 
 - **Access gating**: `launchkit.check()` validates the client's `bworlds_token` against the BWORLDS API server-side. No build secret required in the client bundle.
 - **Gate redirect**: `launchkit.getGateUrl()` returns the BWORLDS-hosted access page URL for the build.
-- **Auto token reading**: `check()` reads the token from `?bworlds_token=` (URL param set by the gate page) or the `bworlds_token` cookie — no argument needed.
+- **Auto token reading**: `check()` reads the token from `?bworlds_token=` (URL param set by the gate page) or the `bworlds_token` cookie -- no argument needed.
 - **`instance.stop()`**: convenience method on the returned instance (equivalent to the existing top-level `stop()` export).
 - `CheckResult` type exported from the package.
 

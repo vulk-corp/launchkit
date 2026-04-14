@@ -2,6 +2,7 @@ import { configureSender } from './telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from './heartbeat';
 import { startErrorCapture, stopErrorCapture } from './error-capture';
 import { check as _check } from './check';
+import { fetchRemoteConfig } from './remote-config';
 import type { LaunchKitConfig } from './types';
 
 export type { LaunchKitConfig } from './types';
@@ -13,13 +14,15 @@ const DEFAULT_API_ENDPOINT = 'https://api.bworlds.co';
 let _buildSlug: string | null = null;
 let _apiEndpoint = DEFAULT_API_ENDPOINT;
 
+// Module-level ref for the dynamically-imported stopReplay function
+let _stopReplay: (() => void) | null = null;
+
 /** True when the app runs inside a cross-origin iframe (e.g. Lovable editor). */
 function isSandboxed(): boolean {
   if (typeof window === 'undefined') return false;
   try {
     return window.self !== window.top;
   } catch {
-    // Cross-origin restriction — definitely sandboxed
     return true;
   }
 }
@@ -27,7 +30,6 @@ function isSandboxed(): boolean {
 /**
  * Inject a full-screen overlay that hides the app while the access check
  * is in flight. Prevents the "flash of protected content" before redirect.
- * Returns a handle with a `remove()` method to tear it down on success.
  */
 function showGateOverlay(): { remove: () => void } {
   const el = document.createElement('div');
@@ -44,11 +46,11 @@ function showGateOverlay(): { remove: () => void } {
     background: '#fff',
   } as CSSStyleDeclaration);
 
-  // Spinner + text
+  // Static spinner markup, no user input (safe innerHTML)
   el.innerHTML = `
     <div style="display:flex;flex-direction:column;align-items:center;gap:12px">
       <div style="width:32px;height:32px;border:3px solid #e5e5e5;border-top-color:#333;border-radius:50%;animation:bw-spin .7s linear infinite"></div>
-      <p style="font-family:system-ui,sans-serif;font-size:14px;color:#666;margin:0">Verifying access…</p>
+      <p style="font-family:system-ui,sans-serif;font-size:14px;color:#666;margin:0">Verifying access\u2026</p>
     </div>
     <style>@keyframes bw-spin{to{transform:rotate(360deg)}}</style>`;
 
@@ -64,12 +66,7 @@ function showGateOverlay(): { remove: () => void } {
 export interface LaunchKitInstance {
   /**
    * Validate the current client's access token.
-   * No arguments — the token is read from ?bworlds_token= or a cookie automatically.
-   *
-   * Remove this call (and the redirect below) if you want your app open to everyone.
-   *
-   *   const session = await launchkit.check();
-   *   if (!session.valid) redirect(launchkit.getGateUrl());
+   * No arguments -- the token is read from ?bworlds_token= or a cookie automatically.
    */
   check: () => ReturnType<typeof _check>;
   /**
@@ -83,12 +80,13 @@ export interface LaunchKitInstance {
 }
 
 /**
- * Initialize LaunchKit monitoring (heartbeat + error capture) and return
- * an instance for access gating.
+ * Initialize LaunchKit monitoring and return an instance for access gating.
  *
  *   const launchkit = init({ buildSlug: 'my-app' })
  *
- * Activates heartbeat monitoring and error tracking automatically.
+ * All features start enabled by default. Remote config from the BWORLDS
+ * dashboard can disable individual features. If the backend is unreachable,
+ * everything stays on (fail-open).
  */
 export function init(config: LaunchKitConfig): LaunchKitInstance {
   _buildSlug = config.buildSlug;
@@ -99,15 +97,27 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
 
     configureSender({ buildSlug: _buildSlug, apiEndpoint: _apiEndpoint });
 
-    if (config.enableHeartbeat !== false) {
-      startHeartbeat(_buildSlug, config.heartbeatInterval);
+    // Start monitoring immediately (defaults: all on)
+    startHeartbeat(_buildSlug);
+
+    // Error capture and replay only run in top-level window.
+    // Sandboxed iframes (e.g. Lovable/Bolt editor) are skipped.
+    if (!sandboxed) {
+      startErrorCapture(_buildSlug);
+      startReplayModule(_buildSlug, _apiEndpoint);
     }
 
-    // Error capture only runs in production (top-level window).
-    // Sandboxed iframes (e.g. Lovable/Bolt editor) are skipped.
-    if (config.enableErrorCapture !== false && !sandboxed) {
-      startErrorCapture(_buildSlug);
-    }
+    // Remote config can disable features. Fail-open: if fetch fails, keep defaults.
+    fetchRemoteConfig(_apiEndpoint, _buildSlug)
+      .then((remote) => {
+        if (!remote) return;
+        if (!remote.monitoring) stopHeartbeat();
+        if (!remote.sessionReplay) {
+          stopErrorCapture();
+          _stopReplay?.();
+        }
+      })
+      .catch(() => {});
 
     // Access gating: show loading screen, check token, redirect or reveal app.
     // Skipped in sandboxed iframes (editor previews).
@@ -126,13 +136,20 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
   return { check, getGateUrl, stop };
 }
 
+function startReplayModule(buildSlug: string, apiEndpoint: string): void {
+  import('./replay')
+    .then(({ startReplay, stopReplay }) => {
+      _stopReplay = stopReplay;
+      return startReplay(buildSlug, apiEndpoint);
+    })
+    .catch((err) => {
+      console.warn('[@bworlds/launchkit] Session replay failed to start:', err);
+    });
+}
+
 /**
  * Validate the current client's access token.
- * Standalone export — works after init() has been called.
- *
- *   import { check, getGateUrl } from '@bworlds/launchkit';
- *   const session = await check();
- *   if (!session.valid) window.location.href = getGateUrl();
+ * Standalone export -- works after init() has been called.
  */
 export function check(): ReturnType<typeof _check> {
   if (!_buildSlug) {
@@ -150,7 +167,7 @@ export function check(): ReturnType<typeof _check> {
 
 /**
  * Returns the BWORLDS gate page URL.
- * Standalone export — works after init() has been called.
+ * Standalone export -- works after init() has been called.
  */
 export function getGateUrl(): string {
   if (!_buildSlug) {
@@ -166,4 +183,5 @@ export function getGateUrl(): string {
 export function stop(): void {
   stopHeartbeat();
   stopErrorCapture();
+  _stopReplay?.();
 }
