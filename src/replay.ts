@@ -14,6 +14,7 @@ const MAX_CHUNK_BYTES = 512_000; // 512 KB per chunk
 const IDLE_TIMEOUT_MS = 15 * 60 * 1000; // 15 min — new session after this idle gap
 const MAX_SESSION_MS = 60 * 60 * 1000; // 60 min — rotate session after this duration
 const STORAGE_KEY = 'bworlds-replay-session';
+const TOKEN_COOKIE = 'bworlds_token';
 
 let _sessionId: string | null = null;
 let _sequenceNumber = 0;
@@ -94,6 +95,15 @@ function _resolveSession(): void {
   _saveSession();
 }
 
+/** Read the bworlds_token cookie (set by check module after validation). */
+function _readToken(): string | null {
+  if (typeof document === 'undefined') return null;
+  const match = document.cookie.match(
+    new RegExp(`(?:^|;\\s*)${TOKEN_COOKIE}=([^;]+)`),
+  );
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 function _hasErrors(events: eventWithTime[]): boolean {
   if (!_EventType) return false;
   return events.some(
@@ -107,10 +117,12 @@ async function _flushChunk(events: eventWithTime[]): Promise<boolean> {
   if (!_buildSlug || !_apiEndpoint || !_sessionId || events.length === 0)
     return true;
 
+  const token = _readToken();
   const payload = {
     buildSlug: _buildSlug,
     sessionId: _sessionId,
     sequenceNumber: _sequenceNumber,
+    ...(token && { token }),
     events,
     hasErrors: _hasErrors(events),
   };
@@ -194,10 +206,12 @@ function _beaconFlush(): void {
   if (!_buildSlug || !_apiEndpoint || !_sessionId) return;
 
   const events = _eventBuffer.splice(0);
+  const token = _readToken();
   const payload = {
     buildSlug: _buildSlug,
     sessionId: _sessionId,
     sequenceNumber: _sequenceNumber,
+    ...(token && { token }),
     events,
     hasErrors: _hasErrors(events),
   };
