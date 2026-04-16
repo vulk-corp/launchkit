@@ -11,9 +11,13 @@ import type { eventWithTime } from 'rrweb';
 const SDK_TAG = '[@bworlds/launchkit]';
 const FLUSH_INTERVAL_MS = 10_000;
 const MAX_CHUNK_BYTES = 512_000; // 512 KB per chunk
+const IDLE_TIMEOUT_MS = 15 * 60 * 1000; // 15 min — new session after this idle gap
+const MAX_SESSION_MS = 60 * 60 * 1000; // 60 min — rotate session after this duration
+const STORAGE_KEY = 'bworlds-replay-session';
 
 let _sessionId: string | null = null;
 let _sequenceNumber = 0;
+let _sessionStartedAt = 0;
 let _eventBuffer: eventWithTime[] = [];
 let _flushTimer: ReturnType<typeof setInterval> | null = null;
 let _stopRecording: (() => void) | null = null;
@@ -26,6 +30,13 @@ let _unloadHandler: (() => void) | null = null;
 // Cached from dynamic import so _hasErrors can use it at flush time
 let _EventType: { Custom: number } | null = null;
 
+interface StoredSession {
+  id: string;
+  seq: number;
+  startedAt: number;
+  lastActivityAt: number;
+}
+
 function _generateSessionId(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
     return crypto.randomUUID();
@@ -34,6 +45,53 @@ function _generateSessionId(): string {
     const r = (Math.random() * 16) | 0;
     return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
   });
+}
+
+function _loadSession(): StoredSession | null {
+  try {
+    const raw = sessionStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as StoredSession;
+  } catch {
+    return null;
+  }
+}
+
+function _saveSession(): void {
+  if (!_sessionId) return;
+  try {
+    const data: StoredSession = {
+      id: _sessionId,
+      seq: _sequenceNumber,
+      startedAt: _sessionStartedAt,
+      lastActivityAt: Date.now(),
+    };
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch {
+    // sessionStorage unavailable — not fatal
+  }
+}
+
+function _resolveSession(): void {
+  const now = Date.now();
+  const stored = _loadSession();
+
+  if (stored) {
+    const idleMs = now - stored.lastActivityAt;
+    const ageMs = now - stored.startedAt;
+
+    if (idleMs < IDLE_TIMEOUT_MS && ageMs < MAX_SESSION_MS) {
+      _sessionId = stored.id;
+      _sequenceNumber = stored.seq;
+      _sessionStartedAt = stored.startedAt;
+      return;
+    }
+  }
+
+  _sessionId = _generateSessionId();
+  _sequenceNumber = 0;
+  _sessionStartedAt = now;
+  _saveSession();
 }
 
 function _hasErrors(events: eventWithTime[]): boolean {
@@ -104,6 +162,7 @@ async function _flushChunk(events: eventWithTime[]): Promise<boolean> {
 
     // Increment only after confirmed delivery
     _sequenceNumber += 1;
+    _saveSession();
     return true;
   } catch (err: unknown) {
     console.warn(
@@ -149,6 +208,10 @@ function _beaconFlush(): void {
       `${_apiEndpoint}/api/telemetry/replay-events`,
       new Blob([body], { type: 'application/json' }),
     );
+    // Optimistic: sendBeacon is fire-and-forget, so we increment without
+    // delivery confirmation. Backend must tolerate sequence gaps.
+    _sequenceNumber += 1;
+    _saveSession();
   }
 }
 
@@ -169,6 +232,10 @@ export function stopReplay(): void {
     window.removeEventListener('beforeunload', _unloadHandler);
     _unloadHandler = null;
   }
+  // Reset module state so _resolveSession starts clean on next startReplay
+  _sessionId = null;
+  _sequenceNumber = 0;
+  _sessionStartedAt = 0;
 }
 
 export async function startReplay(
@@ -178,8 +245,7 @@ export async function startReplay(
   if (_stopRecording) return; // Already recording
   _buildSlug = buildSlug;
   _apiEndpoint = apiEndpoint.replace(/\/+$/, ''); // Strip trailing slashes
-  _sessionId = _generateSessionId();
-  _sequenceNumber = 0;
+  _resolveSession();
   _eventBuffer = [];
   _capReached = false;
 
