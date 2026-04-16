@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.4.0] — 2026-04-16
+
+### Added
+
+- **User identification in replays**: replay chunks now include the `bworlds_token` (read from cookie) so the backend can resolve sessions to a user email or IP.
+- **Session persistence**: replay sessions survive page navigations via sessionStorage. Sessions resume if idle < 15 min and age < 60 min, otherwise rotate to a new session.
+
+### Fixed
+
+- Module state (sessionId, sequenceNumber) is now reset on `stopReplay()` so the next `startReplay()` resolves cleanly from sessionStorage.
+
 ## [1.3.0] — 2026-04-14
 
 ### Added
