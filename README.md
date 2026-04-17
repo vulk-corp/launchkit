@@ -42,6 +42,44 @@ if (!session.valid) redirect(launchkit.getGateUrl());
 
 Replace `my-app` with your build slug from the BWORLDS dashboard.
 
+## Local development against a BWorlds dev stack
+
+When developing a consumer app against a locally-running BWorlds stack (or a PR preview), override the two hosted defaults via config. Both options are drop-in — the built-in gate overlay and redirect keep working, they just point at your local instance.
+
+```js
+init({
+  buildSlug: 'my-app',
+  apiEndpoint: 'http://localhost:3941', // telemetry + token validation
+  gateOrigin: 'http://localhost:3939',  // /access/:slug redirect target
+});
+```
+
+In practice both should be driven from env vars so production falls back to the hosted defaults (`undefined` → SDK default):
+
+```js
+init({
+  buildSlug: process.env.NEXT_PUBLIC_BWORLDS_BUILD_SLUG || 'my-prod-slug',
+  apiEndpoint: process.env.NEXT_PUBLIC_BWORLDS_API_ENDPOINT || undefined,
+  gateOrigin: process.env.NEXT_PUBLIC_BWORLDS_ORIGIN || undefined,
+});
+```
+
+Leave the env vars unset in production and the behavior matches the hosted BWorlds exactly.
+
+### Legacy workaround (pre-1.5.0)
+
+If you're stuck on `@bworlds/launchkit` < 1.5.0 (no `gateOrigin` support), disable the built-in gate and redirect manually — at the cost of losing the "Verifying access..." overlay:
+
+```js
+const launchkit = init({ buildSlug: 'my-app', apiEndpoint: 'http://localhost:3941', gate: false });
+
+launchkit.check().then((r) => {
+  if (!r.valid) window.location.href = `http://localhost:3939/access/my-app`;
+}).catch(() => {});
+```
+
+Upgrade to 1.5.0+ to drop the workaround.
+
 ## Lovable / Bolt / Base44
 
 Paste the snippet above directly into your AI builder as a prompt. The AI will handle the integration.
