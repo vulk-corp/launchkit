@@ -110,6 +110,21 @@ describe('LaunchKitInstance', () => {
     expect(instance.getGateUrl()).toBe('https://app.bworlds.co/access/my-app');
   });
 
+  it('getGateUrl() uses the gateOrigin override when provided', () => {
+    const instance = init({
+      buildSlug: 'my-app',
+      gateOrigin: 'http://localhost:3939',
+      gate: false,
+    });
+    expect(instance.getGateUrl()).toBe('http://localhost:3939/access/my-app');
+  });
+
+  it('getGateUrl() falls back to the default origin when gateOrigin is omitted on re-init', () => {
+    init({ buildSlug: 'my-app', gateOrigin: 'http://localhost:3939', gate: false });
+    const instance = init({ buildSlug: 'my-app', gate: false });
+    expect(instance.getGateUrl()).toBe('https://app.bworlds.co/access/my-app');
+  });
+
   it('stop() calls stopHeartbeat and stopErrorCapture', () => {
     const instance = init({ buildSlug: 'test-app', gate: false });
     instance.stop();
@@ -176,6 +191,34 @@ describe('gate overlay', () => {
 
     expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
     expect(hrefSetter).toHaveBeenCalledWith('https://app.bworlds.co/access/test-app');
+  });
+
+  it('built-in gate redirects to the gateOrigin override when provided', async () => {
+    const hrefSetter = vi.fn();
+    Object.defineProperty(window, 'location', {
+      value: { href: 'http://localhost/' },
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(window.location, 'href', {
+      set: hrefSetter,
+      get: () => 'http://localhost/',
+      configurable: true,
+    });
+
+    vi.mocked(check).mockResolvedValueOnce({
+      valid: false,
+      email: null,
+      accessType: null,
+      expiresAt: null,
+      degraded: false,
+    });
+
+    init({ buildSlug: 'test-app', gateOrigin: 'http://localhost:3939' });
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(hrefSetter).toHaveBeenCalledWith('http://localhost:3939/access/test-app');
   });
 
   it('does not show overlay when gate is disabled', () => {

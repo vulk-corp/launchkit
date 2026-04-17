@@ -12,4 +12,9 @@ export interface LaunchKitConfig {
   /** Enable access gating (default: true). Validates visitor tokens
    *  and redirects unauthorized visitors to the BWORLDS access page. */
   gate?: boolean;
+  /** Origin of the BWORLDS access page used for gate redirects.
+   *  Defaults to https://app.bworlds.co. Set this to point the
+   *  /access/:slug redirect at a local BWORLDS web instance during
+   *  development. No trailing slash. */
+  gateOrigin?: string;
 }

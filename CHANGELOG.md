@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.5.0] — 2026-04-16
+
+### Added
+
+- **`gateOrigin` config option**: override the origin used for `/access/:slug` redirects. Defaults to `https://app.bworlds.co`. Lets consumer apps point the gate at a local BWORLDS web instance during development without disabling the built-in gate + overlay. See the "Local development against a BWorlds dev stack" section of the README.
+
 ## [1.4.0] — 2026-04-16
 
 ### Added

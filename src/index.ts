@@ -9,10 +9,12 @@ export type { LaunchKitConfig } from './types';
 export type { CheckResult } from './check';
 
 const DEFAULT_API_ENDPOINT = 'https://api.bworlds.co';
+const DEFAULT_GATE_ORIGIN = 'https://app.bworlds.co';
 
 // Module-level state set by init(), read by standalone check/getGateUrl.
 let _buildSlug: string | null = null;
 let _apiEndpoint = DEFAULT_API_ENDPOINT;
+let _gateOrigin = DEFAULT_GATE_ORIGIN;
 
 // Module-level ref for the dynamically-imported stopReplay function
 let _stopReplay: (() => void) | null = null;
@@ -91,6 +93,7 @@ export interface LaunchKitInstance {
 export function init(config: LaunchKitConfig): LaunchKitInstance {
   _buildSlug = config.buildSlug;
   _apiEndpoint = config.apiEndpoint ?? DEFAULT_API_ENDPOINT;
+  _gateOrigin = config.gateOrigin ?? DEFAULT_GATE_ORIGIN;
 
   if (typeof window !== 'undefined') {
     const sandboxed = isSandboxed();
@@ -174,7 +177,7 @@ export function getGateUrl(): string {
     console.warn('[LaunchKit] getGateUrl() called before init().');
     return '';
   }
-  return `https://app.bworlds.co/access/${_buildSlug}`;
+  return `${_gateOrigin}/access/${_buildSlug}`;
 }
 
 /**
