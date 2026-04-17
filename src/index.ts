@@ -3,6 +3,7 @@ import { startHeartbeat, stopHeartbeat } from './heartbeat';
 import { startErrorCapture, stopErrorCapture } from './error-capture';
 import { check as _check } from './check';
 import { fetchRemoteConfig } from './remote-config';
+import { startBadgeWidget, stopBadgeWidget } from './badge-widget';
 import type { LaunchKitConfig } from './types';
 
 export type { LaunchKitConfig } from './types';
@@ -111,6 +112,7 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
     }
 
     // Remote config can disable features. Fail-open: if fetch fails, keep defaults.
+    // Trust badge is opt-in (default off), mounted only when remote.badge === true.
     fetchRemoteConfig(_apiEndpoint, _buildSlug)
       .then((remote) => {
         if (!remote) return;
@@ -118,6 +120,9 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
         if (!remote.sessionReplay) {
           stopErrorCapture();
           _stopReplay?.();
+        }
+        if (remote.badge && !sandboxed && _buildSlug) {
+          void startBadgeWidget(_buildSlug, _apiEndpoint, _gateOrigin);
         }
       })
       .catch(() => {});
@@ -187,4 +192,5 @@ export function stop(): void {
   stopHeartbeat();
   stopErrorCapture();
   _stopReplay?.();
+  stopBadgeWidget();
 }

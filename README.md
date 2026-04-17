@@ -13,6 +13,7 @@ Monitoring, error capture, and access gating SDK for AI-built apps. Drop-in inte
 - **Heartbeat monitoring**: automatic uptime tracking, sends a pulse every 5 minutes
 - **Error capture**: catches `window.onerror` and `unhandledrejection`, batches and forwards them
 - **Access gating**: token-based session validation with redirect to a hosted access page
+- **Trust badge widget**: optional floating "Runs on BWORLDS" pill, toggled from the BWORLDS dashboard (no consumer-side flag)
 - **Zero config**: works with a single `buildSlug`, no API key required. All settings are managed remotely from the BWORLDS dashboard.
 - **Lightweight**: works in any browser environment
 - **CDN-ready**: use via npm or a `<script>` tag from unpkg
@@ -102,6 +103,7 @@ All behavior is configured remotely from the [BWORLDS dashboard](https://app.bwo
 | Heartbeat | Automatic uptime pulse |
 | Error capture | `window.onerror` + `unhandledrejection`, batched |
 | Access gating | Token-based session validation with hosted access page |
+| Trust badge | Floating "Runs on BWORLDS" pill, toggled from the dashboard |
 
 All requests are write-only and identified by `buildSlug`. No API key required.
 

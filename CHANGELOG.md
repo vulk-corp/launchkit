@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.6.0] — 2026-04-17
+
+### Added
+
+- **Trust badge widget**: a floating "Runs on BWORLDS · {passed}/{total} verified" pill, mounted bottom-right on the consumer site. Activated server-side via the dashboard toggle on the proof-seal page (no consumer-side flag). Rendered inside a shadow DOM at `z-index: 2147483000` so host-site CSS cannot interfere. Links to the public trust page in a new tab with `rel="noopener noreferrer"`.
+- **`SdkRemoteConfig.badge`**: new boolean field returned by `/api/telemetry/sdk-config`. Defaults to `false` (opt-in). When `true`, the SDK fetches `/api/telemetry/badge-counts` once per pageload (3s abort timeout) and renders the pass/total counts.
+- **Graceful fallback**: if the counts endpoint fails or times out, the badge still mounts with the "Runs on BWORLDS" label only (no counts suffix).
+- **Sandboxed-iframe skip**: the badge does not mount inside cross-origin iframes (e.g. Lovable/Bolt editor previews), same policy as error capture and session replay.
+
 ## [1.5.0] — 2026-04-16
 
 ### Added

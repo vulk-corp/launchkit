@@ -4,6 +4,7 @@ import { startHeartbeat, stopHeartbeat } from '../src/heartbeat';
 import { startErrorCapture, stopErrorCapture } from '../src/error-capture';
 import { check } from '../src/check';
 import { fetchRemoteConfig } from '../src/remote-config';
+import { startBadgeWidget } from '../src/badge-widget';
 
 vi.mock('../src/telemetry-sender', () => ({
   configureSender: vi.fn(),
@@ -31,6 +32,11 @@ vi.mock('../src/replay', () => ({
 
 vi.mock('../src/remote-config', () => ({
   fetchRemoteConfig: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock('../src/badge-widget', () => ({
+  startBadgeWidget: vi.fn().mockResolvedValue(undefined),
+  stopBadgeWidget: vi.fn(),
 }));
 
 const mockFetchRemoteConfig = vi.mocked(fetchRemoteConfig);
@@ -67,7 +73,7 @@ describe('init()', () => {
   });
 
   it('stops heartbeat when remote config disables monitoring', async () => {
-    mockFetchRemoteConfig.mockResolvedValue({ monitoring: false, sessionReplay: true });
+    mockFetchRemoteConfig.mockResolvedValue({ monitoring: false, sessionReplay: true, badge: false });
 
     init({ buildSlug: 'test-app', gate: false });
     await vi.waitFor(() => {
@@ -76,7 +82,7 @@ describe('init()', () => {
   });
 
   it('stops error capture and replay when remote config disables sessionReplay', async () => {
-    mockFetchRemoteConfig.mockResolvedValue({ monitoring: true, sessionReplay: false });
+    mockFetchRemoteConfig.mockResolvedValue({ monitoring: true, sessionReplay: false, badge: false });
 
     init({ buildSlug: 'test-app', gate: false });
     await vi.waitFor(() => {
@@ -94,6 +100,38 @@ describe('init()', () => {
 
     expect(stopHeartbeat).not.toHaveBeenCalled();
     expect(stopErrorCapture).not.toHaveBeenCalled();
+  });
+
+  it('starts the badge widget when remote config enables badge', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: true,
+      sessionReplay: true,
+      badge: true,
+    });
+
+    init({ buildSlug: 'test-app', gate: false });
+
+    await vi.waitFor(() => {
+      expect(startBadgeWidget).toHaveBeenCalledWith(
+        'test-app',
+        'https://api.bworlds.co',
+        'https://app.bworlds.co'
+      );
+    });
+  });
+
+  it('does not start the badge widget when remote config disables badge', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: true,
+      sessionReplay: true,
+      badge: false,
+    });
+
+    init({ buildSlug: 'test-app', gate: false });
+
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(startBadgeWidget).not.toHaveBeenCalled();
   });
 });
 
