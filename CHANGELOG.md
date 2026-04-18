@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.1] — 2026-04-17
+
+### Fixed
+
+- **Mid-session rotation on idle**: the SDK now rotates to a fresh session id when the gap between rrweb events exceeds 4 minutes — one minute below the server's 5-minute idle-assembly threshold. Previously the SDK kept writing to a session id that the server had already closed, so chunks arriving after a tab-away were discarded as late. On rotation, the old buffer is flushed under the old identity and `rrweb.record.takeFullSnapshot(true)` emits a fresh type-2 so the new session is independently replayable.
+- **Stale seq increments across rotation**: `_flushChunk` no longer mutates module state. Callers decide whether to advance `_sequenceNumber` and only do so when the session hasn't rotated mid-flight.
+
 ## [1.6.0] — 2026-04-17
 
 ### Added
