@@ -20,9 +20,8 @@ jobs:
           cache: npm
           registry-url: 'https://registry.npmjs.org'
 
-      - run: npm install -g npm@latest --force
       - run: npm ci
       - run: npm run type-check
       - run: npm run build
       - run: npm test
-      - run: npm publish --provenance --access public
+      - run: npx -y npm@latest publish --provenance --access public
