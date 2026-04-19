@@ -13,6 +13,7 @@
  */
 
 import type { eventWithTime, record as rrwebRecord } from 'rrweb';
+import { getIdentity } from './identity-state';
 
 const SDK_TAG = '[@bworlds/launchkit]';
 const FLUSH_INTERVAL_MS = 10_000;
@@ -42,6 +43,8 @@ let _visibilityHandler: (() => void) | null = null;
 let _unloadHandler: (() => void) | null = null;
 // Cached from dynamic import so _hasErrors can use it at flush time
 let _EventType: { Custom: number } | null = null;
+// UA captured once on startReplay() — sent only on first chunk
+let _userAgent: string | null = null;
 
 interface StoredSession {
   id: string;
@@ -120,6 +123,25 @@ function _readToken(): string | null {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
+/**
+ * Decode the `email` claim from the bworlds_token JWT without verification.
+ * This is an opportunistic read — the server re-verifies the JWT at ingest.
+ * Returns null when the cookie is absent, malformed, or has no email claim.
+ */
+function _readCookieEmail(): string | null {
+  const token = _readToken();
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))) as Record<string, unknown>;
+    const email = payload['email'];
+    return typeof email === 'string' && email.length > 0 ? email : null;
+  } catch {
+    return null;
+  }
+}
+
 function _hasErrors(events: eventWithTime[]): boolean {
   if (!_EventType) return false;
   return events.some(
@@ -133,15 +155,29 @@ function _buildPayload(
   events: eventWithTime[],
   sessionId: string,
   sequenceNumber: number,
+  isFirstChunk: boolean,
 ): Record<string, unknown> {
   const token = _readToken();
+
+  // Identity: prefer explicitly set identity, fall back to cookie email claim
+  // (server re-verifies the token, so this is tagged 'sdk_unverified' at ingest)
+  let { email, userId } = getIdentity();
+  if (!email) {
+    email = _readCookieEmail();
+  }
+
   return {
     buildSlug: _buildSlug,
     sessionId,
     sequenceNumber,
+    isFirstChunk,
     ...(token && { token }),
     events,
     hasErrors: _hasErrors(events),
+    ...(email && { userEmail: email }),
+    ...(userId && { userId }),
+    // UA sent on first chunk only; omitted on subsequent chunks
+    ...(isFirstChunk && _userAgent && { userAgent: _userAgent }),
   };
 }
 
@@ -158,13 +194,15 @@ async function _flushChunk(
 ): Promise<boolean> {
   if (!_buildSlug || !_apiEndpoint || events.length === 0) return true;
 
-  const body = JSON.stringify(_buildPayload(events, sessionId, sequenceNumber));
+  const isFirst = sequenceNumber === 0;
+  const body = JSON.stringify(_buildPayload(events, sessionId, sequenceNumber, isFirst));
   const bodyBytes = new TextEncoder().encode(body).byteLength;
 
   // Split oversized chunks recursively instead of dropping events. Each half
   // reuses the same sequenceNumber — the server dedupes on (session, seq).
   if (bodyBytes > MAX_CHUNK_BYTES && events.length > 1) {
     const mid = Math.floor(events.length / 2);
+    // Pass the same sequenceNumber to sub-chunks (server dedupes)
     const a = await _flushChunk(events.slice(0, mid), sessionId, sequenceNumber);
     const b = await _flushChunk(events.slice(mid), sessionId, sequenceNumber);
     return a && b;
@@ -244,8 +282,9 @@ function _beaconFlush(): void {
   if (!_buildSlug || !_apiEndpoint || !_sessionId) return;
 
   const events = _eventBuffer.splice(0);
+  const isFirst = _sequenceNumber === 0;
   const body = JSON.stringify(
-    _buildPayload(events, _sessionId, _sequenceNumber),
+    _buildPayload(events, _sessionId, _sequenceNumber, isFirst),
   );
   if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
     navigator.sendBeacon(
@@ -315,6 +354,8 @@ export function stopReplay(): void {
   _sessionStartedAt = 0;
   _lastEventAt = 0;
   _record = null;
+  _userAgent = null;
+  _flushing = false;
 }
 
 export async function startReplay(
@@ -328,6 +369,11 @@ export async function startReplay(
   _eventBuffer = [];
   _capReached = false;
   _lastEventAt = 0;
+
+  // Capture UA once per replay session — sent on first chunk only
+  if (typeof navigator !== 'undefined' && navigator.userAgent) {
+    _userAgent = navigator.userAgent;
+  }
 
   // Dynamic import — rrweb is only loaded when replay is enabled
   let rrweb: typeof import('rrweb') | null = null;

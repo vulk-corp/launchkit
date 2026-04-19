@@ -4,6 +4,7 @@ import { startErrorCapture, stopErrorCapture } from './error-capture';
 import { check as _check } from './check';
 import { fetchRemoteConfig } from './remote-config';
 import { startBadgeWidget, stopBadgeWidget } from './badge-widget';
+import { setIdentity, getIdentity } from './identity-state';
 import type { LaunchKitConfig } from './types';
 
 export type { LaunchKitConfig } from './types';
@@ -19,6 +20,8 @@ let _gateOrigin = DEFAULT_GATE_ORIGIN;
 
 // Module-level ref for the dynamically-imported stopReplay function
 let _stopReplay: (() => void) | null = null;
+
+// (Identity state lives in identity-state.ts to avoid circular imports with replay.ts)
 
 /** True when the app runs inside a cross-origin iframe (e.g. Lovable editor). */
 function isSandboxed(): boolean {
@@ -66,6 +69,13 @@ function showGateOverlay(): { remove: () => void } {
   };
 }
 
+export interface IdentifyOptions {
+  /** End-user email address. Sent with each subsequent chunk as `userEmail`. */
+  email?: string;
+  /** End-user identifier from your system. Sent with each chunk as `userId`. */
+  userId?: string;
+}
+
 export interface LaunchKitInstance {
   /**
    * Validate the current client's access token.
@@ -80,6 +90,12 @@ export interface LaunchKitInstance {
    * Stop all monitoring. Call on cleanup/unmount if needed.
    */
   stop: () => void;
+  /**
+   * Forward end-user identity to BWORLDS session replay.
+   * Call after init() when the user logs in or their identity is known.
+   * Identity is included in every subsequent chunk upload.
+   */
+  identify: (options: IdentifyOptions) => void;
 }
 
 /**
@@ -141,7 +157,7 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
     }
   }
 
-  return { check, getGateUrl, stop };
+  return { check, getGateUrl, stop, identify };
 }
 
 function startReplayModule(buildSlug: string, apiEndpoint: string): void {
@@ -194,3 +210,15 @@ export function stop(): void {
   _stopReplay?.();
   stopBadgeWidget();
 }
+
+/**
+ * Forward end-user identity to BWORLDS session replay.
+ * Call after init() when the user logs in or their identity is known.
+ * Stored in shared module state; included in every subsequent chunk upload.
+ */
+export function identify(options: IdentifyOptions): void {
+  setIdentity(options.email ?? null, options.userId ?? null);
+}
+
+/** Accessor for reading current identity state (re-exports from shared module). */
+export const _getIdentity = getIdentity;
