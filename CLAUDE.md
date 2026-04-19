@@ -65,11 +65,21 @@ Replay payload includes `token` (read from `bworlds_token` cookie) so backend re
 
 ## Release
 
-1. Merge to `main`.
-2. Bump `package.json` version.
-3. Append `CHANGELOG.md` entry.
-4. Commit, push.
-5. `git tag vX.Y.Z && git push --tags` → `.github/workflows/release.yml` publishes to npm with OIDC provenance.
-6. Bump `@bworlds/launchkit` in monorepo `apps/bworlds-web/package.json`.
+**Tag push is the publish trigger.** `.github/workflows/release.yml` runs on `v*` tags: type-check → build → test → `npm publish --provenance`.
 
-Breaking change → major. New feature → minor. Bugfix → patch. Never publish if CI red.
+1. Merge to `main`.
+2. Bump `package.json` version (must match the tag).
+3. Append `CHANGELOG.md` entry.
+4. Commit, push `main`.
+5. `git tag vX.Y.Z && git push origin vX.Y.Z` → CI publishes.
+6. Fast-forward `next` to `main`: `git checkout next && git merge main --ff-only && git push origin next`.
+7. Bump `@bworlds/launchkit` in monorepo `apps/bworlds-web/package.json`.
+
+**Tag rules**
+- Tag name = `v` + `package.json` version. No exceptions.
+- Never push a tag for a version already on npm (CI goes red on `npm publish` 403).
+- Never re-tag. Bump patch instead.
+- Never delete a published tag. Git history stays honest.
+- Keep `next` in sync with `main` after every release tag.
+
+Breaking → major. Feature → minor. Bugfix → patch. Never publish if CI red.
