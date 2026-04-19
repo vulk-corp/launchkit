@@ -24,4 +24,19 @@ jobs:
       - run: npm run type-check
       - run: npm run build
       - run: npm test
-      - run: npx -y npm@latest publish --provenance --access public
+
+      - name: Check if version already on npm
+        id: check
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if npm view "@bworlds/launchkit@$VERSION" version >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION already published on npm - skipping publish (tag backfill or re-run)."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.check.outputs.already == 'false'
+        run: npx -y npm@latest publish --provenance --access public
