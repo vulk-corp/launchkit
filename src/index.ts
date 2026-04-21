@@ -2,7 +2,7 @@ import { configureSender } from './telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from './heartbeat';
 import { startErrorCapture, stopErrorCapture } from './error-capture';
 import { check as _check } from './check';
-import { fetchRemoteConfig } from './remote-config';
+import { fetchRemoteConfig, readCachedGatingEnabled } from './remote-config';
 import { startBadgeWidget, stopBadgeWidget } from './badge-widget';
 import { setIdentity, getIdentity } from './identity-state';
 import type { LaunchKitConfig } from './types';
@@ -145,15 +145,28 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
 
     // Access gating: show loading screen, check token, redirect or reveal app.
     // Skipped in sandboxed iframes (editor previews).
+    //
+    // SWR cache check (synchronous): if the cached config explicitly says
+    // gatingEnabled=false, this build has no paid pricing — skip the overlay
+    // AND the validate-token call entirely. The background fetch (already kicked
+    // off by fetchRemoteConfig above) will overwrite the cache with fresh data.
+    //
+    // Fail-safe: on cold cache / parse error / missing field → gating defaults true
+    // → overlay mounts (paid content never exposed by a silent failure).
     if (config.gate !== false && !sandboxed) {
-      const overlay = showGateOverlay();
-      check().then((session) => {
-        if (!session.valid) {
-          window.location.href = getGateUrl();
-        } else {
-          overlay.remove();
-        }
-      });
+      const gatingEnabled = readCachedGatingEnabled(_buildSlug!);
+      if (gatingEnabled) {
+        const overlay = showGateOverlay();
+        check().then((session) => {
+          if (!session.valid) {
+            window.location.href = getGateUrl();
+          } else {
+            overlay.remove();
+          }
+        });
+      }
+      // gatingEnabled === false: skip overlay and validate-token call entirely.
+      // Background fetch already in flight to refresh the cache.
     }
   }
 
