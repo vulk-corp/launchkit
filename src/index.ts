@@ -1,6 +1,7 @@
 import { configureSender } from './telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from './heartbeat';
 import { startErrorCapture, stopErrorCapture } from './error-capture';
+import { startNetworkCapture, stopNetworkCapture } from './network-capture';
 import { check as _check } from './check';
 import { fetchRemoteConfig, readCachedGatingEnabled } from './remote-config';
 import { startBadgeWidget, stopBadgeWidget } from './badge-widget';
@@ -124,6 +125,7 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
     // Sandboxed iframes (e.g. Lovable/Bolt editor) are skipped.
     if (!sandboxed) {
       startErrorCapture(_buildSlug);
+      startNetworkCapture(_apiEndpoint);
       startReplayModule(_buildSlug, _apiEndpoint);
     }
 
@@ -135,6 +137,7 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
         if (!remote.monitoring) stopHeartbeat();
         if (!remote.sessionReplay) {
           stopErrorCapture();
+          stopNetworkCapture();
           _stopReplay?.();
         }
         if (remote.badge && !sandboxed && _buildSlug) {
@@ -220,6 +223,7 @@ export function getGateUrl(): string {
 export function stop(): void {
   stopHeartbeat();
   stopErrorCapture();
+  stopNetworkCapture();
   _stopReplay?.();
   stopBadgeWidget();
 }
