@@ -17,4 +17,8 @@ export interface LaunchKitConfig {
    *  /access/:slug redirect at a local BWORLDS web instance during
    *  development. No trailing slash. */
   gateOrigin?: string;
+  /** Bypass origin-scope guard for local development.
+   *  When true, all subsystems activate regardless of origin mismatch.
+   *  Do not ship with `dev: true` in production. */
+  dev?: boolean;
 }

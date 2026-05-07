@@ -24,7 +24,7 @@ describe('startHeartbeat / stopHeartbeat', () => {
     expect(mockSendTelemetry).toHaveBeenCalledTimes(1);
     expect(mockSendTelemetry).toHaveBeenCalledWith(
       '/api/telemetry/heartbeat',
-      { buildSlug: 'test-app' },
+      expect.objectContaining({ buildSlug: 'test-app', metadata: expect.objectContaining({ sdk_version: expect.any(String) }) }),
     );
   });
 

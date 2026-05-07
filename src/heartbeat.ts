@@ -7,6 +7,8 @@
 
 import { sendTelemetry } from './telemetry-sender';
 
+declare const __SDK_VERSION__: string;
+
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 let _intervalId: ReturnType<typeof setInterval> | null = null;
@@ -37,5 +39,6 @@ async function sendHeartbeat(): Promise<void> {
   if (!_buildSlug) return;
   await sendTelemetry('/api/telemetry/heartbeat', {
     buildSlug: _buildSlug,
+    metadata: { sdk_version: typeof __SDK_VERSION__ !== 'undefined' ? __SDK_VERSION__ : 'unknown' },
   });
 }

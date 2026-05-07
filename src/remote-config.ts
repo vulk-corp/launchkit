@@ -31,6 +31,12 @@ export interface SdkRemoteConfig {
    * Fail-safe: absent field is treated as true (overlay mounts).
    */
   gatingEnabled: boolean;
+  /**
+   * Origin derived from the build's registered URL (e.g. "https://myapp.com").
+   * SDK compares this against `window.location.origin` to scope telemetry.
+   * Null means "no restriction" (fail-open for backward compat).
+   */
+  allowedOrigin: string | null;
 }
 
 // Cache is cross-tab persistent (localStorage): survives tab close/reopen.
@@ -81,8 +87,10 @@ export async function fetchRemoteConfig(
     return config;
   }).catch(() => null);
 
-  // Return cached value synchronously if available, otherwise await the fetch.
-  if (cached) return cached;
+  // Return cached value if available AND it contains the allowedOrigin field.
+  // Old cached configs (pre-origin-scope) lack allowedOrigin — wait for the
+  // network fetch so the origin guard in index.ts has data to work with.
+  if (cached && 'allowedOrigin' in cached) return cached;
   return fetchAndCache;
 }
 

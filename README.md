@@ -55,6 +55,17 @@ init({
 });
 ```
 
+The SDK scopes all telemetry to the build's registered URL origin. During local development your app runs on `localhost`, which won't match. Pass `dev: true` to bypass the origin check:
+
+```js
+init({
+  buildSlug: 'my-app',
+  apiEndpoint: 'http://localhost:3941', // telemetry + token validation
+  gateOrigin: 'http://localhost:3939',  // /access/:slug redirect target
+  dev: true,                            // bypass origin-scope guard
+});
+```
+
 In practice both should be driven from env vars so production falls back to the hosted defaults (`undefined` → SDK default):
 
 ```js
@@ -62,10 +73,11 @@ init({
   buildSlug: process.env.NEXT_PUBLIC_BWORLDS_BUILD_SLUG || 'my-prod-slug',
   apiEndpoint: process.env.NEXT_PUBLIC_BWORLDS_API_ENDPOINT || undefined,
   gateOrigin: process.env.NEXT_PUBLIC_BWORLDS_ORIGIN || undefined,
+  dev: process.env.NODE_ENV === 'development',
 });
 ```
 
-Leave the env vars unset in production and the behavior matches the hosted BWorlds exactly.
+Leave the env vars unset in production and the behavior matches the hosted BWorlds exactly. **Do not ship `dev: true` in production** — it bypasses the origin guard entirely.
 
 ### Legacy workaround (pre-1.5.0)
 

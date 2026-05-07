@@ -22,6 +22,9 @@ let _gateOrigin = DEFAULT_GATE_ORIGIN;
 // Module-level ref for the dynamically-imported stopReplay function
 let _stopReplay: (() => void) | null = null;
 
+// Guard against double init() — prevents duplicate subsystem activation
+let _initialized = false;
+
 // (Identity state lives in identity-state.ts to avoid circular imports with replay.ts)
 
 /** True when the app runs inside a cross-origin iframe (e.g. Lovable editor). */
@@ -100,6 +103,27 @@ export interface LaunchKitInstance {
 }
 
 /**
+ * Strip the www. prefix from an origin so https://www.x.com matches https://x.com.
+ */
+function stripWww(origin: string): string {
+  return origin.replace('://www.', '://');
+}
+
+/**
+ * Check whether the current page's origin matches the build's allowed origin.
+ * Returns true (activate) when:
+ *   - `dev: true` is set (local development bypass)
+ *   - `allowedOrigin` is null/empty (fail-open for backward compat)
+ *   - origins match after www. normalization
+ */
+function originMatches(allowedOrigin: string | null, dev: boolean): boolean {
+  if (dev) return true;
+  if (!allowedOrigin) return true;
+  if (typeof window === 'undefined') return true;
+  return stripWww(window.location.origin) === stripWww(allowedOrigin);
+}
+
+/**
  * Initialize LaunchKit monitoring and return an instance for access gating.
  *
  *   const launchkit = init({ buildSlug: 'my-app' })
@@ -107,73 +131,132 @@ export interface LaunchKitInstance {
  * All features start enabled by default. Remote config from the BWORLDS
  * dashboard can disable individual features. If the backend is unreachable,
  * everything stays on (fail-open).
+ *
+ * Origin guard: subsystems are deferred until after the sdk-config fetch
+ * resolves. If the current page's origin doesn't match the build's registered
+ * URL, no subsystems start — the SDK is completely silent.
  */
 export function init(config: LaunchKitConfig): LaunchKitInstance {
+  if (_initialized) {
+    console.warn('[@bworlds/launchkit] init() called more than once — ignoring duplicate call.');
+    return { check, getGateUrl, stop, identify };
+  }
+
+  if (!config.buildSlug) {
+    console.warn('[@bworlds/launchkit] init() called without buildSlug — SDK will not start.');
+    return { check, getGateUrl, stop, identify };
+  }
+
+  _initialized = true;
+
   _buildSlug = config.buildSlug;
   _apiEndpoint = config.apiEndpoint ?? DEFAULT_API_ENDPOINT;
   _gateOrigin = config.gateOrigin ?? DEFAULT_GATE_ORIGIN;
 
   if (typeof window !== 'undefined') {
     const sandboxed = isSandboxed();
+    const isDev = config.dev === true;
 
+    // configureSender is needed for the config fetch itself.
     configureSender({ buildSlug: _buildSlug, apiEndpoint: _apiEndpoint });
 
-    // Start monitoring immediately (defaults: all on)
-    startHeartbeat(_buildSlug);
-
-    // Error capture and replay only run in top-level window.
-    // Sandboxed iframes (e.g. Lovable/Bolt editor) are skipped.
-    if (!sandboxed) {
-      startErrorCapture(_buildSlug);
-      startNetworkCapture(_apiEndpoint);
-      startReplayModule(_buildSlug, _apiEndpoint);
-    }
-
-    // Remote config can disable features. Fail-open: if fetch fails, keep defaults.
-    // Trust badge is opt-in (default off), mounted only when remote.badge === true.
+    // Fetch remote config, then check origin before activating any subsystem.
+    // This replaces the previous eager-start approach.
     fetchRemoteConfig(_apiEndpoint, _buildSlug)
       .then((remote) => {
-        if (!remote) return;
-        if (!remote.monitoring) stopHeartbeat();
-        if (!remote.sessionReplay) {
-          stopErrorCapture();
-          stopNetworkCapture();
-          _stopReplay?.();
-        }
-        if (remote.badge && !sandboxed && _buildSlug) {
-          void startBadgeWidget(_buildSlug, _apiEndpoint, _gateOrigin);
+        try {
+          if (!remote) {
+            activateSubsystems(config, sandboxed, null);
+            return;
+          }
+
+          const allowed = remote.allowedOrigin ?? null;
+          if (!originMatches(allowed, isDev)) {
+            return;
+          }
+
+          activateSubsystems(config, sandboxed, remote);
+        } catch (err) {
+          console.warn('[@bworlds/launchkit] subsystem activation failed:', err);
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        try {
+          activateSubsystems(config, sandboxed, null);
+        } catch (err) {
+          console.warn('[@bworlds/launchkit] subsystem activation failed:', err);
+        }
+      });
+  }
 
-    // Access gating: show loading screen, check token, redirect or reveal app.
-    // Skipped in sandboxed iframes (editor previews).
-    //
-    // SWR cache check (synchronous): if the cached config explicitly says
-    // gatingEnabled=false, this build has no paid pricing — skip the overlay
-    // AND the validate-token call entirely. The background fetch (already kicked
-    // off by fetchRemoteConfig above) will overwrite the cache with fresh data.
-    //
-    // Fail-safe: on cold cache / parse error / missing field → gating defaults true
-    // → overlay mounts (paid content never exposed by a silent failure).
-    if (config.gate !== false && !sandboxed) {
-      const gatingEnabled = readCachedGatingEnabled(_buildSlug!);
-      if (gatingEnabled) {
-        const overlay = showGateOverlay();
-        check().then((session) => {
+  return { check, getGateUrl, stop, identify };
+}
+
+/**
+ * Start all monitoring subsystems and gating logic.
+ * Called only after origin check passes (or is bypassed).
+ */
+function activateSubsystems(
+  config: LaunchKitConfig,
+  sandboxed: boolean,
+  remote: import('./remote-config').SdkRemoteConfig | null
+): void {
+  const buildSlug = _buildSlug!;
+  const apiEndpoint = _apiEndpoint;
+
+  // Start monitoring (defaults: all on).
+  startHeartbeat(buildSlug);
+
+  // Error capture and replay only run in top-level window.
+  // Sandboxed iframes (e.g. Lovable/Bolt editor) are skipped.
+  if (!sandboxed) {
+    startErrorCapture(buildSlug);
+    startNetworkCapture(apiEndpoint);
+    startReplayModule(buildSlug, apiEndpoint);
+  }
+
+  // Apply remote toggles if available.
+  if (remote) {
+    if (!remote.monitoring) stopHeartbeat();
+    if (!remote.sessionReplay) {
+      stopErrorCapture();
+      stopNetworkCapture();
+      _stopReplay?.();
+    }
+    if (remote.badge && !sandboxed) {
+      void startBadgeWidget(buildSlug, apiEndpoint, _gateOrigin);
+    }
+  }
+
+  // Access gating: show loading screen, check token, redirect or reveal app.
+  // Skipped in sandboxed iframes (editor previews).
+  //
+  // SWR cache check (synchronous): if the cached config explicitly says
+  // gatingEnabled=false, this build has no paid pricing — skip the overlay
+  // AND the validate-token call entirely. The background fetch (already kicked
+  // off by fetchRemoteConfig above) will overwrite the cache with fresh data.
+  //
+  // Fail-safe: on cold cache / parse error / missing field → gating defaults true
+  // → overlay mounts (paid content never exposed by a silent failure).
+  if (config.gate !== false && !sandboxed) {
+    const gatingEnabled = readCachedGatingEnabled(buildSlug);
+    if (gatingEnabled) {
+      const overlay = showGateOverlay();
+      check()
+        .then((session) => {
           if (!session.valid) {
             window.location.href = getGateUrl();
           } else {
             overlay.remove();
           }
+        })
+        .catch(() => {
+          overlay.remove();
         });
-      }
-      // gatingEnabled === false: skip overlay and validate-token call entirely.
-      // Background fetch already in flight to refresh the cache.
     }
+    // gatingEnabled === false: skip overlay and validate-token call entirely.
+    // Background fetch already in flight to refresh the cache.
   }
-
-  return { check, getGateUrl, stop, identify };
 }
 
 function startReplayModule(buildSlug: string, apiEndpoint: string): void {
@@ -226,6 +309,7 @@ export function stop(): void {
   stopNetworkCapture();
   _stopReplay?.();
   stopBadgeWidget();
+  _initialized = false;
 }
 
 /**

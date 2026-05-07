@@ -3,6 +3,7 @@ import { configureSender } from '../src/telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from '../src/heartbeat';
 import { startErrorCapture, stopErrorCapture } from '../src/error-capture';
 import { check } from '../src/check';
+import type { CheckResult } from '../src/check';
 import { fetchRemoteConfig, readCachedGatingEnabled } from '../src/remote-config';
 import { startBadgeWidget } from '../src/badge-widget';
 
@@ -32,7 +33,7 @@ vi.mock('../src/replay', () => ({
 
 vi.mock('../src/remote-config', () => ({
   fetchRemoteConfig: vi.fn().mockResolvedValue(null),
-  // Default: cold cache → gating enabled → overlay mounts (fail-safe).
+  // Default: cold cache -> gating enabled -> overlay mounts (fail-safe).
   // Tests that need ungated behavior can override per-test.
   readCachedGatingEnabled: vi.fn().mockReturnValue(true),
 }));
@@ -42,16 +43,28 @@ vi.mock('../src/badge-widget', () => ({
   stopBadgeWidget: vi.fn(),
 }));
 
+vi.mock('../src/network-capture', () => ({
+  startNetworkCapture: vi.fn(),
+  stopNetworkCapture: vi.fn(),
+}));
+
 const mockFetchRemoteConfig = vi.mocked(fetchRemoteConfig);
 const mockReadCachedGatingEnabled = vi.mocked(readCachedGatingEnabled);
 
 beforeEach(() => {
+  // Reset SDK state so _initialized is false for each test.
+  stop();
   vi.clearAllMocks();
   document.getElementById('bworlds-gate-overlay')?.remove();
   mockFetchRemoteConfig.mockResolvedValue(null);
-  // Default: cold cache → gating enabled → overlay mounts (fail-safe).
+  // Default: cold cache -> gating enabled -> overlay mounts (fail-safe).
   mockReadCachedGatingEnabled.mockReturnValue(true);
 });
+
+/** Flush microtask queue so the deferred activation in init() completes. */
+async function flushMicrotasks(): Promise<void> {
+  await new Promise((r) => setTimeout(r, 0));
+}
 
 describe('init()', () => {
   it('calls configureSender with buildSlug and apiEndpoint', () => {
@@ -63,13 +76,15 @@ describe('init()', () => {
     });
   });
 
-  it('starts heartbeat by default', () => {
+  it('starts heartbeat by default after config fetch resolves', async () => {
     init({ buildSlug: 'test-app', gate: false });
+    await flushMicrotasks();
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
   });
 
-  it('starts error capture by default', () => {
+  it('starts error capture by default after config fetch resolves', async () => {
     init({ buildSlug: 'test-app', gate: false });
+    await flushMicrotasks();
     expect(startErrorCapture).toHaveBeenCalledWith('test-app');
   });
 
@@ -79,7 +94,7 @@ describe('init()', () => {
   });
 
   it('stops heartbeat when remote config disables monitoring', async () => {
-    mockFetchRemoteConfig.mockResolvedValue({ monitoring: false, sessionReplay: true, badge: false, gatingEnabled: false });
+    mockFetchRemoteConfig.mockResolvedValue({ monitoring: false, sessionReplay: true, badge: false, gatingEnabled: false, allowedOrigin: null });
 
     init({ buildSlug: 'test-app', gate: false });
     await vi.waitFor(() => {
@@ -88,7 +103,7 @@ describe('init()', () => {
   });
 
   it('stops error capture and replay when remote config disables sessionReplay', async () => {
-    mockFetchRemoteConfig.mockResolvedValue({ monitoring: true, sessionReplay: false, badge: false, gatingEnabled: false });
+    mockFetchRemoteConfig.mockResolvedValue({ monitoring: true, sessionReplay: false, badge: false, gatingEnabled: false, allowedOrigin: null });
 
     init({ buildSlug: 'test-app', gate: false });
     await vi.waitFor(() => {
@@ -102,7 +117,7 @@ describe('init()', () => {
     init({ buildSlug: 'test-app', gate: false });
 
     // Let promises settle
-    await new Promise((r) => setTimeout(r, 0));
+    await flushMicrotasks();
 
     expect(stopHeartbeat).not.toHaveBeenCalled();
     expect(stopErrorCapture).not.toHaveBeenCalled();
@@ -114,6 +129,7 @@ describe('init()', () => {
       sessionReplay: true,
       badge: true,
       gatingEnabled: false,
+      allowedOrigin: null,
     });
 
     init({ buildSlug: 'test-app', gate: false });
@@ -133,11 +149,12 @@ describe('init()', () => {
       sessionReplay: true,
       badge: false,
       gatingEnabled: false,
+      allowedOrigin: null,
     });
 
     init({ buildSlug: 'test-app', gate: false });
 
-    await new Promise((r) => setTimeout(r, 0));
+    await flushMicrotasks();
 
     expect(startBadgeWidget).not.toHaveBeenCalled();
   });
@@ -166,13 +183,17 @@ describe('LaunchKitInstance', () => {
   });
 
   it('getGateUrl() falls back to the default origin when gateOrigin is omitted on re-init', () => {
+    // After stop(), re-init with different config resets module state.
     init({ buildSlug: 'my-app', gateOrigin: 'http://localhost:3939', gate: false });
+    stop();
+    vi.clearAllMocks();
     const instance = init({ buildSlug: 'my-app', gate: false });
     expect(instance.getGateUrl()).toBe('https://app.bworlds.co/access/my-app');
   });
 
   it('stop() calls stopHeartbeat and stopErrorCapture', () => {
     const instance = init({ buildSlug: 'test-app', gate: false });
+    vi.clearAllMocks(); // Clear calls from init
     instance.stop();
 
     expect(stopHeartbeat).toHaveBeenCalled();
@@ -183,6 +204,7 @@ describe('LaunchKitInstance', () => {
 describe('top-level stop()', () => {
   it('calls stopHeartbeat and stopErrorCapture', () => {
     init({ buildSlug: 'test-app', gate: false });
+    vi.clearAllMocks(); // Clear calls from init
     stop();
 
     expect(stopHeartbeat).toHaveBeenCalled();
@@ -192,9 +214,18 @@ describe('top-level stop()', () => {
 
 describe('gate overlay', () => {
   it('shows overlay during access check', async () => {
+    // Use a pending check so the overlay stays visible long enough to observe.
+    let resolveCheck!: (v: CheckResult) => void;
+    vi.mocked(check).mockReturnValueOnce(new Promise((r) => { resolveCheck = r; }));
+
     init({ buildSlug: 'test-app' });
 
-    expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+    await vi.waitFor(() => {
+      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+    });
+
+    // Resolve check -> overlay removed
+    resolveCheck({ valid: true, email: null, accessType: 'free', expiresAt: null, degraded: false });
 
     await vi.waitFor(() => {
       expect(document.getElementById('bworlds-gate-overlay')).toBeNull();
@@ -202,12 +233,17 @@ describe('gate overlay', () => {
   });
 
   it('removes overlay when check returns valid', async () => {
-    vi.mocked(check).mockResolvedValueOnce({
-      valid: true, email: null, accessType: 'paid', expiresAt: null, degraded: false,
-    });
+    // Use a pending check so we can observe the overlay before it's removed.
+    let resolveCheck!: (v: CheckResult) => void;
+    vi.mocked(check).mockReturnValueOnce(new Promise((r) => { resolveCheck = r; }));
 
     init({ buildSlug: 'test-app' });
-    expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+
+    await vi.waitFor(() => {
+      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+    });
+
+    resolveCheck({ valid: true, email: null, accessType: 'paid', expiresAt: null, degraded: false });
 
     await vi.waitFor(() => {
       expect(document.getElementById('bworlds-gate-overlay')).toBeNull();
@@ -233,10 +269,13 @@ describe('gate overlay', () => {
 
     init({ buildSlug: 'test-app' });
 
-    await new Promise((r) => setTimeout(r, 10));
+    await vi.waitFor(() => {
+      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+    });
 
-    expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
-    expect(hrefSetter).toHaveBeenCalledWith('https://app.bworlds.co/access/test-app');
+    await vi.waitFor(() => {
+      expect(hrefSetter).toHaveBeenCalledWith('https://app.bworlds.co/access/test-app');
+    });
   });
 
   it('built-in gate redirects to the gateOrigin override when provided', async () => {
@@ -262,13 +301,14 @@ describe('gate overlay', () => {
 
     init({ buildSlug: 'test-app', gateOrigin: 'http://localhost:3939' });
 
-    await new Promise((r) => setTimeout(r, 10));
-
-    expect(hrefSetter).toHaveBeenCalledWith('http://localhost:3939/access/test-app');
+    await vi.waitFor(() => {
+      expect(hrefSetter).toHaveBeenCalledWith('http://localhost:3939/access/test-app');
+    });
   });
 
-  it('does not show overlay when gate is disabled', () => {
+  it('does not show overlay when gate is disabled', async () => {
     init({ buildSlug: 'test-app', gate: false });
+    await flushMicrotasks();
     expect(document.getElementById('bworlds-gate-overlay')).toBeNull();
   });
 
@@ -276,47 +316,55 @@ describe('gate overlay', () => {
   // gating_enabled_skip_overlay: cached gatingEnabled=false suppresses overlay
   // -------------------------------------------------------------------------
 
-  it('gating_enabled_skip_overlay: when cached gatingEnabled=false, init does not mount overlay', () => {
-    // Cached gatingEnabled=false → build is ungated → overlay must NOT mount
+  it('gating_enabled_skip_overlay: when cached gatingEnabled=false, init does not mount overlay', async () => {
+    // Cached gatingEnabled=false -> build is ungated -> overlay must NOT mount
     mockReadCachedGatingEnabled.mockReturnValue(false);
 
     init({ buildSlug: 'test-app' });
+    await flushMicrotasks();
 
     // Overlay element must not exist in the DOM
     expect(document.getElementById('bworlds-gate-overlay')).toBeNull();
   });
 
-  it('gating_enabled_skip_overlay: when cached gatingEnabled=false, check() is not called', () => {
+  it('gating_enabled_skip_overlay: when cached gatingEnabled=false, check() is not called', async () => {
     // The validate-token call must be skipped entirely on the ungated path
     mockReadCachedGatingEnabled.mockReturnValue(false);
 
     init({ buildSlug: 'test-app' });
+    await flushMicrotasks();
 
     // check() must not have been invoked (no validate-token call)
     expect(check).not.toHaveBeenCalled();
   });
 
   it('gating_enabled_true_mounts_overlay: when cached gatingEnabled=true, init mounts overlay and calls check()', async () => {
-    // gatingEnabled=true (or cold cache default) → overlay mounts and check() is called
+    // gatingEnabled=true (or cold cache default) -> overlay mounts and check() is called
     mockReadCachedGatingEnabled.mockReturnValue(true);
+    // Use a pending check so overlay stays visible
+    vi.mocked(check).mockReturnValueOnce(new Promise(() => {}));
 
     init({ buildSlug: 'test-app' });
 
-    // Overlay must be mounted immediately (synchronous, before check() resolves)
-    expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+    // Overlay is created inside activateSubsystems (after async config fetch)
+    await vi.waitFor(() => {
+      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+    });
 
     // check() must be called exactly once
-    await vi.waitFor(() => {
-      expect(check).toHaveBeenCalled();
-    });
+    expect(check).toHaveBeenCalled();
   });
 
-  it('cold_cache_mounts_overlay: cold cache (readCachedGatingEnabled=true) proceeds with overlay path', () => {
-    // Cold cache returns true (fail-safe default) → overlay mounts
+  it('cold_cache_mounts_overlay: cold cache (readCachedGatingEnabled=true) proceeds with overlay path', async () => {
+    // Cold cache returns true (fail-safe default) -> overlay mounts
     mockReadCachedGatingEnabled.mockReturnValue(true);
+    // Use a pending check so overlay stays visible
+    vi.mocked(check).mockReturnValueOnce(new Promise(() => {}));
 
     init({ buildSlug: 'test-app' });
 
-    expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+    await vi.waitFor(() => {
+      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+    });
   });
 });

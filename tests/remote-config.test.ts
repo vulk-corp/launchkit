@@ -64,12 +64,14 @@ function createMockSdkRemoteConfig(overrides: Partial<{
   monitoring: boolean;
   badge: boolean;
   gatingEnabled: boolean;
+  allowedOrigin: string | null;
 }> = {}) {
   return {
     sessionReplay: false,
     monitoring: true,
     badge: false,
     gatingEnabled: false,
+    allowedOrigin: null as string | null,
     ...overrides,
   };
 }
