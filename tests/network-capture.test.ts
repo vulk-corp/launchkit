@@ -96,6 +96,54 @@ describe('startNetworkCapture / stopNetworkCapture', () => {
     );
   });
 
+  it('network_non_error: fetch rejecting with non-Error keeps readable suffix', async () => {
+    const reason = { message: 'socket hang up' };
+    window.fetch = vi.fn().mockRejectedValue(reason);
+
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch('https://example.com/flaky')).rejects.toBe(reason);
+
+    expect(mockEnqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: 'network',
+        message: 'Network error - GET https://example.com/flaky: socket hang up',
+        metadata: expect.objectContaining({ status: 0 }),
+      }),
+    );
+  });
+
+  it('captures fetch rejecting with a plain string verbatim in the suffix', async () => {
+    window.fetch = vi.fn().mockRejectedValue('connection reset');
+
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch('https://example.com/flaky')).rejects.toBe('connection reset');
+
+    expect(mockEnqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: 'network',
+        message: 'Network error - GET https://example.com/flaky: connection reset',
+      }),
+    );
+  });
+
+  it('captures aborted requests (DOMException) with a readable message', async () => {
+    const abort = new DOMException('The operation was aborted.', 'AbortError');
+    window.fetch = vi.fn().mockRejectedValue(abort);
+
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch('https://example.com/slow')).rejects.toBe(abort);
+
+    expect(mockEnqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: 'network',
+        message: 'Network error - GET https://example.com/slow: The operation was aborted.',
+      }),
+    );
+  });
+
   it('does not capture SDK telemetry calls', async () => {
     window.fetch = vi.fn().mockResolvedValue(
       new Response('Error', { status: 500, statusText: 'Error' }),
@@ -161,6 +209,34 @@ describe('startNetworkCapture / stopNetworkCapture', () => {
         },
       }),
     );
+  });
+
+  it('returns the response unchanged when enqueueError itself throws', async () => {
+    mockEnqueue.mockImplementationOnce(() => {
+      throw new Error('enqueue exploded');
+    });
+    const mockResponse = new Response('Server Error', {
+      status: 500,
+      statusText: 'Internal Server Error',
+    });
+    window.fetch = vi.fn().mockResolvedValue(mockResponse);
+
+    startNetworkCapture('https://api.bworlds.co');
+    const resp = await fetch('https://example.com/broken');
+
+    expect(resp).toBe(mockResponse);
+  });
+
+  it('rethrows the original rejection when enqueueError itself throws', async () => {
+    mockEnqueue.mockImplementationOnce(() => {
+      throw new Error('enqueue exploded');
+    });
+    const failure = new TypeError('Failed to fetch');
+    window.fetch = vi.fn().mockRejectedValue(failure);
+
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch('https://example.com/down')).rejects.toBe(failure);
   });
 
   it('restores original fetch on stop', () => {

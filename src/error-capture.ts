@@ -1,3 +1,11 @@
+import {
+  MAX_MESSAGE_LENGTH,
+  MAX_STACK_LENGTH,
+  MAX_URL_LENGTH,
+  normalizeThrown,
+  sanitizeAndTruncate,
+  truncateMessage,
+} from './normalize-thrown';
 import { sendTelemetry } from './telemetry-sender';
 
 const BATCH_INTERVAL_MS = 10_000;
@@ -29,12 +37,30 @@ export function startErrorCapture(buildSlug: string): void {
 
   _originalOnError = window.onerror;
   window.onerror = (message, source, lineno, colno, error) => {
-    enqueueError({
-      message: String(message),
-      stack: error?.stack ?? null,
-      url: source ?? window.location.href,
-      source: 'uncaught',
-    });
+    // Capture must never block the host app's own onerror chain below: a
+    // poisoned `error` (e.g. a throwing stack getter) drops this one capture,
+    // nothing more.
+    try {
+      // Non-Error throws reach onerror as a browser-stringified `message`
+      // ("Uncaught [object Object]"); derive a readable one from the thrown
+      // value instead. Errors (and absent `error`, e.g. cross-origin
+      // "Script error.") keep the browser message untouched.
+      const normalized =
+        error != null && !(error instanceof Error)
+          ? normalizeThrown(error)
+          : {
+              message: String(message),
+              stack: typeof error?.stack === 'string' ? error.stack : null,
+            };
+      enqueueError({
+        message: normalized.message,
+        stack: normalized.stack,
+        url: source ?? window.location.href,
+        source: 'uncaught',
+      });
+    } catch {
+      // swallow: telemetry loss is acceptable, breaking the host app is not
+    }
     if (_originalOnError) {
       return _originalOnError.call(window, message, source, lineno, colno, error);
     }
@@ -42,10 +68,10 @@ export function startErrorCapture(buildSlug: string): void {
   };
 
   _rejectionHandler = (event: PromiseRejectionEvent) => {
-    const reason = event.reason;
+    const { message, stack } = normalizeThrown(event.reason);
     enqueueError({
-      message: reason?.message ?? String(reason),
-      stack: reason?.stack ?? null,
+      message,
+      stack,
       url: window.location.href,
       source: 'unhandled-rejection',
     });
@@ -99,7 +125,16 @@ export function stopErrorCapture(): void {
 }
 
 export function enqueueError(error: CapturedError): void {
-  _queue.push(error);
+  // Single wire-validity chokepoint for every capture path: the server
+  // rejects any item whose message exceeds 5000 chars, stack exceeds 10000,
+  // url exceeds 2048, carries a non-string where a string is expected, or
+  // contains a lone surrogate — and the rejection drops the whole batch.
+  const message = truncateMessage(error.message);
+  const stack =
+    typeof error.stack === 'string' ? sanitizeAndTruncate(error.stack, MAX_STACK_LENGTH) : null;
+  const url =
+    typeof error.url === 'string' ? sanitizeAndTruncate(error.url, MAX_URL_LENGTH) : null;
+  _queue.push({ ...error, message, stack, url });
   if (_queue.length >= BATCH_SIZE_THRESHOLD) {
     flush();
   }
@@ -118,14 +153,26 @@ function flush(): void {
 function extractErrorFromArgs(args: unknown[]): { message: string; stack: string | null } {
   for (const arg of args) {
     if (arg instanceof Error) {
+      // normalizeThrown guards subclasses whose message/stack getters return
+      // non-strings or throw. An Error with an empty message still reads
+      // better as its String() form ("Error: ..."), so keep that fallback.
+      const normalized = normalizeThrown(arg);
       return {
-        message: arg.message || String(arg),
-        stack: arg.stack ?? null,
+        message: normalized.message || String(arg),
+        stack: normalized.stack,
       };
     }
   }
-  const message = args
-    .map((a) => (typeof a === 'string' ? a : String(a)))
-    .join(' ');
-  return { message: message.slice(0, 5000), stack: null };
+  // Budget loop: each kept arg gets its full normalization pass, but once the
+  // joined length passes the message cap any remaining args are dead weight —
+  // enqueueError cuts them anyway, so skip their stringify cost entirely.
+  const parts: string[] = [];
+  let budget = 0;
+  for (const arg of args) {
+    if (budget > MAX_MESSAGE_LENGTH) break;
+    const part = typeof arg === 'string' ? arg : normalizeThrown(arg).message;
+    parts.push(part);
+    budget += part.length + 1;
+  }
+  return { message: parts.join(' '), stack: null };
 }

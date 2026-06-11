@@ -1,4 +1,5 @@
 import { enqueueError } from './error-capture';
+import { normalizeThrown } from './normalize-thrown';
 
 let _originalFetch: typeof fetch | null = null;
 let _installed = false;
@@ -47,10 +48,10 @@ export function startNetworkCapture(apiEndpoint: string): void {
       return response;
     } catch (error: unknown) {
       try {
-        const msg = error instanceof Error ? error.message : String(error);
+        const { message, stack } = normalizeThrown(error);
         enqueueError({
-          message: `Network error - ${method} ${truncateUrl(url)}: ${msg}`,
-          stack: error instanceof Error ? (error.stack ?? null) : null,
+          message: `Network error - ${method} ${truncateUrl(url)}: ${message}`,
+          stack,
           url: window.location.href,
           source: 'network',
           metadata: {
