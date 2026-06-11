@@ -37,14 +37,7 @@ export function startErrorCapture(buildSlug: string): void {
 
   _originalOnError = window.onerror;
   window.onerror = (message, source, lineno, colno, error) => {
-    // Capture must never block the host app's own onerror chain below: a
-    // poisoned `error` (e.g. a throwing stack getter) drops this one capture,
-    // nothing more.
     try {
-      // Non-Error throws reach onerror as a browser-stringified `message`
-      // ("Uncaught [object Object]"); derive a readable one from the thrown
-      // value instead. Errors (and absent `error`, e.g. cross-origin
-      // "Script error.") keep the browser message untouched.
       const normalized =
         error != null && !(error instanceof Error)
           ? normalizeThrown(error)
@@ -59,7 +52,7 @@ export function startErrorCapture(buildSlug: string): void {
         source: 'uncaught',
       });
     } catch {
-      // swallow: telemetry loss is acceptable, breaking the host app is not
+      // telemetry loss is acceptable, breaking the host app is not
     }
     if (_originalOnError) {
       return _originalOnError.call(window, message, source, lineno, colno, error);
@@ -125,10 +118,6 @@ export function stopErrorCapture(): void {
 }
 
 export function enqueueError(error: CapturedError): void {
-  // Single wire-validity chokepoint for every capture path: the server
-  // rejects any item whose message exceeds 5000 chars, stack exceeds 10000,
-  // url exceeds 2048, carries a non-string where a string is expected, or
-  // contains a lone surrogate — and the rejection drops the whole batch.
   const message = truncateMessage(error.message);
   const stack =
     typeof error.stack === 'string' ? sanitizeAndTruncate(error.stack, MAX_STACK_LENGTH) : null;
@@ -153,9 +142,6 @@ function flush(): void {
 function extractErrorFromArgs(args: unknown[]): { message: string; stack: string | null } {
   for (const arg of args) {
     if (arg instanceof Error) {
-      // normalizeThrown guards subclasses whose message/stack getters return
-      // non-strings or throw. An Error with an empty message still reads
-      // better as its String() form ("Error: ..."), so keep that fallback.
       const normalized = normalizeThrown(arg);
       return {
         message: normalized.message || String(arg),
@@ -163,9 +149,6 @@ function extractErrorFromArgs(args: unknown[]): { message: string; stack: string
       };
     }
   }
-  // Budget loop: each kept arg gets its full normalization pass, but once the
-  // joined length passes the message cap any remaining args are dead weight —
-  // enqueueError cuts them anyway, so skip their stringify cost entirely.
   const parts: string[] = [];
   let budget = 0;
   for (const arg of args) {

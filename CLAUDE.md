@@ -39,6 +39,20 @@ CI: Node 22, runs on main/next push + PRs (type-check, build, test).
 | `src/telemetry-sender.ts` | POST JSON + `keepalive`, silent fail |
 | `src/fetch-util.ts` | `fetchJsonWithTimeout` (3s AbortController) |
 
+## Message normalization rules
+
+Design rationale for `normalize-thrown.ts` and the capture paths — keep it here, not in code comments.
+
+- `MAX_MESSAGE_LENGTH`/`MAX_STACK_LENGTH`/`MAX_URL_LENGTH` mirror the server's `ClientErrorItem` field caps (`telemetry_schemas.py` in bworlds-api). One invalid item 422s the whole batch — that is why `enqueueError` is the single enforcement chokepoint and why every field is sanitized there even when a capture path already produced a safe value.
+- Surrogate handling is two-sided: replace lone surrogates anywhere (a pre-existing one fails the server's UTF-8 encode), and never cut at a position that splits a pair (the cut would reintroduce the failure). `toWellFormed()` is ES2024; the regex fallback covers older engines, hence the feature-detect cast.
+- Getter-chain recursion is hard-capped at depth 3: an Error subclass whose `message` getter returns another Error (or itself) would otherwise recurse to stack overflow inside hot capture paths. Legitimate chains never exceed depth 2.
+- An object's empty-string `message` falls through to its `error` field or JSON form — the server maps `""` to "Unknown error", which carries less signal.
+- The `error`-field hop happens only at depth 0: the outermost object may delegate once; deeper levels serialize.
+- Full `JSON.stringify` before truncation is deliberate: JSON size is unknowable without serializing, and a budgeted replacer would alter the kept prefix. Cost is one O(size) pass per captured value; an engine `RangeError` falls through to the fallback.
+- `onerror`: a non-Error `error` param is normalized (the browser-stringified `message` would read "Uncaught [object Object]"); Error instances and absent `error` (cross-origin "Script error.") keep the browser message untouched. The capture body is wrapped in try/catch so a poisoned value (throwing `stack` getter) drops one capture without blocking the host app's own onerror chain.
+- Console path: an Error arg with an empty message falls back to `String(arg)` ("Error: ..."); non-Error args run through a budget loop that stops normalizing once the joined length passes the message cap — `enqueueError` would cut the excess anyway, so their stringify cost is skipped.
+- `[error details could not be read]` is builder-facing copy (dashboard row, alert email, Fix prompt): plain language, and a single literal keeps server-side grouping intact.
+
 ## API endpoints
 
 | Path | Module | Method |
