@@ -1,3 +1,11 @@
+import {
+  MAX_MESSAGE_LENGTH,
+  MAX_STACK_LENGTH,
+  MAX_URL_LENGTH,
+  normalizeThrown,
+  sanitizeAndTruncate,
+  truncateMessage,
+} from './normalize-thrown';
 import { sendTelemetry } from './telemetry-sender';
 
 const BATCH_INTERVAL_MS = 10_000;
@@ -29,12 +37,23 @@ export function startErrorCapture(buildSlug: string): void {
 
   _originalOnError = window.onerror;
   window.onerror = (message, source, lineno, colno, error) => {
-    enqueueError({
-      message: String(message),
-      stack: error?.stack ?? null,
-      url: source ?? window.location.href,
-      source: 'uncaught',
-    });
+    try {
+      const normalized =
+        error != null && !(error instanceof Error)
+          ? normalizeThrown(error)
+          : {
+              message: String(message),
+              stack: typeof error?.stack === 'string' ? error.stack : null,
+            };
+      enqueueError({
+        message: normalized.message,
+        stack: normalized.stack,
+        url: source ?? window.location.href,
+        source: 'uncaught',
+      });
+    } catch {
+      // telemetry loss is acceptable, breaking the host app is not
+    }
     if (_originalOnError) {
       return _originalOnError.call(window, message, source, lineno, colno, error);
     }
@@ -42,10 +61,10 @@ export function startErrorCapture(buildSlug: string): void {
   };
 
   _rejectionHandler = (event: PromiseRejectionEvent) => {
-    const reason = event.reason;
+    const { message, stack } = normalizeThrown(event.reason);
     enqueueError({
-      message: reason?.message ?? String(reason),
-      stack: reason?.stack ?? null,
+      message,
+      stack,
       url: window.location.href,
       source: 'unhandled-rejection',
     });
@@ -99,7 +118,12 @@ export function stopErrorCapture(): void {
 }
 
 export function enqueueError(error: CapturedError): void {
-  _queue.push(error);
+  const message = truncateMessage(error.message);
+  const stack =
+    typeof error.stack === 'string' ? sanitizeAndTruncate(error.stack, MAX_STACK_LENGTH) : null;
+  const url =
+    typeof error.url === 'string' ? sanitizeAndTruncate(error.url, MAX_URL_LENGTH) : null;
+  _queue.push({ ...error, message, stack, url });
   if (_queue.length >= BATCH_SIZE_THRESHOLD) {
     flush();
   }
@@ -118,14 +142,20 @@ function flush(): void {
 function extractErrorFromArgs(args: unknown[]): { message: string; stack: string | null } {
   for (const arg of args) {
     if (arg instanceof Error) {
+      const normalized = normalizeThrown(arg);
       return {
-        message: arg.message || String(arg),
-        stack: arg.stack ?? null,
+        message: normalized.message || String(arg),
+        stack: normalized.stack,
       };
     }
   }
-  const message = args
-    .map((a) => (typeof a === 'string' ? a : String(a)))
-    .join(' ');
-  return { message: message.slice(0, 5000), stack: null };
+  const parts: string[] = [];
+  let budget = 0;
+  for (const arg of args) {
+    if (budget > MAX_MESSAGE_LENGTH) break;
+    const part = typeof arg === 'string' ? arg : normalizeThrown(arg).message;
+    parts.push(part);
+    budget += part.length + 1;
+  }
+  return { message: parts.join(' '), stack: null };
 }
