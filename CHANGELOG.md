@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.9.1] — 2026-06-11
+
+### Fixed
+
+- **Non-Error throws captured as "[object Object]"**: plain objects, primitives, and exotic values thrown in builder apps now produce readable messages on all four capture paths (unhandled rejection, `window.onerror`, network, console). New `normalizeThrown()` derives the message from a non-empty `message` field, then an `error` field (one hop), then safe JSON, then a plain `[error details could not be read]` fallback. Error instances are untouched.
+- **Silent telemetry batch loss**: `enqueueError` now enforces the wire contract for every field — string-typed, lone surrogates replaced, never cut mid-surrogate-pair, capped at the server limits (message 5000, stack 10000, url 2048). Previously one oversized or malformed item caused the API to reject the entire 5-error batch.
+- **Hardened hot paths**: `window.onerror` capture can no longer skip the host app's own handler chain when a hostile getter throws; the console wrapper stops serializing arguments once the message cap is reached.
+
 ## [1.6.1] — 2026-04-17
 
 ### Fixed
