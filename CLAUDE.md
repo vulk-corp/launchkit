@@ -82,7 +82,7 @@ Replay payload includes `token` (read from `bworlds_token` cookie) so backend re
 
 ## Release
 
-**Main push is the release trigger.** `.github/workflows/ci.yml` runs type-check → build → test, then creates the missing annotated `vX.Y.Z` tag from `package.json`. The tag push triggers `.github/workflows/release.yml`, which publishes with provenance.
+**Main push is the publish trigger.** `.github/workflows/ci.yml` runs type-check → build → test, creates the missing annotated `vX.Y.Z` tag from `package.json`, then publishes with provenance. `.github/workflows/release.yml` remains a manual tag-push backstop.
 
 1. Merge to `main`.
 2. Bump `package.json` version.
