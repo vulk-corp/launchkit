@@ -102,7 +102,7 @@ function setDocHidden() {
 
 async function triggerFlush(ts = START_NOW) {
   const emit = hoisted.getEmit();
-  emit?.({ type: 3, timestamp: ts, data: {} });
+  emit?.({ type: 2, timestamp: ts, data: {} });
   setDocHidden();
   document.dispatchEvent(new Event('visibilitychange'));
   await flushMicrotasks();
