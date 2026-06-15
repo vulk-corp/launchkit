@@ -82,21 +82,20 @@ Replay payload includes `token` (read from `bworlds_token` cookie) so backend re
 
 ## Release
 
-**Tag push is the publish trigger.** `.github/workflows/release.yml` runs on `v*` tags: type-check → build → test → `npm publish --provenance`.
+**Main push is the release trigger.** `.github/workflows/ci.yml` runs type-check → build → test, then creates the missing annotated `vX.Y.Z` tag from `package.json`. The tag push triggers `.github/workflows/release.yml`, which publishes with provenance.
 
 1. Merge to `main`.
-2. Bump `package.json` version (must match the tag).
+2. Bump `package.json` version.
 3. Append `CHANGELOG.md` entry.
-4. Commit, push `main`.
-5. `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z` → CI publishes.
-6. Fast-forward `next` to `main`: `git checkout next && git merge main --ff-only && git push origin next`.
-7. Bump `@bworlds/launchkit` in monorepo `apps/bworlds-web/package.json`.
+4. Commit and push `main` → CI creates `vX.Y.Z` and publishes.
+5. Fast-forward `next` to `main`: `git checkout next && git merge main --ff-only && git push origin next`.
+6. Bump `@bworlds/launchkit` in monorepo `apps/bworlds-web/package.json`.
 
 **Tag rules**
 - **Always annotated** (`git tag -a …`). Never lightweight. Annotated tags carry tagger + date + message, survive `git describe`, and match industry signing flow.
 - Tag message: `vX.Y.Z` (or the CHANGELOG headline if more context useful).
 - Tag name = `v` + `package.json` version. No exceptions.
-- Never push a tag for a version already on npm (guard in `release.yml` skips publish, but avoid anyway).
+- Never push a tag for a version already on npm (CI guards skip publish, but avoid anyway).
 - Never re-tag. Bump patch instead.
 - Never delete a published tag. Git history stays honest.
 - Keep `next` in sync with `main` after every release tag.
