@@ -61,6 +61,11 @@ function parseFetchBody(call: unknown[]): Record<string, unknown> {
   return JSON.parse(init?.body ?? '{}') as Record<string, unknown>;
 }
 
+async function parseBeaconBody(call: unknown[]): Promise<Record<string, unknown>> {
+  const blob = call[1] as Blob;
+  return JSON.parse(await blob.text()) as Record<string, unknown>;
+}
+
 function readStoredSession(): StoredSession {
   return JSON.parse(sessionStorage.getItem(STORAGE_KEY)!) as StoredSession;
 }
@@ -75,6 +80,7 @@ function setNow(ms: number) {
 
 let visibilityState: DocumentVisibilityState = 'visible';
 let originalVisibilityDescriptor: PropertyDescriptor | undefined;
+let originalSendBeaconDescriptor: PropertyDescriptor | undefined;
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] });
@@ -84,7 +90,10 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
   hoisted.setEmit(null);
   hoisted.stopRecording.mockClear();
-  hoisted.takeFullSnapshot.mockClear();
+  hoisted.takeFullSnapshot.mockReset();
+  hoisted.takeFullSnapshot.mockImplementation(() => {
+    hoisted.getEmit()?.({ type: 2, timestamp: Date.now(), data: {} });
+  });
   hoisted.recordFactory.mockClear();
   sessionStorage.clear();
   visibilityState = 'visible';
@@ -92,9 +101,16 @@ beforeEach(() => {
     Document.prototype,
     'visibilityState',
   );
+  originalSendBeaconDescriptor =
+    Object.getOwnPropertyDescriptor(Navigator.prototype, 'sendBeacon') ??
+    Object.getOwnPropertyDescriptor(navigator, 'sendBeacon');
   Object.defineProperty(document, 'visibilityState', {
     configurable: true,
     get: () => visibilityState,
+  });
+  Object.defineProperty(navigator, 'sendBeacon', {
+    configurable: true,
+    value: undefined,
   });
 });
 
@@ -106,6 +122,15 @@ afterEach(() => {
       'visibilityState',
       originalVisibilityDescriptor,
     );
+  }
+  if (originalSendBeaconDescriptor) {
+    Object.defineProperty(
+      navigator,
+      'sendBeacon',
+      originalSendBeaconDescriptor,
+    );
+  } else {
+    Reflect.deleteProperty(navigator, 'sendBeacon');
   }
   vi.unstubAllGlobals();
   vi.useRealTimers();
@@ -247,6 +272,171 @@ describe('session rotation', () => {
 
     expect(readStoredSession().id).toBe(sessionB);
     expect(readStoredSession().seq).toBe(0);
+  });
+});
+
+describe('sequence reservation', () => {
+  it('does not start two rrweb recorders when startReplay is called concurrently', async () => {
+    await Promise.all([
+      startReplay(BUILD_SLUG, API_ENDPOINT),
+      startReplay(BUILD_SLUG, API_ENDPOINT),
+    ]);
+
+    expect(hoisted.recordFactory).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps sequence numbers monotone when visibilitychange fires during the initial flush', async () => {
+    visibilityState = 'hidden';
+
+    let releaseFetch!: (value: Response) => void;
+    fetchMock.mockReset();
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          releaseFetch = resolve;
+        }),
+    );
+    fetchMock.mockImplementation(() => Promise.resolve(okResponse()));
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    expect(parseFetchBody(fetchMock.mock.calls[0]).sequenceNumber).toBe(0);
+    expect(readStoredSession().seq).toBe(1);
+
+    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'during-fetch' } });
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    releaseFetch(okResponse());
+    await flushMicrotasks();
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    expect(parseFetchBody(fetchMock.mock.calls[1]).sequenceNumber).toBe(1);
+  });
+
+  it('uses the next sequenceNumber for beforeunload sendBeacon during the initial fetch', async () => {
+    visibilityState = 'hidden';
+
+    let releaseFetch!: (value: Response) => void;
+    fetchMock.mockReset();
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          releaseFetch = resolve;
+        }),
+    );
+    fetchMock.mockImplementation(() => Promise.resolve(okResponse()));
+
+    const sendBeaconMock = vi.fn(() => true);
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: sendBeaconMock,
+    });
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    document.dispatchEvent(new Event('visibilitychange'));
+    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'unload' } });
+
+    window.dispatchEvent(new Event('beforeunload'));
+
+    expect(parseFetchBody(fetchMock.mock.calls[0]).sequenceNumber).toBe(0);
+    expect(sendBeaconMock).toHaveBeenCalledTimes(1);
+    expect(
+      (await parseBeaconBody(sendBeaconMock.mock.calls[0])).sequenceNumber,
+    ).toBe(1);
+
+    releaseFetch(okResponse());
+    await flushMicrotasks();
+  });
+
+  it('retries a failed chunk with the same sequenceNumber and payload', async () => {
+    visibilityState = 'hidden';
+    fetchMock.mockReset();
+    fetchMock
+      .mockResolvedValueOnce({ ok: false, status: 500 } as Response)
+      .mockResolvedValue(okResponse());
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await flushMicrotasks();
+
+    const failedBody = parseFetchBody(fetchMock.mock.calls[0]);
+    expect(failedBody.sequenceNumber).toBe(0);
+
+    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'after-failure' } });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    const retryBody = parseFetchBody(fetchMock.mock.calls[1]);
+    expect(retryBody.sequenceNumber).toBe(0);
+    expect(retryBody.events).toEqual(failedBody.events);
+
+    await flushMicrotasks();
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(parseFetchBody(fetchMock.mock.calls[2]).sequenceNumber).toBe(1);
+  });
+
+  it('assigns distinct sequenceNumbers to oversized split chunks', async () => {
+    visibilityState = 'hidden';
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({
+      type: 2,
+      timestamp: Date.now(),
+      data: { html: 'x'.repeat(310_000) },
+    });
+    emit!({
+      type: 3,
+      timestamp: Date.now(),
+      data: { text: 'y'.repeat(310_000) },
+    });
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    expect(parseFetchBody(fetchMock.mock.calls[0]).sequenceNumber).toBe(0);
+    expect(parseFetchBody(fetchMock.mock.calls[1]).sequenceNumber).toBe(1);
+  });
+
+  it('opens a fresh sequenceNumber 0 session when sessionStorage is idle-stale', async () => {
+    visibilityState = 'hidden';
+    sessionStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        id: 'old-session',
+        seq: 7,
+        startedAt: START_NOW - 1_000,
+        lastActivityAt: START_NOW - IDLE_TIMEOUT_MS - 1,
+        firstChunkAcked: true,
+      }),
+    );
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const stored = readStoredSession();
+    expect(stored.id).not.toBe('old-session');
+    expect(stored.seq).toBe(0);
+
+    hoisted.getEmit()!({ type: 2, timestamp: Date.now(), data: {} });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    const body = parseFetchBody(fetchMock.mock.calls[0]);
+    expect(body.sessionId).toBe(stored.id);
+    expect(body.sequenceNumber).toBe(0);
   });
 });
 
