@@ -27,8 +27,8 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,8 +37,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Resolve package version
         id: version
@@ -47,9 +45,22 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Create release tag when missing
+      - name: Check if version already on npm
+        id: npm
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          TAG="${{ steps.version.outputs.tag }}"
+          if npm view "@bworlds/launchkit@$VERSION" version >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION already published on npm - skipping release dispatch."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release tag when missing
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
           if git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "$TAG already exists."
             exit 0
@@ -60,26 +71,9 @@ jobs:
           git tag -a "$TAG" -m "$TAG"
           git push origin "$TAG"
 
-      - name: Check if version already on npm
-        id: npm
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          if npm view "@bworlds/launchkit@$VERSION" version >/dev/null 2>&1; then
-            echo "already=true" >> "$GITHUB_OUTPUT"
-            echo "v$VERSION already published on npm - skipping publish."
-          else
-            echo "already=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - run: npm ci
+      - name: Dispatch release workflow
         if: steps.npm.outputs.already == 'false'
-      - run: npm run type-check
-        if: steps.npm.outputs.already == 'false'
-      - run: npm run build
-        if: steps.npm.outputs.already == 'false'
-      - run: npm test
-        if: steps.npm.outputs.already == 'false'
-
-      - name: Publish
-        if: steps.npm.outputs.already == 'false'
-        run: npx -y npm@latest publish --provenance --access public
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh workflow run release.yml --ref "$TAG"
