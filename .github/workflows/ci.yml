@@ -24,7 +24,7 @@ jobs:
 
   auto-release:
     needs: build-and-test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next')
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -38,12 +38,31 @@ jobs:
         with:
           node-version: 22
 
-      - name: Resolve package version
+      - name: Resolve release channel
         id: version
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          node <<'NODE'
+          const fs = require('fs');
+          const version = require('./package.json').version;
+          const branch = process.env.GITHUB_REF_NAME;
+          const isPrerelease = version.includes('-');
+
+          if (branch === 'main' && isPrerelease) {
+            console.error(`main can only publish stable versions. Found ${version}.`);
+            process.exit(1);
+          }
+
+          if (branch === 'next' && !isPrerelease) {
+            console.error(`next can only publish prerelease versions. Found ${version}.`);
+            process.exit(1);
+          }
+
+          const output = process.env.GITHUB_OUTPUT;
+          fs.appendFileSync(output, `version=${version}\n`);
+          fs.appendFileSync(output, `tag=v${version}\n`);
+          fs.appendFileSync(output, `branch=${branch}\n`);
+          fs.appendFileSync(output, `npm_tag=${branch === 'next' ? 'next' : 'latest'}\n`);
+          NODE
 
       - name: Check if version already on npm
         id: npm
@@ -75,4 +94,5 @@ jobs:
         if: steps.npm.outputs.already == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run release.yml --ref main
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: gh workflow run release.yml --ref "$BRANCH"

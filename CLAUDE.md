@@ -82,14 +82,21 @@ Replay payload includes `token` (read from `bworlds_token` cookie) so backend re
 
 ## Release
 
-**Main push is the publish trigger.** `.github/workflows/ci.yml` runs type-check → build → test, creates the missing annotated `vX.Y.Z` tag from `package.json`, then publishes with provenance. `.github/workflows/release.yml` remains a manual tag-push backstop.
+**Branch push is the publish trigger.** `.github/workflows/ci.yml` runs type-check → build → test, creates the missing annotated `vX.Y.Z` tag from `package.json`, then dispatches `.github/workflows/release.yml` to publish with provenance.
 
+Stable releases:
 1. Merge to `main`.
-2. Bump `package.json` version.
+2. Bump `package.json` to a stable version.
 3. Append `CHANGELOG.md` entry.
-4. Commit and push `main` → CI creates `vX.Y.Z` and publishes.
-5. Fast-forward `next` to `main`: `git checkout next && git merge main --ff-only && git push origin next`.
-6. Bump `@bworlds/launchkit` in monorepo `apps/bworlds-web/package.json`.
+4. Commit and push `main` → CI creates `vX.Y.Z` and publishes with npm dist-tag `latest`.
+5. Bump `@bworlds/launchkit` in monorepo `apps/bworlds-web/package.json`.
+
+Prereleases:
+1. Work on `next`.
+2. Bump `package.json` to a prerelease version such as `1.10.0-alpha.0`.
+3. Append `CHANGELOG.md` prerelease entry if needed.
+4. Commit and push `next` → CI creates `vX.Y.Z-alpha.N` and publishes with npm dist-tag `next`.
+5. Do not fast-forward `next` from `main` automatically while it carries prerelease work.
 
 **Tag rules**
 - **Always annotated** (`git tag -a …`). Never lightweight. Annotated tags carry tagger + date + message, survive `git describe`, and match industry signing flow.
@@ -98,6 +105,6 @@ Replay payload includes `token` (read from `bworlds_token` cookie) so backend re
 - Never push a tag for a version already on npm (CI guards skip publish, but avoid anyway).
 - Never re-tag. Bump patch instead.
 - Never delete a published tag. Git history stays honest.
-- Keep `next` in sync with `main` after every release tag.
+- `main` can only publish stable versions. `next` can only publish prerelease versions.
 
-Breaking → major. Feature → minor. Bugfix → patch. Never publish if CI red.
+Breaking → major. Feature → minor. Bugfix → patch. Prerelease → `-alpha.N` or `-beta.N`. Never publish if CI red.

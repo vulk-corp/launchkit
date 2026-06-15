@@ -26,11 +26,23 @@ jobs:
       - run: npm run build
       - run: npm test
 
+      - name: Resolve npm tag
+        id: version
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const version = require('./package.json').version;
+          const npmTag = version.includes('-') ? 'next' : 'latest';
+          const output = process.env.GITHUB_OUTPUT;
+          fs.appendFileSync(output, `version=${version}\n`);
+          fs.appendFileSync(output, `npm_tag=${npmTag}\n`);
+          NODE
+
       - name: Check if version already on npm
         id: check
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           if npm view "@bworlds/launchkit@$VERSION" version >/dev/null 2>&1; then
             echo "already=true" >> "$GITHUB_OUTPUT"
             echo "v$VERSION already published on npm - skipping publish (tag backfill or re-run)."
@@ -40,4 +52,6 @@ jobs:
 
       - name: Publish
         if: steps.check.outputs.already == 'false'
-        run: npx -y npm@latest publish --provenance --access public
+        env:
+          NPM_TAG: ${{ steps.version.outputs.npm_tag }}
+        run: npx -y npm@latest publish --provenance --access public --tag "$NPM_TAG"
