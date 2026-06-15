@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.3] — 2026-06-15
+
+### Fixed
+
+- **Duplicate replay `sequenceNumber=0` uploads**: replay chunks now reserve and persist sequence numbers before upload, including `sendBeacon` unload flushes and oversized split chunks. Exact retries keep the same numbered payload, while different payloads cannot reuse the same `(sessionId, sequenceNumber)`.
+- **Replay startup robustness**: concurrent `startReplay()` calls are guarded before rrweb finishes loading, and the first chunk of a replay session must include a FullSnapshot so newly rotated sessions remain independently replayable.
+
 ## [1.9.2] — 2026-06-15
 
 ### Fixed
