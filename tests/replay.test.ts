@@ -38,7 +38,7 @@ vi.mock('rrweb', () => {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const IDLE_TIMEOUT_MS = 4 * 60 * 1000;
+const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const STORAGE_KEY = 'bworlds-replay-session';
 const BUILD_SLUG = 'test-build';
 const API_ENDPOINT = 'https://api.test';

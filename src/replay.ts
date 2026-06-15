@@ -6,8 +6,7 @@
  * visibilitychange/beforeunload. Stops recording on 429 (daily cap reached).
  *
  * Session rotation: if no rrweb events fire for longer than IDLE_TIMEOUT_MS,
- * the server may already have assembled the session. On the next event the
- * SDK rotates to a fresh session id, flushes the tail of the old one under
+ * the SDK rotates to a fresh session id, flushes the tail of the old one under
  * its original identity, and forces a new FullSnapshot so the new session is
  * independently replayable.
  */
@@ -19,10 +18,9 @@ const SDK_TAG = '[@bworlds/launchkit]';
 const FLUSH_INTERVAL_MS = 10_000;
 const MAX_CHUNK_BYTES = 512_000; // 512 KB per chunk
 const REPLAY_EVENTS_PATH = '/api/telemetry/replay-events';
-// Must stay below the server-side idle-assembly threshold (5 min). If the SDK
-// waits longer than this between events, the server will have already closed
-// the session and any further chunks would be discarded as late.
-const IDLE_TIMEOUT_MS = 4 * 60 * 1000;
+// Align with Sentry Replay: a user returning within 15 minutes continues the
+// same replay session. Server-side assembly is independent and append-only.
+const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_SESSION_MS = 60 * 60 * 1000; // 60 min — rotate session after this duration
 const STORAGE_KEY = 'bworlds-replay-session';
 const TOKEN_COOKIE = 'bworlds_token';
@@ -266,9 +264,8 @@ async function _flush(_isFinal = false): Promise<void> {
         _saveSession();
       }
     } else if (_sessionId === sessionId) {
-      // Re-queue only when the session hasn't rotated. After rotation the
-      // old session is closed server-side; retrying under new identity would
-      // poison the new session's FullSnapshot ordering.
+      // Re-queue only when the session hasn't rotated. Retrying old-session
+      // events under a new identity would poison FullSnapshot ordering.
       _eventBuffer.unshift(...events);
     }
   } finally {
@@ -299,10 +296,9 @@ function _beaconFlush(): void {
 }
 
 /**
- * Close the current session and open a fresh one. Called from the emit
- * callback when the gap since the previous event exceeds IDLE_TIMEOUT_MS —
- * by that point the server has likely assembled the old session, so any
- * further chunks under its id would be discarded.
+ * Close the current session and open a fresh one when the emit gap exceeds
+ * IDLE_TIMEOUT_MS. The next event starts from a FullSnapshot so replay assembly
+ * can resume with an independently replayable session.
  *
  * Sequence:
  *   1. snapshot old identity + buffered events

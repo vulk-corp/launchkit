@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.2] — 2026-06-15
+
+### Fixed
+
+- **Replay sessions split too aggressively after tab-away gaps**: replay idle rotation now follows the 15-minute session-continuity window used by Sentry Replay. Users returning within 15 minutes keep the same replay session, while the 60-minute max session rotation still applies.
+- **Package metadata drift**: package version metadata is aligned with the next publishable version after npm `1.9.1`.
+
 ## [1.9.1] — 2026-06-11
 
 ### Fixed
