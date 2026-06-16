@@ -113,7 +113,7 @@ async function triggerFlush(ts = START_NOW) {
 // ---------------------------------------------------------------------------
 
 it('req_sdk_identify_api — identify() stores email/userId; first chunk payload carries them', async () => {
-  await startReplay(BUILD_SLUG, API_ENDPOINT);
+  await startReplay(BUILD_SLUG, API_ENDPOINT, { getIdentity: _getIdentity });
 
   identify({ email: 'alice@example.com', userId: 'user_42' });
 
@@ -165,7 +165,7 @@ it('req_sdk_cookie_email_auto — email from bworlds_token cookie in first chunk
 it('req_sdk_ua_first_chunk_only — userAgent captured on startReplay, sent on first chunk only', async () => {
   // jsdom has a real navigator.userAgent; we just verify the UA field is populated on first chunk
   // and that isFirstChunk flag is correct
-  await startReplay(BUILD_SLUG, API_ENDPOINT);
+  await startReplay(BUILD_SLUG, API_ENDPOINT, { getIdentity: _getIdentity });
 
   // First flush
   await triggerFlush();

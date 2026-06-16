@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.4] — 2026-06-16
+
+### Fixed
+
+- **Replay identity lost when CDN chunks split the SDK**: identity state now lives on `globalThis`, so separate ESM chunks or module instances share the same `identify()` values.
+- **Replay no longer imports its own identity store**: `index.ts` injects the shared identity getter into `startReplay()`, making the identity path explicit and resilient to CDN or bundler chunking.
+
 ## [1.9.3] — 2026-06-15
 
 ### Fixed

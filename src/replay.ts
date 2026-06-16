@@ -12,7 +12,6 @@
  */
 
 import type { eventWithTime, record as rrwebRecord } from 'rrweb';
-import { getIdentity } from './identity-state';
 
 const SDK_TAG = '[@bworlds/launchkit]';
 const FLUSH_INTERVAL_MS = 10_000;
@@ -48,6 +47,16 @@ let _EventType: { Custom: number; FullSnapshot?: number } | null = null;
 let _userAgent: string | null = null;
 let _firstChunkAcked = false;
 const _instanceId = _generateSessionId();
+
+type Identity = { email: string | null; userId: string | null };
+type GetIdentity = () => Identity;
+
+const _defaultGetIdentity: GetIdentity = () => ({ email: null, userId: null });
+let _getIdentity: GetIdentity = _defaultGetIdentity;
+
+export interface StartReplayOptions {
+  getIdentity?: GetIdentity;
+}
 
 interface StoredSession {
   id: string;
@@ -226,7 +235,7 @@ function _buildPayload(
 
   // Identity: prefer explicitly set identity, fall back to cookie email claim
   // (server re-verifies the token, so this is tagged 'sdk_unverified' at ingest)
-  let { email, userId } = getIdentity();
+  let { email, userId } = _getIdentity();
   if (!email) {
     email = _readCookieEmail();
   }
@@ -537,6 +546,7 @@ export function stopReplay(): void {
   _pendingChunks = [];
   _record = null;
   _userAgent = null;
+  _getIdentity = _defaultGetIdentity;
   _flushing = false;
   _starting = false;
   _firstChunkAcked = false;
@@ -546,12 +556,14 @@ export function stopReplay(): void {
 export async function startReplay(
   buildSlug: string,
   apiEndpoint: string,
+  options: StartReplayOptions = {},
 ): Promise<void> {
   if (_stopRecording || _starting) return; // Already recording or starting
   if (!_acquireReplayLock()) return;
 
   _starting = true;
   try {
+    _getIdentity = options.getIdentity ?? _defaultGetIdentity;
     _buildSlug = buildSlug;
     _apiEndpoint = apiEndpoint.replace(/\/+$/, ''); // Strip trailing slashes
     _resolveSession();

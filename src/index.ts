@@ -25,7 +25,8 @@ let _stopReplay: (() => void) | null = null;
 // Guard against double init() — prevents duplicate subsystem activation
 let _initialized = false;
 
-// (Identity state lives in identity-state.ts to avoid circular imports with replay.ts)
+// Identity state is injected into replay.ts so replay does not import its own
+// copy when a CDN or bundler splits the SDK into multiple chunks.
 
 /** True when the app runs inside a cross-origin iframe (e.g. Lovable editor). */
 function isSandboxed(): boolean {
@@ -263,7 +264,7 @@ function startReplayModule(buildSlug: string, apiEndpoint: string): void {
   import('./replay')
     .then(({ startReplay, stopReplay }) => {
       _stopReplay = stopReplay;
-      return startReplay(buildSlug, apiEndpoint);
+      return startReplay(buildSlug, apiEndpoint, { getIdentity });
     })
     .catch((err) => {
       console.warn('[@bworlds/launchkit] Session replay failed to start:', err);

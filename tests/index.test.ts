@@ -6,6 +6,7 @@ import { check } from '../src/check';
 import type { CheckResult } from '../src/check';
 import { fetchRemoteConfig, readCachedGatingEnabled } from '../src/remote-config';
 import { startBadgeWidget } from '../src/badge-widget';
+import { startReplay } from '../src/replay';
 
 vi.mock('../src/telemetry-sender', () => ({
   configureSender: vi.fn(),
@@ -86,6 +87,22 @@ describe('init()', () => {
     init({ buildSlug: 'test-app', gate: false });
     await flushMicrotasks();
     expect(startErrorCapture).toHaveBeenCalledWith('test-app');
+  });
+
+  it('passes the shared identity getter into replay', async () => {
+    const instance = init({ buildSlug: 'test-app', gate: false });
+    await flushMicrotasks();
+
+    const replayOptions = vi.mocked(startReplay).mock.calls[0]?.[2] as
+      | { getIdentity?: () => { email: string | null; userId: string | null } }
+      | undefined;
+    expect(replayOptions?.getIdentity).toEqual(expect.any(Function));
+
+    instance.identify({ email: 'split@example.com', userId: 'user_split' });
+    expect(replayOptions?.getIdentity?.()).toEqual({
+      email: 'split@example.com',
+      userId: 'user_split',
+    });
   });
 
   it('fetches remote config', () => {
