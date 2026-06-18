@@ -148,6 +148,66 @@ describe('startErrorCapture / stopErrorCapture', () => {
   });
 });
 
+describe('flush on page hidden', () => {
+  let visibilityState: DocumentVisibilityState = 'visible';
+  let originalDescriptor: PropertyDescriptor | undefined;
+
+  beforeEach(() => {
+    visibilityState = 'visible';
+    originalDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState');
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => visibilityState,
+    });
+  });
+
+  afterEach(() => {
+    if (originalDescriptor) {
+      Object.defineProperty(Document.prototype, 'visibilityState', originalDescriptor);
+    }
+  });
+
+  it('flushes queued errors when the page becomes hidden', () => {
+    startErrorCapture('test-app');
+
+    window.onerror!('Dying breath', 'test.js', 1, 1, new Error('Dying breath'));
+    expect(mockSendTelemetry).not.toHaveBeenCalled();
+
+    visibilityState = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    expect(mockSendTelemetry).toHaveBeenCalledWith(
+      '/api/telemetry/errors',
+      expect.objectContaining({
+        errors: [expect.objectContaining({ message: 'Dying breath' })],
+      }),
+    );
+  });
+
+  it('does not flush when visibility changes to visible', () => {
+    startErrorCapture('test-app');
+
+    window.onerror!('Still alive', 'test.js', 1, 1, new Error('Still alive'));
+
+    document.dispatchEvent(new Event('visibilitychange')); // state stays 'visible'
+
+    expect(mockSendTelemetry).not.toHaveBeenCalled();
+  });
+
+  it('removes the visibility listener on stop', () => {
+    startErrorCapture('test-app');
+    stopErrorCapture();
+    mockSendTelemetry.mockClear();
+
+    // Queue an error post-stop so a leaked listener would actually flush it.
+    enqueueError({ message: 'after stop', stack: null, url: null, source: 'network' });
+    visibilityState = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    expect(mockSendTelemetry).not.toHaveBeenCalled();
+  });
+});
+
 describe('wire-validity chokepoint', () => {
   function flushedFirstError(): { message: string; stack: string | null; url: string | null } {
     vi.advanceTimersByTime(10_000);

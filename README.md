@@ -11,7 +11,7 @@ Monitoring, error capture, and access gating SDK for AI-built apps. Drop-in inte
 ## Features
 
 - **Heartbeat monitoring**: automatic uptime tracking, sends a pulse every 5 minutes
-- **Error capture**: catches uncaught errors, unhandled rejections, failed network requests, and console errors; batches and forwards them with readable messages for any thrown value
+- **Error capture**: catches uncaught errors, unhandled rejections, failed network requests, and console errors; batches and forwards them with readable messages for any thrown value. Errors captured while a session recording is active are linked to that recording, so they show up inside the session on the BWORLDS dashboard
 - **Session replay identity**: automatically attaches Supabase Auth `email` / `userId` to replays in Lovable-style apps when available
 - **Access gating**: token-based session validation with redirect to a hosted access page
 - **Trust badge widget**: optional floating "Runs on BWORLDS" pill, toggled from the BWORLDS dashboard (no consumer-side flag)
@@ -116,7 +116,7 @@ For Supabase Auth apps, LaunchKit automatically attempts to attach the signed-in
 | Feature | Description |
 |---------|-------------|
 | Heartbeat | Automatic uptime pulse |
-| Error capture | Uncaught errors, unhandled rejections, failed network requests, and console errors, batched with readable messages for any thrown value |
+| Error capture | Uncaught errors, unhandled rejections, failed network requests, and console errors, batched with readable messages for any thrown value and linked to the active session recording when one is running |
 | Session replay | rrweb-based session replay with automatic Supabase Auth email/id enrichment when available |
 | Access gating | Token-based session validation with hosted access page |
 | Trust badge | Floating "Runs on BWORLDS" pill, toggled from the dashboard |
