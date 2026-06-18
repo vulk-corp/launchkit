@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.11.0] — 2026-06-18
+
+### Added
+
+- **Error–Session Link**: every captured error now carries the recorded session it happened in. `/api/telemetry/errors` items gain `sessionId` (the active recording's Client Session ID, null when replay is not recording) and `capturedAt` (client-clock capture timestamp, epoch ms). Both are stamped at enqueue time, not at flush, so a batch spanning a session rotation keeps each error on the session it actually occurred in. Additive payload fields — older servers ignore them.
+- **`session-state.ts`**: new shared session-state module (mirrors `identity-state.ts`, including its `globalThis`-backed storage so the session id stays shared when CDN ESM providers split LaunchKit across bundle files). Replay writes the session id on open/resume/rotation and clears it on stop and on the 429 daily-cap stop; error capture reads it at enqueue time without importing the rrweb-bearing replay module.
+- **Page-load error back-stamp**: errors that fire while the replay module is still loading (dynamic import window) are queued with a null session and back-stamped with the session id the moment recording genuinely starts. Capture timestamps are preserved; only the session link is filled in.
+- **Error flush on page hidden**: the error queue now flushes on `visibilitychange → hidden` (keepalive fetch), so errors captured in the final seconds of a page life reach the API instead of dying with the tab.
+
+### Fixed
+
+- **Stale session id after failed replay start**: when the rrweb import fails or `record()` returns no stop handle, the shared session id is cleared so subsequent errors are not stamped with a session that will never record. Queued errors already stamped with a fresh session that never started recording are un-stamped too; resumed sessions keep their stamps (prior footage exists).
+
 ## [1.10.0] — 2026-06-18
 
 ### Added

@@ -1,4 +1,12 @@
 import { startReplay, stopReplay } from '../src/replay';
+import { enqueueError, startErrorCapture, stopErrorCapture } from '../src/error-capture';
+import { sendTelemetry } from '../src/telemetry-sender';
+
+vi.mock('../src/telemetry-sender', () => ({
+  sendTelemetry: vi.fn(),
+}));
+
+const mockSendTelemetry = vi.mocked(sendTelemetry);
 
 // ---------------------------------------------------------------------------
 // rrweb mock — hoisted so the dynamic import() inside replay.ts resolves to it.
@@ -16,6 +24,8 @@ const hoisted = vi.hoisted(() => {
     stopRecording: vi.fn(),
     takeFullSnapshot: vi.fn(),
     recordFactory: vi.fn(),
+    // When true, record() returns no stop handle (rrweb init failure path).
+    recordReturnsNoHandle: { value: false },
   };
 });
 
@@ -24,7 +34,7 @@ vi.mock('rrweb', () => {
     (opts: { emit: (event: unknown) => void }) => {
       hoisted.setEmit(opts.emit);
       hoisted.recordFactory(opts);
-      return hoisted.stopRecording;
+      return hoisted.recordReturnsNoHandle.value ? undefined : hoisted.stopRecording;
     },
     { takeFullSnapshot: hoisted.takeFullSnapshot },
   );
@@ -78,6 +88,15 @@ function setNow(ms: number) {
   vi.setSystemTime(ms);
 }
 
+/** Errors of the most recent sendTelemetry batch (error-capture flush). */
+function lastFlushedErrors(): Array<{ sessionId: string | null; capturedAt: number }> {
+  const calls = mockSendTelemetry.mock.calls;
+  const payload = calls[calls.length - 1][1] as {
+    errors: Array<{ sessionId: string | null; capturedAt: number }>;
+  };
+  return payload.errors;
+}
+
 let visibilityState: DocumentVisibilityState = 'visible';
 let originalVisibilityDescriptor: PropertyDescriptor | undefined;
 let originalSendBeaconDescriptor: PropertyDescriptor | undefined;
@@ -85,6 +104,7 @@ let originalSendBeaconDescriptor: PropertyDescriptor | undefined;
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] });
   setNow(START_NOW);
+  mockSendTelemetry.mockClear();
   fetchMock.mockReset();
   fetchMock.mockResolvedValue(okResponse());
   vi.stubGlobal('fetch', fetchMock);
@@ -95,6 +115,7 @@ beforeEach(() => {
     hoisted.getEmit()?.({ type: 2, timestamp: Date.now(), data: {} });
   });
   hoisted.recordFactory.mockClear();
+  hoisted.recordReturnsNoHandle.value = false;
   sessionStorage.clear();
   visibilityState = 'visible';
   originalVisibilityDescriptor = Object.getOwnPropertyDescriptor(
@@ -115,6 +136,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  stopErrorCapture();
   stopReplay();
   if (originalVisibilityDescriptor) {
     Object.defineProperty(
@@ -272,6 +294,189 @@ describe('session rotation', () => {
 
     expect(readStoredSession().id).toBe(sessionB);
     expect(readStoredSession().seq).toBe(0);
+  });
+});
+
+describe('error–session stamping', () => {
+  it('test_req_error_session_stamp: error captured while replay is recording carries the active session id and capture timestamp', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const activeSessionId = readStoredSession().id;
+
+    startErrorCapture(BUILD_SLUG);
+    enqueueError({
+      message: 'boom during recording',
+      stack: null,
+      url: 'https://example.com',
+      source: 'uncaught',
+    });
+    stopErrorCapture(); // flushes the queue synchronously
+
+    const [error] = lastFlushedErrors();
+    expect(error.sessionId).toBe(activeSessionId);
+    expect(error.capturedAt).toBe(START_NOW);
+  });
+
+  it('test_req_rotation_stamp: error captured after a rotation carries the new session id', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
+    const oldSessionId = readStoredSession().id;
+
+    setNow(START_NOW + IDLE_TIMEOUT_MS + 1_000);
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } }); // triggers rotation
+    const newSessionId = readStoredSession().id;
+    expect(newSessionId).not.toBe(oldSessionId);
+
+    startErrorCapture(BUILD_SLUG);
+    enqueueError({
+      message: 'after rotation',
+      stack: null,
+      url: null,
+      source: 'console',
+    });
+    stopErrorCapture();
+
+    const [error] = lastFlushedErrors();
+    expect(error.sessionId).toBe(newSessionId);
+  });
+
+  it('resume_stamp: error captured after a stop/restart resume carries the resumed session id', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const firstSessionId = readStoredSession().id;
+    stopReplay();
+
+    // Restart WITHOUT clearing sessionStorage — _resolveSession resumes the
+    // stored session (idle < 4 min, age < 60 min) and republishes its id.
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    expect(readStoredSession().id).toBe(firstSessionId);
+
+    startErrorCapture(BUILD_SLUG);
+    enqueueError({
+      message: 'after resume',
+      stack: null,
+      url: null,
+      source: 'console',
+    });
+    stopErrorCapture();
+
+    const [error] = lastFlushedErrors();
+    expect(error.sessionId).toBe(firstSessionId);
+  });
+
+  it('test_req_no_replay_null_session: error captured after replay stops carries a null session id', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    stopReplay();
+
+    startErrorCapture(BUILD_SLUG);
+    enqueueError({
+      message: 'no replay running',
+      stack: null,
+      url: null,
+      source: 'network',
+    });
+    stopErrorCapture();
+
+    const [error] = lastFlushedErrors();
+    expect(error.sessionId).toBeNull();
+    expect(typeof error.capturedAt).toBe('number');
+  });
+
+  it('daily_cap_429_clears_session: error captured after the 429 daily-cap stop carries a null session id', async () => {
+    visibilityState = 'hidden';
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    emit!({ type: 2, timestamp: Date.now(), data: {} });
+
+    // Chunk upload hits the daily cap; replay stops itself via stopReplay().
+    fetchMock.mockResolvedValue({ ok: false, status: 429 } as Response);
+    document.dispatchEvent(new Event('visibilitychange'));
+    await flushMicrotasks();
+    expect(hoisted.stopRecording).toHaveBeenCalled();
+
+    startErrorCapture(BUILD_SLUG);
+    enqueueError({
+      message: 'after daily cap',
+      stack: null,
+      url: null,
+      source: 'uncaught',
+    });
+    stopErrorCapture();
+
+    const [error] = lastFlushedErrors();
+    // Footage ended at the cap — the error must not point at that session.
+    expect(error.sessionId).toBeNull();
+    infoSpy.mockRestore();
+  });
+});
+
+describe('pre-replay error back-stamp', () => {
+  it('backstamp_queued_errors: error queued before replay starts is stamped with the session once recording begins', async () => {
+    startErrorCapture(BUILD_SLUG);
+    enqueueError({
+      message: 'fired during replay module import',
+      stack: null,
+      url: null,
+      source: 'uncaught',
+    });
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const activeSessionId = readStoredSession().id;
+
+    stopErrorCapture(); // flushes the queue synchronously
+
+    const [error] = lastFlushedErrors();
+    expect(error.sessionId).toBe(activeSessionId);
+    // Back-stamping rewrites the session link only — capture time is preserved.
+    expect(error.capturedAt).toBe(START_NOW);
+  });
+
+  it('backstamp_only_null_sessions: errors stamped at capture time keep their original session', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const firstSessionId = readStoredSession().id;
+
+    startErrorCapture(BUILD_SLUG);
+    enqueueError({
+      message: 'live-stamped under first session',
+      stack: null,
+      url: null,
+      source: 'console',
+    });
+
+    // Restart replay under a fresh session while the error is still queued.
+    stopReplay();
+    sessionStorage.clear();
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const secondSessionId = readStoredSession().id;
+    expect(secondSessionId).not.toBe(firstSessionId);
+
+    stopErrorCapture();
+
+    const [error] = lastFlushedErrors();
+    expect(error.sessionId).toBe(firstSessionId);
+  });
+
+  it('failed_start_clears_session: record() returning no stop handle clears the shared session id', async () => {
+    hoisted.recordReturnsNoHandle.value = true;
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+    startErrorCapture(BUILD_SLUG);
+    enqueueError({
+      message: 'after failed replay start',
+      stack: null,
+      url: null,
+      source: 'network',
+    });
+    stopErrorCapture();
+
+    const [error] = lastFlushedErrors();
+    // No recording exists — the error must not point at a dead session.
+    expect(error.sessionId).toBeNull();
+    warnSpy.mockRestore();
   });
 });
 
@@ -455,5 +660,143 @@ describe('stopReplay cleanup', () => {
     emit2!({ type: 2, timestamp: Date.now(), data: {} });
 
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
+  });
+});
+
+describe('sessionId wire format', () => {
+  // The server validates sessionId as a UUID; any other shape 422-rejects the
+  // ENTIRE error batch — silent total telemetry loss for those 5 errors.
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  it('uuid_wire_format: a flushed error sessionId is a server-accepted UUID', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+    startErrorCapture(BUILD_SLUG);
+    enqueueError({
+      message: 'wire check',
+      stack: null,
+      url: null,
+      source: 'uncaught',
+    });
+    stopErrorCapture();
+
+    const [error] = lastFlushedErrors();
+    expect(error.sessionId).toMatch(UUID_RE);
+  });
+
+  it('uuid_fallback_format: the non-crypto fallback id still matches the UUID shape', async () => {
+    // Drop crypto.randomUUID so _generateSessionId takes the Math.random
+    // fallback (restored by vi.unstubAllGlobals in afterEach).
+    vi.stubGlobal('crypto', {});
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const sessionId = readStoredSession().id;
+    expect(sessionId).toMatch(UUID_RE);
+
+    startErrorCapture(BUILD_SLUG);
+    enqueueError({
+      message: 'fallback wire check',
+      stack: null,
+      url: null,
+      source: 'uncaught',
+    });
+    stopErrorCapture();
+
+    const [error] = lastFlushedErrors();
+    expect(error.sessionId).toBe(sessionId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Failed replay start un-stamp. These tests force the rrweb DYNAMIC IMPORT to
+// fail, which requires a fresh module registry (the top-level mock factory is
+// cached after the first import). They stay last in the file: everything
+// inside goes through freshly imported module instances, never the static
+// imports above.
+// ---------------------------------------------------------------------------
+
+describe('failed replay start un-stamp', () => {
+  afterEach(() => {
+    vi.doUnmock('rrweb');
+    vi.resetModules();
+  });
+
+  /** Fresh replay/error-capture instances whose `import('rrweb')` rejects. */
+  async function loadWithFailingRrwebImport() {
+    vi.resetModules();
+    vi.doMock('rrweb', () => {
+      throw new Error('dynamic import failed');
+    });
+    const replay = await import('../src/replay');
+    const errorCapture = await import('../src/error-capture');
+    const sender = await import('../src/telemetry-sender');
+    return { replay, errorCapture, sendTelemetry: vi.mocked(sender.sendTelemetry) };
+  }
+
+  function flushedErrorsOf(
+    sendTelemetry: typeof mockSendTelemetry,
+  ): Array<{ sessionId: string | null }> {
+    const calls = sendTelemetry.mock.calls;
+    const payload = calls[calls.length - 1][1] as {
+      errors: Array<{ sessionId: string | null }>;
+    };
+    return payload.errors;
+  }
+
+  it('fresh_session_unstamped: error stamped during a failing rrweb import flushes with a null session id', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { replay, errorCapture, sendTelemetry } = await loadWithFailingRrwebImport();
+
+    // Not awaited yet: the error must be enqueued inside the import window,
+    // after _resolveSession published the fresh session id.
+    const startPromise = replay.startReplay(BUILD_SLUG, API_ENDPOINT);
+    errorCapture.startErrorCapture(BUILD_SLUG);
+    errorCapture.enqueueError({
+      message: 'during failing import',
+      stack: null,
+      url: null,
+      source: 'uncaught',
+    });
+    await startPromise;
+    errorCapture.stopErrorCapture();
+
+    // The fresh session will never record — its stamp must not reach the wire.
+    expect(flushedErrorsOf(sendTelemetry)[0].sessionId).toBeNull();
+    warnSpy.mockRestore();
+  });
+
+  it('resumed_session_keeps_stamp: a resumed session keeps queued error stamps when the start fails', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { replay, errorCapture, sendTelemetry } = await loadWithFailingRrwebImport();
+
+    const storedId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    sessionStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        id: storedId,
+        seq: 3,
+        startedAt: START_NOW - 1_000,
+        lastActivityAt: START_NOW - 500,
+        // origin's _resolveSession only resumes a chunked session (seq > 0)
+        // once its first chunk was acked; without this it opens a fresh one,
+        // which would (correctly) scrub the stamp instead of keeping it.
+        firstChunkAcked: true,
+      }),
+    );
+
+    const startPromise = replay.startReplay(BUILD_SLUG, API_ENDPOINT);
+    errorCapture.startErrorCapture(BUILD_SLUG);
+    errorCapture.enqueueError({
+      message: 'during failing import (resumed)',
+      stack: null,
+      url: null,
+      source: 'uncaught',
+    });
+    await startPromise;
+    errorCapture.stopErrorCapture();
+
+    // Prior footage exists for a resumed session — the stamp stays.
+    expect(flushedErrorsOf(sendTelemetry)[0].sessionId).toBe(storedId);
+    warnSpy.mockRestore();
   });
 });

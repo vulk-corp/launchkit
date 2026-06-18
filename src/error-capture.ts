@@ -7,18 +7,32 @@ import {
   truncateMessage,
 } from './normalize-thrown';
 import { sendTelemetry } from './telemetry-sender';
+import { getReplaySessionId } from './session-state';
 
 const BATCH_INTERVAL_MS = 10_000;
 const BATCH_SIZE_THRESHOLD = 5;
 
 export type ErrorSource = 'uncaught' | 'unhandled-rejection' | 'console' | 'network';
 
-export interface CapturedError {
+/** What capture paths provide. Session link fields are stamped internally. */
+export interface CapturedErrorInput {
   message: string;
   stack: string | null;
   url: string | null;
   source: ErrorSource;
   metadata?: Record<string, unknown>;
+}
+
+/**
+ * Wire shape sent to /api/telemetry/errors. `sessionId` is the replay
+ * session active at capture time (null when replay is not recording) and
+ * `capturedAt` is the client-clock capture timestamp in epoch ms — both
+ * stamped inside enqueueError, never at flush, so a batch spanning a session
+ * rotation keeps each error on the session it actually happened in.
+ */
+export interface CapturedError extends CapturedErrorInput {
+  sessionId: string | null;
+  capturedAt: number;
 }
 
 let _queue: CapturedError[] = [];
@@ -29,6 +43,7 @@ let _originalOnError: OnErrorEventHandler = null;
 let _rejectionHandler: ((event: PromiseRejectionEvent) => void) | null = null;
 let _originalConsoleError: (typeof console.error) | null = null;
 let _capturing = false;
+let _visibilityFlushHandler: (() => void) | null = null;
 
 export function startErrorCapture(buildSlug: string): void {
   if (_installed) return;
@@ -95,12 +110,27 @@ export function startErrorCapture(buildSlug: string): void {
   };
 
   _intervalId = setInterval(flush, BATCH_INTERVAL_MS);
+
+  // Errors captured in the final seconds of a page life (often the fatal
+  // ones) would otherwise sit in the queue past unload and never reach the
+  // API. sendTelemetry uses keepalive fetch, so a flush at hidden survives
+  // tab close and navigation.
+  _visibilityFlushHandler = () => {
+    if (document.visibilityState === 'hidden') {
+      flush();
+    }
+  };
+  document.addEventListener('visibilitychange', _visibilityFlushHandler);
 }
 
 export function stopErrorCapture(): void {
   if (_intervalId) {
     clearInterval(_intervalId);
     _intervalId = null;
+  }
+  if (_visibilityFlushHandler) {
+    document.removeEventListener('visibilitychange', _visibilityFlushHandler);
+    _visibilityFlushHandler = null;
   }
   flush();
 
@@ -117,15 +147,55 @@ export function stopErrorCapture(): void {
   _installed = false;
 }
 
-export function enqueueError(error: CapturedError): void {
+export function enqueueError(error: CapturedErrorInput): void {
   const message = truncateMessage(error.message);
   const stack =
     typeof error.stack === 'string' ? sanitizeAndTruncate(error.stack, MAX_STACK_LENGTH) : null;
   const url =
     typeof error.url === 'string' ? sanitizeAndTruncate(error.url, MAX_URL_LENGTH) : null;
-  _queue.push({ ...error, message, stack, url });
+  _queue.push({
+    ...error,
+    message,
+    stack,
+    url,
+    sessionId: getReplaySessionId(),
+    capturedAt: Date.now(),
+  });
   if (_queue.length >= BATCH_SIZE_THRESHOLD) {
     flush();
+  }
+}
+
+/**
+ * Stamp queued errors that were captured before replay became active.
+ * Called by replay.ts the moment recording genuinely starts (rrweb loaded,
+ * stop handle obtained), closing the page-load gap where errors fire during
+ * the replay module's dynamic import. Only null-session entries are touched
+ * — errors stamped at capture time keep the session they happened in. The
+ * 10s flush interval bounds queue age, so a back-stamped error is at most
+ * one flush window older than the recording; assembly clamps its timestamp
+ * to the session window.
+ */
+export function backstampQueuedErrors(sessionId: string): void {
+  for (const error of _queue) {
+    if (error.sessionId === null) {
+      error.sessionId = sessionId;
+    }
+  }
+}
+
+/**
+ * Remove the session link from queued errors stamped with the given session.
+ * Called by replay.ts when a FRESH session's replay start fails (rrweb import
+ * error or no stop handle) — that session will never record or assemble, so
+ * its id must not reach the wire. Resumed sessions are never un-stamped:
+ * their prior footage is legitimate.
+ */
+export function unstampQueuedErrors(sessionId: string): void {
+  for (const error of _queue) {
+    if (error.sessionId === sessionId) {
+      error.sessionId = null;
+    }
   }
 }
 

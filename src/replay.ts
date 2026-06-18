@@ -12,6 +12,8 @@
  */
 
 import type { eventWithTime, record as rrwebRecord } from 'rrweb';
+import { setReplaySessionId } from './session-state';
+import { backstampQueuedErrors, unstampQueuedErrors } from './error-capture';
 
 const SDK_TAG = '[@bworlds/launchkit]';
 const FLUSH_INTERVAL_MS = 10_000;
@@ -156,10 +158,17 @@ function _openNewSession(now: number): void {
   _sequenceNumber = 0;
   _sessionStartedAt = now;
   _firstChunkAcked = false;
+  setReplaySessionId(_sessionId);
   _saveSession();
 }
 
-function _resolveSession(): void {
+/**
+ * Resume the stored session when still live, else open a fresh one. Returns
+ * true when a FRESH session was opened: failure handling scrubs queued error
+ * stamps for a fresh session (it never recorded), but keeps them for a resumed
+ * session (prior footage exists).
+ */
+function _resolveSession(): boolean {
   const now = Date.now();
   const stored = _loadSession();
 
@@ -170,17 +179,19 @@ function _resolveSession(): void {
     if (idleMs < IDLE_TIMEOUT_MS && ageMs < MAX_SESSION_MS) {
       if (stored.seq > 0 && stored.firstChunkAcked !== true) {
         _openNewSession(now);
-        return;
+        return true;
       }
       _sessionId = stored.id;
       _sequenceNumber = stored.seq;
       _sessionStartedAt = stored.startedAt;
       _firstChunkAcked = stored.firstChunkAcked === true;
-      return;
+      setReplaySessionId(_sessionId);
+      return false;
     }
   }
 
   _openNewSession(now);
+  return true;
 }
 
 /** Read the bworlds_token cookie (set by check module after validation). */
@@ -537,7 +548,11 @@ export function stopReplay(): void {
     window.removeEventListener('beforeunload', _unloadHandler);
     _unloadHandler = null;
   }
-  // Reset module state so _resolveSession starts clean on next startReplay
+  // Reset module state so _resolveSession starts clean on next startReplay.
+  // Clearing the shared session id covers manual stop and the 429 daily-cap
+  // stop (which routes through stopReplay) — errors captured after this point
+  // must not point at a session whose footage has ended.
+  setReplaySessionId(null);
   _sessionId = null;
   _sequenceNumber = 0;
   _sessionStartedAt = 0;
@@ -566,7 +581,7 @@ export async function startReplay(
     _getIdentity = options.getIdentity ?? _defaultGetIdentity;
     _buildSlug = buildSlug;
     _apiEndpoint = apiEndpoint.replace(/\/+$/, ''); // Strip trailing slashes
-    _resolveSession();
+    const isFreshSession = _resolveSession();
     _eventBuffer = [];
     _pendingChunks = [];
     _capReached = false;
@@ -586,6 +601,14 @@ export async function startReplay(
         `${SDK_TAG} Session replay failed to initialize. rrweb could not be loaded:`,
         err,
       );
+      // _resolveSession published the session id; with no recording it must not
+      // leak into error stamps (that session never assembles). A fresh session's
+      // already-queued stamps are scrubbed; a resumed session keeps them.
+      const failedSessionId = _sessionId;
+      setReplaySessionId(null);
+      if (isFreshSession && failedSessionId) {
+        unstampQueuedErrors(failedSessionId);
+      }
       return;
     }
 
@@ -618,11 +641,23 @@ export async function startReplay(
       console.warn(
         `${SDK_TAG} rrweb record() returned no stop handle. Replay disabled.`,
       );
+      const failedSessionId = _sessionId;
+      setReplaySessionId(null);
+      if (isFreshSession && failedSessionId) {
+        unstampQueuedErrors(failedSessionId);
+      }
       return;
     }
 
     _stopRecording = stop;
     _markReplayRecording();
+
+    // Recording is genuinely active: errors that fired during the replay
+    // module's dynamic import are still queued (10s flush) with a null session
+    // — link them to the session whose footage starts now.
+    if (_sessionId) {
+      backstampQueuedErrors(_sessionId);
+    }
 
     _flushTimer = setInterval(() => {
       _flush().catch(() => {});
