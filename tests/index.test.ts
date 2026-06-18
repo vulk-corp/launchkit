@@ -49,6 +49,12 @@ vi.mock('../src/network-capture', () => ({
   stopNetworkCapture: vi.fn(),
 }));
 
+vi.mock('../src/supabase-identity-bridge', () => ({
+  startSupabaseIdentityBridge: vi.fn(),
+  stopSupabaseIdentityBridge: vi.fn(),
+  connectSupabase: vi.fn(),
+}));
+
 const mockFetchRemoteConfig = vi.mocked(fetchRemoteConfig);
 const mockReadCachedGatingEnabled = vi.mocked(readCachedGatingEnabled);
 

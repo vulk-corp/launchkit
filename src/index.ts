@@ -6,9 +6,16 @@ import { check as _check } from './check';
 import { fetchRemoteConfig, readCachedGatingEnabled } from './remote-config';
 import { startBadgeWidget, stopBadgeWidget } from './badge-widget';
 import { setIdentity, getIdentity } from './identity-state';
+import {
+  connectSupabase as _connectSupabase,
+  startSupabaseIdentityBridge,
+  stopSupabaseIdentityBridge,
+  type SupabaseClientLike,
+} from './supabase-identity-bridge';
 import type { LaunchKitConfig } from './types';
 
 export type { LaunchKitConfig } from './types';
+export type { SupabaseClientLike } from './supabase-identity-bridge';
 export type { CheckResult } from './check';
 
 const DEFAULT_API_ENDPOINT = 'https://api.bworlds.co';
@@ -101,6 +108,11 @@ export interface LaunchKitInstance {
    * Identity is included in every subsequent chunk upload.
    */
   identify: (options: IdentifyOptions) => void;
+  /**
+   * Connect an existing Supabase browser client to BWORLDS session replay.
+   * This reads only `session.user.email` and `session.user.id`.
+   */
+  connectSupabase: (client: SupabaseClientLike) => void;
 }
 
 /**
@@ -140,12 +152,12 @@ function originMatches(allowedOrigin: string | null, dev: boolean): boolean {
 export function init(config: LaunchKitConfig): LaunchKitInstance {
   if (_initialized) {
     console.warn('[@bworlds/launchkit] init() called more than once — ignoring duplicate call.');
-    return { check, getGateUrl, stop, identify };
+    return { check, getGateUrl, stop, identify, connectSupabase };
   }
 
   if (!config.buildSlug) {
     console.warn('[@bworlds/launchkit] init() called without buildSlug — SDK will not start.');
-    return { check, getGateUrl, stop, identify };
+    return { check, getGateUrl, stop, identify, connectSupabase };
   }
 
   _initialized = true;
@@ -190,7 +202,7 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
       });
   }
 
-  return { check, getGateUrl, stop, identify };
+  return { check, getGateUrl, stop, identify, connectSupabase };
 }
 
 /**
@@ -213,6 +225,7 @@ function activateSubsystems(
   if (!sandboxed) {
     startErrorCapture(buildSlug);
     startNetworkCapture(apiEndpoint);
+    startSupabaseIdentityBridge();
     startReplayModule(buildSlug, apiEndpoint);
   }
 
@@ -222,6 +235,7 @@ function activateSubsystems(
     if (!remote.sessionReplay) {
       stopErrorCapture();
       stopNetworkCapture();
+      stopSupabaseIdentityBridge();
       _stopReplay?.();
     }
     if (remote.badge && !sandboxed) {
@@ -308,6 +322,7 @@ export function stop(): void {
   stopHeartbeat();
   stopErrorCapture();
   stopNetworkCapture();
+  stopSupabaseIdentityBridge();
   _stopReplay?.();
   stopBadgeWidget();
   _initialized = false;
@@ -320,6 +335,15 @@ export function stop(): void {
  */
 export function identify(options: IdentifyOptions): void {
   setIdentity(options.email ?? null, options.userId ?? null);
+}
+
+/**
+ * Connect an existing Supabase browser client to BWORLDS session replay.
+ * This is optional: init() also attempts a best-effort localStorage bridge for
+ * Lovable-style Supabase apps.
+ */
+export function connectSupabase(client: SupabaseClientLike): void {
+  _connectSupabase(client);
 }
 
 /** Accessor for reading current identity state (re-exports from shared module). */

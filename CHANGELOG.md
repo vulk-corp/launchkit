@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.10.0] — 2026-06-18
+
+### Added
+
+- **Automatic Supabase identity for replays**: LaunchKit now detects Lovable-style Supabase Auth sessions from browser storage and attaches `userEmail` / `userId` to replay chunks without changing the public `init({ buildSlug })` snippet.
+- **Optional Supabase client bridge**: `launchkit.connectSupabase(supabase)` can be used by integration agents or advanced apps to feed identity through Supabase's official `getSession()` / `onAuthStateChange()` APIs.
+
+### Privacy
+
+- The Supabase bridge reads only `session.user.email` and `session.user.id`. Supabase access tokens, refresh tokens, user metadata, and application tables are not sent to BWORLDS.
+
 ## [1.9.4] — 2026-06-16
 
 ### Fixed
