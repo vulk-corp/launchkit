@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.11.1] — 2026-06-19
+
+### Fixed
+
+- **Vite dev replay snapshots without CSS**: session replay now waits briefly for Vite's runtime-injected `style[data-vite-dev-id]` before starting rrweb, and ignores later Vite dev `FullSnapshot` events that drop CSS after a styled snapshot has already been captured. This prevents localhost/Lovable dev recordings from replaying as raw unstyled HTML when rrweb snapshots race CSS injection.
+
 ## [1.11.0] — 2026-06-18
 
 ### Added

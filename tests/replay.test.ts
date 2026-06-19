@@ -84,6 +84,73 @@ function okResponse() {
   return { ok: true, status: 200 } as Response;
 }
 
+function appendViteClientScript() {
+  const script = document.createElement('script');
+  script.type = 'module';
+  script.src = '/@vite/client';
+  document.head.appendChild(script);
+  return script;
+}
+
+function appendViteDevCss() {
+  const style = document.createElement('style');
+  style.setAttribute('data-vite-dev-id', '/src/index.css');
+  style.textContent = 'body { color: rgb(10, 20, 30); }';
+  document.head.appendChild(style);
+  return style;
+}
+
+function fullSnapshotEvent(hasViteDevCss: boolean, marker: string) {
+  const headChildren = hasViteDevCss
+    ? [
+        {
+          type: 2,
+          id: 4,
+          tagName: 'style',
+          attributes: { 'data-vite-dev-id': '/src/index.css' },
+          childNodes: [{ type: 3, id: 5, textContent: 'body{}' }],
+        },
+      ]
+    : [];
+
+  return {
+    type: 2,
+    timestamp: Date.now(),
+    data: {
+      marker,
+      initialOffset: { top: 0, left: 0 },
+      node: {
+        type: 0,
+        id: 1,
+        childNodes: [
+          {
+            type: 2,
+            id: 2,
+            tagName: 'html',
+            attributes: {},
+            childNodes: [
+              {
+                type: 2,
+                id: 3,
+                tagName: 'head',
+                attributes: {},
+                childNodes: headChildren,
+              },
+              {
+                type: 2,
+                id: 6,
+                tagName: 'body',
+                attributes: {},
+                childNodes: [],
+              },
+            ],
+          },
+        ],
+      },
+    },
+  };
+}
+
 function setNow(ms: number) {
   vi.setSystemTime(ms);
 }
@@ -105,6 +172,8 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] });
   setNow(START_NOW);
   mockSendTelemetry.mockClear();
+  document.head.innerHTML = '';
+  document.body.innerHTML = '';
   fetchMock.mockReset();
   fetchMock.mockResolvedValue(okResponse());
   vi.stubGlobal('fetch', fetchMock);
@@ -161,6 +230,53 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe('Vite dev CSS readiness', () => {
+  it('waits for Vite dev CSS before starting rrweb', async () => {
+    appendViteClientScript();
+
+    const start = startReplay(BUILD_SLUG, API_ENDPOINT);
+    await flushMicrotasks();
+
+    expect(hoisted.recordFactory).not.toHaveBeenCalled();
+
+    appendViteDevCss();
+    await start;
+
+    expect(hoisted.recordFactory).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops a style-less Vite dev FullSnapshot after a styled snapshot and retries', async () => {
+    visibilityState = 'hidden';
+    appendViteClientScript();
+    appendViteDevCss();
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    expect(emit).not.toBeNull();
+
+    hoisted.takeFullSnapshot.mockImplementation(() => {
+      emit!(fullSnapshotEvent(true, 'retry-styled'));
+    });
+
+    emit!(fullSnapshotEvent(true, 'initial-styled'));
+    emit!(fullSnapshotEvent(false, 'styleless-checkout'));
+
+    await vi.waitFor(() => {
+      expect(hoisted.takeFullSnapshot).toHaveBeenCalledWith(true);
+    });
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    const body = parseFetchBody(fetchMock.mock.calls[0]);
+    const events = body.events as Array<{ data?: { marker?: string } }>;
+    expect(events.map((event) => event.data?.marker)).toEqual([
+      'initial-styled',
+      'retry-styled',
+    ]);
+  });
+});
 
 describe('session rotation', () => {
   it('rotates to a new session id when emit fires after the idle threshold', async () => {

@@ -26,6 +26,9 @@ const MAX_SESSION_MS = 60 * 60 * 1000; // 60 min — rotate session after this d
 const STORAGE_KEY = 'bworlds-replay-session';
 const TOKEN_COOKIE = 'bworlds_token';
 const GLOBAL_REPLAY_STATE_KEY = '__bworldsLaunchKitReplayState__';
+const VITE_DEV_CLIENT_SCRIPT_SELECTOR = 'script[src*="/@vite/client"]';
+const VITE_DEV_CSS_SELECTOR = 'style[data-vite-dev-id]';
+const VITE_DEV_CSS_READY_TIMEOUT_MS = 1_500;
 
 let _sessionId: string | null = null;
 let _sequenceNumber = 0;
@@ -48,6 +51,8 @@ let _EventType: { Custom: number; FullSnapshot?: number } | null = null;
 // UA captured once on startReplay() — sent only on first chunk
 let _userAgent: string | null = null;
 let _firstChunkAcked = false;
+let _viteDevCssFullSnapshotSeen = false;
+let _viteDevCssSnapshotRetryScheduled = false;
 const _instanceId = _generateSessionId();
 
 type Identity = { email: string | null; userId: string | null };
@@ -77,6 +82,13 @@ interface ReplayChunk {
 interface ReplayGlobalState {
   ownerId: string;
   phase: 'starting' | 'recording';
+}
+
+interface SnapshotNodeLike {
+  type?: unknown;
+  tagName?: unknown;
+  attributes?: Record<string, unknown>;
+  childNodes?: SnapshotNodeLike[];
 }
 
 function _generateSessionId(): string {
@@ -125,6 +137,116 @@ function _releaseReplayLock(): void {
   if (replayWindow[GLOBAL_REPLAY_STATE_KEY]?.ownerId === _instanceId) {
     delete replayWindow[GLOBAL_REPLAY_STATE_KEY];
   }
+}
+
+function _hasViteDevCssElement(): boolean {
+  if (typeof document === 'undefined') return false;
+  return document.querySelector(VITE_DEV_CSS_SELECTOR) !== null;
+}
+
+function _isViteDevRuntime(): boolean {
+  if (typeof document === 'undefined') return false;
+  if (_hasViteDevCssElement()) return true;
+  return document.querySelector(VITE_DEV_CLIENT_SCRIPT_SELECTOR) !== null;
+}
+
+function _nextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => resolve());
+      return;
+    }
+    setTimeout(resolve, 0);
+  });
+}
+
+async function _waitForViteDevCssReady(): Promise<void> {
+  if (!_isViteDevRuntime() || _hasViteDevCssElement()) return;
+
+  await _nextPaint();
+  if (!_isViteDevRuntime() || _hasViteDevCssElement()) return;
+
+  await new Promise<void>((resolve) => {
+    let done = false;
+    let observer: MutationObserver | null = null;
+
+    const finish = () => {
+      if (done) return;
+      done = true;
+      observer?.disconnect();
+      clearTimeout(timeout);
+      resolve();
+    };
+
+    const timeout = setTimeout(finish, VITE_DEV_CSS_READY_TIMEOUT_MS);
+
+    if (typeof MutationObserver === 'undefined') return;
+
+    observer = new MutationObserver(() => {
+      if (_hasViteDevCssElement()) finish();
+    });
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+    if (_hasViteDevCssElement()) finish();
+  });
+}
+
+function _isFullSnapshotEvent(event: eventWithTime): boolean {
+  return event.type === (_EventType?.FullSnapshot ?? 2);
+}
+
+function _snapshotNodeHasViteDevCss(node: SnapshotNodeLike): boolean {
+  if (
+    node.type === 2 &&
+    typeof node.tagName === 'string' &&
+    node.tagName.toLowerCase() === 'style' &&
+    node.attributes?.['data-vite-dev-id'] != null
+  ) {
+    return true;
+  }
+
+  return Array.isArray(node.childNodes)
+    ? node.childNodes.some(_snapshotNodeHasViteDevCss)
+    : false;
+}
+
+function _fullSnapshotHasViteDevCss(event: eventWithTime): boolean {
+  if (!_isFullSnapshotEvent(event)) return false;
+  const node = (event.data as { node?: SnapshotNodeLike } | undefined)?.node;
+  return node ? _snapshotNodeHasViteDevCss(node) : false;
+}
+
+function _scheduleViteDevCssFullSnapshot(): void {
+  if (_viteDevCssSnapshotRetryScheduled || !_record) return;
+  _viteDevCssSnapshotRetryScheduled = true;
+
+  _waitForViteDevCssReady()
+    .then(() => _nextPaint())
+    .then(() => {
+      if (!_record || !_stopRecording) return;
+      try {
+        _record.takeFullSnapshot(true);
+      } catch {
+        // rrweb throws if called outside an active recording — non-fatal.
+      }
+    })
+    .finally(() => {
+      _viteDevCssSnapshotRetryScheduled = false;
+    });
+}
+
+function _shouldBufferReplayEvent(event: eventWithTime): boolean {
+  if (!_isFullSnapshotEvent(event) || !_isViteDevRuntime()) return true;
+  if (_fullSnapshotHasViteDevCss(event)) {
+    _viteDevCssFullSnapshotSeen = true;
+    return true;
+  }
+  if (!_viteDevCssFullSnapshotSeen || !_hasViteDevCssElement()) return true;
+
+  _scheduleViteDevCssFullSnapshot();
+  return false;
 }
 
 function _loadSession(): StoredSession | null {
@@ -565,6 +687,8 @@ export function stopReplay(): void {
   _flushing = false;
   _starting = false;
   _firstChunkAcked = false;
+  _viteDevCssFullSnapshotSeen = false;
+  _viteDevCssSnapshotRetryScheduled = false;
   _releaseReplayLock();
 }
 
@@ -586,6 +710,8 @@ export async function startReplay(
     _pendingChunks = [];
     _capReached = false;
     _lastEventAt = 0;
+    _viteDevCssFullSnapshotSeen = false;
+    _viteDevCssSnapshotRetryScheduled = false;
 
     // Capture UA once per replay session — sent on first chunk only
     if (typeof navigator !== 'undefined' && navigator.userAgent) {
@@ -616,6 +742,9 @@ export async function startReplay(
     _EventType = EventType;
     _record = record;
 
+    await _waitForViteDevCssReady();
+    if (!_starting) return;
+
     const stop = record({
       emit(event: eventWithTime) {
         const now = Date.now();
@@ -628,6 +757,7 @@ export async function startReplay(
           // prevents that nested call from re-triggering rotation.
           _rotateSession();
         }
+        if (!_shouldBufferReplayEvent(event)) return;
         _eventBuffer.push(event);
       },
       maskInputOptions: {
