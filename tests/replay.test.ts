@@ -23,6 +23,7 @@ const hoisted = vi.hoisted(() => {
     setEmit,
     stopRecording: vi.fn(),
     takeFullSnapshot: vi.fn(),
+    addCustomEvent: vi.fn(),
     recordFactory: vi.fn(),
     // When true, record() returns no stop handle (rrweb init failure path).
     recordReturnsNoHandle: { value: false },
@@ -36,7 +37,10 @@ vi.mock('rrweb', () => {
       hoisted.recordFactory(opts);
       return hoisted.recordReturnsNoHandle.value ? undefined : hoisted.stopRecording;
     },
-    { takeFullSnapshot: hoisted.takeFullSnapshot },
+    {
+      takeFullSnapshot: hoisted.takeFullSnapshot,
+      addCustomEvent: hoisted.addCustomEvent,
+    },
   );
   return {
     record,
@@ -183,6 +187,7 @@ beforeEach(() => {
   hoisted.takeFullSnapshot.mockImplementation(() => {
     hoisted.getEmit()?.({ type: 2, timestamp: Date.now(), data: {} });
   });
+  hoisted.addCustomEvent.mockReset();
   hoisted.recordFactory.mockClear();
   hoisted.recordReturnsNoHandle.value = false;
   sessionStorage.clear();
@@ -776,6 +781,165 @@ describe('stopReplay cleanup', () => {
     emit2!({ type: 2, timestamp: Date.now(), data: {} });
 
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
+  });
+});
+
+describe('navigation watcher', () => {
+  function lastNavigationCall() {
+    const calls = hoisted.addCustomEvent.mock.calls;
+    return calls[calls.length - 1] as [string, { href: string; title?: string }];
+  }
+
+  it('pushState emits one navigation custom event with href and title', async () => {
+    history.replaceState({}, '', '/');
+    document.title = 'Dashboard';
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+    history.pushState({}, '', '/settings');
+
+    expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+    expect(lastNavigationCall()).toEqual([
+      'navigation',
+      { href: location.href, title: 'Dashboard' },
+    ]);
+    expect(location.href).toContain('/settings');
+  });
+
+  it('replaceState emits one navigation custom event', async () => {
+    history.replaceState({}, '', '/');
+    document.title = 'Home';
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+    history.replaceState({}, '', '/checkout?step=1');
+
+    expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+    expect(lastNavigationCall()).toEqual([
+      'navigation',
+      { href: location.href, title: 'Home' },
+    ]);
+  });
+
+  it('popstate emits one navigation custom event on back/forward', async () => {
+    history.replaceState({}, '', '/');
+    document.title = 'Page';
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+    // Build a history stack so a back navigation restores a different URL.
+    history.pushState({}, '', '/first');
+    history.pushState({}, '', '/second');
+    hoisted.addCustomEvent.mockClear();
+
+    history.back(); // browser restores '/first' and fires popstate
+    await vi.waitFor(() => expect(hoisted.addCustomEvent).toHaveBeenCalled());
+
+    expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+    expect(lastNavigationCall()).toEqual([
+      'navigation',
+      { href: location.href, title: 'Page' },
+    ]);
+  });
+
+  it('dedupes consecutive navigations to an identical URL', async () => {
+    history.replaceState({}, '', '/');
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+    history.pushState({}, '', '/repeat?v=1');
+    history.replaceState({}, '', '/repeat?v=1'); // same resolved URL — query churn
+
+    expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it('stop restores original history methods and fires no event afterwards', async () => {
+    history.replaceState({}, '', '/');
+    const originalPushState = history.pushState;
+    const originalReplaceState = history.replaceState;
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    expect(history.pushState).not.toBe(originalPushState); // patched while recording
+
+    stopReplay();
+    expect(history.pushState).toBe(originalPushState);
+    expect(history.replaceState).toBe(originalReplaceState);
+
+    hoisted.addCustomEvent.mockClear();
+    history.pushState({}, '', '/after-stop');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    expect(hoisted.addCustomEvent).not.toHaveBeenCalled();
+  });
+
+  it('does not install the watcher inside a cross-origin iframe', async () => {
+    history.replaceState({}, '', '/');
+    const originalPushState = history.pushState;
+
+    // Simulate a cross-origin iframe: window.self !== window.top.
+    const ownSelf = Object.getOwnPropertyDescriptor(window, 'self');
+    Object.defineProperty(window, 'self', { configurable: true, get: () => ({}) });
+    try {
+      await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+      // History is left untouched — the watcher never patched it.
+      expect(history.pushState).toBe(originalPushState);
+
+      history.pushState({}, '', '/iframe-route');
+      expect(hoisted.addCustomEvent).not.toHaveBeenCalled();
+    } finally {
+      if (ownSelf) {
+        Object.defineProperty(window, 'self', ownSelf);
+      } else {
+        Reflect.deleteProperty(window, 'self');
+      }
+    }
+  });
+
+  it('re-emits a rotated session entry URL even when it matches the prior session', async () => {
+    history.replaceState({}, '', '/');
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    // Prime _lastEventAt with a real rrweb event (the first event never rotates).
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
+
+    // Navigate: the dedup baseline becomes '/dash'.
+    history.pushState({}, '', '/dash');
+    expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+
+    // Idle past the threshold, then a real event rotates the session.
+    setNow(START_NOW + IDLE_TIMEOUT_MS + 1_000);
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
+    expect(hoisted.takeFullSnapshot).toHaveBeenCalledWith(true); // rotation happened
+
+    // Same URL as before the rotation. Without the baseline reset this dedupes
+    // and the rotated session would carry no navigation event for its entry page.
+    hoisted.addCustomEvent.mockClear();
+    history.pushState({}, '', '/dash');
+    expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not stack history wrappers when a prior teardown left one in place', async () => {
+    history.replaceState({}, '', '/');
+    const genuinePushState = history.pushState;
+
+    // First recording installs our wrapper, then a clean stop restores the original.
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const staleWrapper = history.pushState;
+    expect(staleWrapper).not.toBe(genuinePushState);
+    stopReplay();
+    expect(history.pushState).toBe(genuinePushState);
+
+    // Simulate a hardened host where teardown could NOT restore: the stale wrapper
+    // is left on history.pushState (it still carries the genuine original).
+    history.pushState = staleWrapper;
+
+    // Second recording must recover the genuine original from the stale wrapper
+    // instead of wrapping the wrapper (which would double every navigation event).
+    hoisted.addCustomEvent.mockClear();
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+    history.pushState({}, '', '/stack-check');
+    expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+
+    stopReplay();
+    expect(history.pushState).toBe(genuinePushState); // genuine restored, no wrapper left
   });
 });
 

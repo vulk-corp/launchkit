@@ -12,6 +12,7 @@
 - **rrweb is external + lazy.** Dynamic `import('./replay')` only on first session. Main bundle ~6.5 kB.
 - **Replay owns the session id; error capture only reads it.** `replay.ts` publishes the active session id through `session-state.ts` (set on open/resume/rotation, cleared on stop, 429 cap stop, and failed start) — never export a getter from `replay.ts`, that defeats the dynamic-import boundary. `enqueueError` stamps `sessionId` + `capturedAt` at capture time, never at flush: a batch can span a session rotation. `backstampQueuedErrors` fills null-session entries only, preserves `capturedAt`, and is called only from `startReplay`'s success path.
 - **Telemetry strings are string-typed, capped, and well-formed.** `enqueueError` is the single enforcement chokepoint for `message` (≤ `MAX_MESSAGE_LENGTH`, 5000), `stack` (≤ `MAX_STACK_LENGTH`, 10000), and `url` (≤ `MAX_URL_LENGTH`, 2048): always strings, lone surrogates replaced with U+FFFD, never cut mid-surrogate-pair. The API rejects the entire `/api/telemetry/errors` batch when one item carries an invalid field. `normalizeThrown` never throws; unreadable values become `[error details could not be read]`.
+- **Navigation watcher restores the host's history on stop.** The SPA navigation watcher (history `pushState`/`replaceState` patch + `popstate` listener) lives inside the lazily-imported replay module, installs when recording starts, and tears down fully on stop — original `history.pushState`/`replaceState` restored, listener removed. Never leave the host app's history patched after stop. Skip entirely in cross-origin iframes; wrap install/emit in try/catch so route changes can never break the host app.
 
 ## Commands
 
@@ -34,7 +35,7 @@ CI: Node 22, runs on main/next push + PRs (type-check, build, test).
 | `src/error-capture.ts` | `window.onerror` + `unhandledrejection` + `console.error` wrapper. Batches 5 errors OR 10s, flushes on page hidden. Stamps `sessionId` (from session-state) + `capturedAt` at enqueue |
 | `src/network-capture.ts` | `window.fetch` wrapper. Enqueues HTTP ≥ 400 responses and rejected fetches with `Network error - {method} {url}` prefix. Skips `apiEndpoint` URLs (no self-capture) |
 | `src/normalize-thrown.ts` | Any thrown value → `{message, stack}`: Error as-is, string/primitive verbatim, object → `message` field → `error` field → safe JSON → `[error details could not be read]`. Depth-capped, never throws. Exports `truncateMessage`, `sanitizeAndTruncate` + the `MAX_*_LENGTH` server caps |
-| `src/replay.ts` | rrweb record, 10s flush, 512 KB chunks, sessionStorage persistence. Publishes session id to session-state, back-stamps queued errors on start |
+| `src/replay.ts` | rrweb record, 10s flush, 512 KB chunks, sessionStorage persistence. Publishes session id to session-state, back-stamps queued errors on start. Watches SPA navigation (history patch + popstate) and emits a `navigation` custom event per route change |
 | `src/session-state.ts` | Shared replay-session id holder. replay writes, error-capture reads at enqueue. Zero imports |
 | `src/identity-state.ts` | Shared identity holder. `index.ts` writes, replay payload reads |
 | `src/badge-widget.ts` | Shadow DOM badge. Fetches `/api/telemetry/badge-counts` |
@@ -55,6 +56,17 @@ Design rationale for `normalize-thrown.ts` and the capture paths — keep it her
 - `onerror`: a non-Error `error` param is normalized (the browser-stringified `message` would read "Uncaught [object Object]"); Error instances and absent `error` (cross-origin "Script error.") keep the browser message untouched. The capture body is wrapped in try/catch so a poisoned value (throwing `stack` getter) drops one capture without blocking the host app's own onerror chain.
 - Console path: an Error arg with an empty message falls back to `String(arg)` ("Error: ..."); non-Error args run through a budget loop that stops normalizing once the joined length passes the message cap — `enqueueError` would cut the excess anyway, so their stringify cost is skipped.
 - `[error details could not be read]` is builder-facing copy (dashboard row, alert email, Fix prompt): plain language, and a single literal keeps server-side grouping intact.
+
+## Navigation event contract
+
+SPA route changes are recorded as rrweb custom events so the backend distiller can segment a single-page session into pages. The contract is **stable** — the distiller (`bworlds-api`, #889 workstream 3) will match on it and append to `pages_visited` once that wiring ships. Do not rename the tag or reshape the payload without coordinating that change.
+
+- **tag**: `"navigation"`
+- **payload**: `{ href: string, title?: string }` — `href` is `location.href` (full URL, recorded exactly as rrweb already records META URLs; no new masking, query-param PII is a separate decision), `title` is `document.title` when non-empty.
+- **Emitted on**: `history.pushState`, `history.replaceState` (both patched — neither fires natively), and `popstate` (back/forward). `hashchange` is not covered (hash routers fall through); revisit if a HashRouter build needs in-session pages.
+- **Deduped**: an emission whose resolved `href` equals the last emitted one is dropped. The baseline is seeded to `location.href` at install, so the initial full-load META is not double-counted and `replaceState` query-param churn is silenced.
+- **Across rotation**: the watcher survives an idle session rotation (the patch is intentionally not torn down on rotate). `_rotateSession` clears the dedup baseline so each rotated session re-emits its entry URL instead of swallowing it as a duplicate.
+- Capture only. The initial page is already represented by rrweb's full-load META (type 4); no synthetic navigation event is emitted for it.
 
 ## API endpoints
 
