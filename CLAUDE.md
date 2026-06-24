@@ -95,6 +95,57 @@ Replay payload includes `token` (read from `bworlds_token` cookie) so backend re
 - Replay tests: hoisted `vi.hoisted()` to capture rrweb emit callback. `vi.setSystemTime()` for session rotation.
 - Always pass `gate: false` in non-gate tests (auto-gate triggers overlay + `check()` side effects).
 
+## Local testing (unreleased build)
+
+To exercise an unreleased SDK change in a real consumer app without an npm release, link the local build with `yalc` (no global install — use `pnpm dlx`). `yalc` ships `dist/`, so build first.
+
+Publish from this repo:
+
+```bash
+npm run build
+pnpm dlx yalc publish        # pushes the build to the local yalc store
+```
+
+Link it in the consumer app's **package** directory, then install from its root so the workspace picks up the link:
+
+```bash
+pnpm dlx yalc add @bworlds/launchkit   # rewrites the dep to file:.yalc/...
+pnpm install                           # from the consumer monorepo root
+```
+
+Iterate after each SDK change:
+
+```bash
+npm run build && pnpm dlx yalc push    # re-pushes to every linked consumer
+```
+
+then restart the consumer dev server (Next.js will not hot-swap a relinked package).
+
+**Point the consumer's `init()` at the local stack**, or the origin guard silently disables every subsystem:
+
+```js
+init({
+  buildSlug: '<local-slug>',              // must exist in the local BWorlds DB
+  apiEndpoint: 'http://localhost:3941',   // local bworlds-api (default port)
+  gateOrigin: 'http://localhost:3939',    // local bworlds-web (default port)
+  dev: true,                              // bypass the origin guard on localhost
+});
+```
+
+Worktree stacks shift the ports (base 4900/5900/6900/7900; web +39, api +41). Without `dev: true` the SDK fetches remote config, sees `localhost` does not match the build's registered origin, and goes fully silent (no console output) — that is the most common "nothing happens" cause.
+
+**Seed the build slug first.** If `buildSlug` is absent from the local DB, `/api/monetization/validate-token` returns `valid: false` for everyone and `/access/<slug>` 404s. Seed it from the BWorlds stack (e.g. `pnpm seed:demo` loads the `market-echo` demo build) before testing.
+
+**Verify.** With the consumer dev server up and DevTools → Network open, a reload should show `POST http://localhost:3941/api/telemetry/heartbeat` and a `validate-token` call hitting the **local** API, not `api.bworlds.co`. For SPA navigation specifically, click through routes and confirm `/api/telemetry/replay-events` payloads carry `navigation` custom events.
+
+**Common failure modes.** Redirect lands on `app.bworlds.co` → consumer env not loaded, restart its dev server. SDK behaves like the old version → stale yalc link, re-run `npm run build && pnpm dlx yalc push` then restart. `git status` shows `file:.yalc/...` → a link was left in place, revert before committing.
+
+Revert in the consumer when done — **never commit** `file:.yalc/...` or `yalc.lock`:
+
+```bash
+pnpm dlx yalc remove @bworlds/launchkit && pnpm install
+```
+
 ## Release
 
 **Branch push is the publish trigger.** `.github/workflows/ci.yml` runs type-check → build → test, creates the missing annotated `vX.Y.Z` tag from `package.json`, then dispatches `.github/workflows/release.yml` to publish with provenance.
