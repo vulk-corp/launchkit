@@ -143,7 +143,7 @@ it('req_sdk_cookie_email_auto — email from bworlds_token cookie in first chunk
     return `${header}.${claims}.fakesig`;
   }
 
-  const token = makeJwt({ email: 'cookie@example.com', buildSlug: 'test', accessType: 'full' });
+  const token = makeJwt({ email: 'cookie@example.com', buildSlug: BUILD_SLUG, accessType: 'full' });
   Object.defineProperty(document, 'cookie', {
     value: `bworlds_token=${token}`,
     writable: true,

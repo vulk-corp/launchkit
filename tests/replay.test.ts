@@ -93,6 +93,26 @@ function okResponse() {
   return { ok: true, status: 200 } as Response;
 }
 
+/** Build an unsigned JWT (header.payload.sig) the SDK can decode without verifying. */
+function makeToken(payload: Record<string, unknown>): string {
+  const b64url = (obj: unknown) => {
+    const bytes = new TextEncoder().encode(JSON.stringify(obj));
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+  return `${b64url({ alg: 'HS256', typ: 'JWT' })}.${b64url(payload)}.sig`;
+}
+
+function clearCookies() {
+  for (const part of document.cookie.split(';')) {
+    const name = part.split('=')[0].trim();
+    if (name) {
+      document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`;
+    }
+  }
+}
+
 function appendViteClientScript() {
   const script = document.createElement('script');
   script.type = 'module';
@@ -183,6 +203,7 @@ beforeEach(() => {
   mockSendTelemetry.mockClear();
   document.head.innerHTML = '';
   document.body.innerHTML = '';
+  clearCookies();
   fetchMock.mockReset();
   fetchMock.mockResolvedValue(okResponse());
   vi.stubGlobal('fetch', fetchMock);
@@ -1022,6 +1043,56 @@ describe('visitor identity', () => {
     } finally {
       vi.mocked(getVisitorId).mockReturnValue('visitor-fixed-id');
     }
+  });
+});
+
+describe('build-bound token', () => {
+  async function flushOneChunk(): Promise<Record<string, unknown>> {
+    hoisted.getEmit()!({ type: 2, timestamp: Date.now(), data: {} });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    return parseFetchBody(fetchMock.mock.calls[0]);
+  }
+
+  it('stamps userEmail and forwards a token bound to this build', async () => {
+    visibilityState = 'hidden';
+    document.cookie = `bworlds_token=${makeToken({
+      email: 'owner@example.com',
+      buildSlug: BUILD_SLUG,
+    })}`;
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const body = await flushOneChunk();
+
+    expect(body.userEmail).toBe('owner@example.com');
+    expect(typeof body.token).toBe('string');
+  });
+
+  it('ignores a token cookie issued for another build (no email or token leak)', async () => {
+    visibilityState = 'hidden';
+    document.cookie = `bworlds_token=${makeToken({
+      email: 'someone-else@example.com',
+      buildSlug: 'a-different-build',
+    })}`;
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const body = await flushOneChunk();
+
+    expect(body).not.toHaveProperty('userEmail');
+    expect(body).not.toHaveProperty('token');
+  });
+
+  it('decodes a non-ASCII email from a build-bound token', async () => {
+    visibilityState = 'hidden';
+    document.cookie = `bworlds_token=${makeToken({
+      email: 'josé@example.com',
+      buildSlug: BUILD_SLUG,
+    })}`;
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const body = await flushOneChunk();
+
+    expect(body.userEmail).toBe('josé@example.com');
   });
 });
 

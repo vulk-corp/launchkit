@@ -88,7 +88,7 @@ SPA route changes are recorded as rrweb custom events so the backend distiller c
 - `gateOrigin` — `/access/:slug` redirect target. Defaults to `https://app.bworlds.co`.
 - `gate` — boolean, auto-gating toggle.
 
-Replay payload includes `token` (read from `bworlds_token` cookie) so backend resolves user identity.
+Replay payload includes `token` (read from `bworlds_token` cookie) so backend resolves user identity. The token and its `userEmail` fallback are used only when the JWT's `buildSlug` claim matches the current build, so a foreign `bworlds_token` sharing the cookie jar (localhost ports in dev, a parent-scoped cookie) cannot leak another build's user.
 
 Replay payload also includes `visitorId` on every chunk: a stable anonymous visitor id (UUID) from `visitor-state.ts`, persisted in `localStorage` and origin-scoped. Sent regardless of identity so the backend groups a visitor's sessions and links their earlier anonymous sessions once they identify. The errors endpoint rejects unknown fields (422 the batch), so the visitor id rides the replay payload only.
 
