@@ -1,9 +1,14 @@
 import { startReplay, stopReplay } from '../src/replay';
 import { enqueueError, startErrorCapture, stopErrorCapture } from '../src/error-capture';
 import { sendTelemetry } from '../src/telemetry-sender';
+import { getVisitorId } from '../src/visitor-state';
 
 vi.mock('../src/telemetry-sender', () => ({
   sendTelemetry: vi.fn(),
+}));
+
+vi.mock('../src/visitor-state', () => ({
+  getVisitorId: vi.fn(() => 'visitor-fixed-id'),
 }));
 
 const mockSendTelemetry = vi.mocked(sendTelemetry);
@@ -86,6 +91,26 @@ function readStoredSession(): StoredSession {
 
 function okResponse() {
   return { ok: true, status: 200 } as Response;
+}
+
+/** Build an unsigned JWT (header.payload.sig) the SDK can decode without verifying. */
+function makeToken(payload: Record<string, unknown>): string {
+  const b64url = (obj: unknown) => {
+    const bytes = new TextEncoder().encode(JSON.stringify(obj));
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+  return `${b64url({ alg: 'HS256', typ: 'JWT' })}.${b64url(payload)}.sig`;
+}
+
+function clearCookies() {
+  for (const part of document.cookie.split(';')) {
+    const name = part.split('=')[0].trim();
+    if (name) {
+      document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`;
+    }
+  }
 }
 
 function appendViteClientScript() {
@@ -178,6 +203,7 @@ beforeEach(() => {
   mockSendTelemetry.mockClear();
   document.head.innerHTML = '';
   document.body.innerHTML = '';
+  clearCookies();
   fetchMock.mockReset();
   fetchMock.mockResolvedValue(okResponse());
   vi.stubGlobal('fetch', fetchMock);
@@ -965,8 +991,8 @@ describe('sessionId wire format', () => {
   });
 
   it('uuid_fallback_format: the non-crypto fallback id still matches the UUID shape', async () => {
-    // Drop crypto.randomUUID so _generateSessionId takes the Math.random
-    // fallback (restored by vi.unstubAllGlobals in afterEach).
+    // Drop crypto.randomUUID so generateUuid takes the Math.random fallback
+    // (restored by vi.unstubAllGlobals in afterEach).
     vi.stubGlobal('crypto', {});
 
     await startReplay(BUILD_SLUG, API_ENDPOINT);
@@ -984,6 +1010,89 @@ describe('sessionId wire format', () => {
 
     const [error] = lastFlushedErrors();
     expect(error.sessionId).toBe(sessionId);
+  });
+});
+
+describe('visitor identity', () => {
+  it('stamps every replay chunk with the visitor id', async () => {
+    visibilityState = 'hidden';
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    emit!({ type: 2, timestamp: Date.now(), data: {} });
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    const body = parseFetchBody(fetchMock.mock.calls[0]);
+    expect(body.visitorId).toBe('visitor-fixed-id');
+  });
+
+  it('omits the visitor id from the payload when none is available', async () => {
+    vi.mocked(getVisitorId).mockReturnValue(null);
+    try {
+      visibilityState = 'hidden';
+      await startReplay(BUILD_SLUG, API_ENDPOINT);
+      const emit = hoisted.getEmit();
+      emit!({ type: 2, timestamp: Date.now(), data: {} });
+
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+      const body = parseFetchBody(fetchMock.mock.calls[0]);
+      expect(body).not.toHaveProperty('visitorId');
+    } finally {
+      vi.mocked(getVisitorId).mockReturnValue('visitor-fixed-id');
+    }
+  });
+});
+
+describe('build-bound token', () => {
+  async function flushOneChunk(): Promise<Record<string, unknown>> {
+    hoisted.getEmit()!({ type: 2, timestamp: Date.now(), data: {} });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    return parseFetchBody(fetchMock.mock.calls[0]);
+  }
+
+  it('stamps userEmail and forwards a token bound to this build', async () => {
+    visibilityState = 'hidden';
+    document.cookie = `bworlds_token=${makeToken({
+      email: 'owner@example.com',
+      buildSlug: BUILD_SLUG,
+    })}`;
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const body = await flushOneChunk();
+
+    expect(body.userEmail).toBe('owner@example.com');
+    expect(typeof body.token).toBe('string');
+  });
+
+  it('ignores a token cookie issued for another build (no email or token leak)', async () => {
+    visibilityState = 'hidden';
+    document.cookie = `bworlds_token=${makeToken({
+      email: 'someone-else@example.com',
+      buildSlug: 'a-different-build',
+    })}`;
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const body = await flushOneChunk();
+
+    expect(body).not.toHaveProperty('userEmail');
+    expect(body).not.toHaveProperty('token');
+  });
+
+  it('decodes a non-ASCII email from a build-bound token', async () => {
+    visibilityState = 'hidden';
+    document.cookie = `bworlds_token=${makeToken({
+      email: 'josé@example.com',
+      buildSlug: BUILD_SLUG,
+    })}`;
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const body = await flushOneChunk();
+
+    expect(body.userEmail).toBe('josé@example.com');
   });
 });
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.13.0] — 2026-06-25
+
+### Added
+
+- **Cross-session visitor identity**: the SDK generates a stable anonymous visitor id and sends it on every replay chunk, so a returning visitor's sessions can be grouped under one identity and their earlier anonymous sessions attach to their account once they identify. The id is a UUID persisted in `localStorage` (key `bworlds-visitor-id`), scoped to the exact origin so it never leaks between builder apps that share a parent domain (e.g. `*.lovable.app`). Sent only on `/api/telemetry/replay-events`, as an additive `visitorId` field that servers which do not read it ignore. Fail-open: when `localStorage` is unavailable (private mode, blocked), the id lives in memory for the page's lifetime and nothing throws.
+- **Supabase identity from cookies (Next.js / `@supabase/ssr`)**: the zero-config identity auto-bridge now also reads the Supabase session from `document.cookie` (`sb-*-auth-token`), reassembling chunked `.0`/`.1` cookies and decoding the `base64-` base64url payload before feeding the existing identity path. Default Next.js + `@supabase/ssr` apps keep the session in a cookie rather than `localStorage`; their signed-in user is now attached to replay automatically, with no `identify()` / `connectSupabase()` call. The cookie is read first, so a stale `localStorage` token cannot shadow the live cookie session; localStorage-only apps carry no auth cookie and fall through to the stored session unchanged. httpOnly auth cookies are a no-op (not visible to `document.cookie`).
+
 ## [1.12.0] — 2026-06-24
 
 ### Added

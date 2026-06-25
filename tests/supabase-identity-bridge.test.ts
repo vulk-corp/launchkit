@@ -57,6 +57,27 @@ function flushMicrotasks(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/** Encode a session the way @supabase/ssr writes it: `base64-` + base64url(UTF-8 JSON). */
+function base64UrlAuthCookie(session: object): string {
+  const bytes = new TextEncoder().encode(JSON.stringify(session));
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  const b64url = btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  return `base64-${b64url}`;
+}
+
+function clearCookies(): void {
+  for (const part of document.cookie.split(';')) {
+    const name = part.split('=')[0].trim();
+    if (name) {
+      document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`;
+    }
+  }
+}
+
 const originalLocalStorageDescriptor = Object.getOwnPropertyDescriptor(
   window,
   'localStorage',
@@ -72,6 +93,7 @@ beforeEach(() => {
   stopSupabaseIdentityBridge();
   resetIdentity();
   localStorage.clear();
+  clearCookies();
   vi.useRealTimers();
 });
 
@@ -79,6 +101,7 @@ afterEach(() => {
   stopSupabaseIdentityBridge();
   resetIdentity();
   localStorage.clear();
+  clearCookies();
   vi.unstubAllGlobals();
   if (originalLocalStorageDescriptor) {
     Object.defineProperty(window, 'localStorage', originalLocalStorageDescriptor);
@@ -139,6 +162,57 @@ it('does not let auto-detected Supabase identity override manual identify()', ()
     email: 'manual@example.com',
     userId: 'manual_user',
   });
+});
+
+it('reads identity from a base64url auth cookie (@supabase/ssr)', () => {
+  document.cookie = `${SUPABASE_STORAGE_KEY}=${base64UrlAuthCookie(
+    storedSession('ssr@example.com', 'ssr_user'),
+  )}`;
+
+  startSupabaseIdentityBridge();
+
+  expect(getIdentity()).toEqual({ email: 'ssr@example.com', userId: 'ssr_user' });
+});
+
+it('reassembles chunked auth cookies (.0/.1) into one session', () => {
+  const full = base64UrlAuthCookie(storedSession('chunked@example.com', 'chunked_user'));
+  const mid = Math.floor(full.length / 2);
+  // Out-of-order on purpose: the reader must sort by index.
+  document.cookie = `${SUPABASE_STORAGE_KEY}.1=${full.slice(mid)}`;
+  document.cookie = `${SUPABASE_STORAGE_KEY}.0=${full.slice(0, mid)}`;
+
+  startSupabaseIdentityBridge();
+
+  expect(getIdentity()).toEqual({
+    email: 'chunked@example.com',
+    userId: 'chunked_user',
+  });
+});
+
+it('prefers the live cookie session over a stale localStorage token', () => {
+  localStorage.setItem(
+    SUPABASE_STORAGE_KEY,
+    JSON.stringify(storedSession('stale@example.com', 'stale_user')),
+  );
+  document.cookie = `${SUPABASE_STORAGE_KEY}=${base64UrlAuthCookie(
+    storedSession('cookie@example.com', 'cookie_user'),
+  )}`;
+
+  startSupabaseIdentityBridge();
+
+  expect(getIdentity()).toEqual({
+    email: 'cookie@example.com',
+    userId: 'cookie_user',
+  });
+});
+
+it('sets no identity when no readable auth cookie or storage exists', () => {
+  // An httpOnly auth cookie never appears in document.cookie, so it lands here too.
+  document.cookie = 'unrelated=value';
+
+  startSupabaseIdentityBridge();
+
+  expect(getIdentity()).toEqual({ email: null, userId: null });
 });
 
 it('connectSupabase reads the active session and follows auth state changes', async () => {

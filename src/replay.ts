@@ -13,6 +13,8 @@
 
 import type { eventWithTime, record as rrwebRecord } from 'rrweb';
 import { setReplaySessionId } from './session-state';
+import { getVisitorId } from './visitor-state';
+import { generateUuid } from './uuid';
 import { backstampQueuedErrors, unstampQueuedErrors } from './error-capture';
 
 const SDK_TAG = '[@bworlds/launchkit]';
@@ -64,7 +66,7 @@ let _userAgent: string | null = null;
 let _firstChunkAcked = false;
 let _viteDevCssFullSnapshotSeen = false;
 let _viteDevCssSnapshotRetryScheduled = false;
-const _instanceId = _generateSessionId();
+const _instanceId = generateUuid();
 
 type Identity = { email: string | null; userId: string | null };
 type GetIdentity = () => Identity;
@@ -102,15 +104,6 @@ interface SnapshotNodeLike {
   childNodes?: SnapshotNodeLike[];
 }
 
-function _generateSessionId(): string {
-  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-    return crypto.randomUUID();
-  }
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
-  });
-}
 
 function _getReplayWindow(): (Window & {
   [GLOBAL_REPLAY_STATE_KEY]?: ReplayGlobalState;
@@ -287,7 +280,7 @@ function _saveSession(): void {
 }
 
 function _openNewSession(now: number): void {
-  _sessionId = _generateSessionId();
+  _sessionId = generateUuid();
   _sequenceNumber = 0;
   _sessionStartedAt = now;
   _firstChunkAcked = false;
@@ -336,23 +329,39 @@ function _readToken(): string | null {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
-/**
- * Decode the `email` claim from the bworlds_token JWT without verification.
- * This is an opportunistic read — the server re-verifies the JWT at ingest.
- * Returns null when the cookie is absent, malformed, or has no email claim.
- */
-function _readCookieEmail(): string | null {
-  const token = _readToken();
-  if (!token) return null;
+/** Decode a JWT payload without verifying the signature. Null when malformed. */
+function _decodeJwtPayload(token: string): Record<string, unknown> | null {
   const parts = token.split('.');
   if (parts.length !== 3) return null;
   try {
-    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))) as Record<string, unknown>;
-    const email = payload['email'];
-    return typeof email === 'string' && email.length > 0 ? email : null;
+    const binary = atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'));
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
   } catch {
     return null;
   }
+}
+
+/**
+ * The bworlds_token cookie and its email claim, but only when the JWT is bound
+ * to the current build (its `buildSlug` claim equals `_buildSlug`).
+ *
+ * A bworlds_token issued for another build can share this app's cookie jar
+ * (localhost ports in dev, or a parent-scoped cookie). Trusting it blindly would
+ * stamp that build's user email onto this app's sessions; the server re-verifies
+ * the signature, but only after the email has already shipped. The email claim is
+ * read without verification, so the server still tags it 'sdk_unverified'.
+ */
+function _readBuildBoundToken(): { token: string; email: string | null } | null {
+  const token = _readToken();
+  if (!token) return null;
+  const payload = _decodeJwtPayload(token);
+  if (!payload || payload['buildSlug'] !== _buildSlug) return null;
+  const email = payload['email'];
+  return {
+    token,
+    email: typeof email === 'string' && email.length > 0 ? email : null,
+  };
 }
 
 function _hasErrors(events: eventWithTime[]): boolean {
@@ -375,14 +384,19 @@ function _buildPayload(
   sequenceNumber: number,
   isFirstChunk: boolean,
 ): Record<string, unknown> {
-  const token = _readToken();
+  // Only a token bound to this build is trusted: a foreign bworlds_token sharing
+  // the cookie jar must not leak another build's user into this app's sessions.
+  const buildToken = _readBuildBoundToken();
+  const token = buildToken?.token ?? null;
 
-  // Identity: prefer explicitly set identity, fall back to cookie email claim
-  // (server re-verifies the token, so this is tagged 'sdk_unverified' at ingest)
+  // Identity: prefer explicitly set identity, fall back to the bound token email.
   let { email, userId } = _getIdentity();
   if (!email) {
-    email = _readCookieEmail();
+    email = buildToken?.email ?? null;
   }
+
+  // Sent on every chunk, identified or not. visitor-state.ts owns the rationale.
+  const visitorId = getVisitorId();
 
   return {
     buildSlug: _buildSlug,
@@ -392,6 +406,7 @@ function _buildPayload(
     ...(token && { token }),
     events,
     hasErrors: _hasErrors(events),
+    ...(visitorId && { visitorId }),
     ...(email && { userEmail: email }),
     ...(userId && { userId }),
     // UA sent on first chunk only; omitted on subsequent chunks

@@ -149,8 +149,118 @@ function _readStoredSupabaseSession(): SupabaseSessionLike {
   return null;
 }
 
+const AUTH_COOKIE_PREFIX = 'base64-';
+
+// Reused across decodes so the 2s poll does not allocate a decoder each tick.
+let _textDecoder: TextDecoder | null = null;
+let _lastCookieString: string | null = null;
+let _lastCookieSession: SupabaseSessionLike = null;
+
+function _readDocumentCookie(): string {
+  try {
+    return typeof document !== 'undefined' && typeof document.cookie === 'string'
+      ? document.cookie
+      : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Decode a base64url string (the @supabase/ssr cookie encoding: URL-safe
+ * alphabet, no padding, UTF-8 payload) back to its original string.
+ */
+function _decodeBase64Url(value: string): string {
+  let base64 = value.replace(/-/g, '+').replace(/_/g, '/');
+  const remainder = base64.length % 4;
+  if (remainder) base64 += '='.repeat(4 - remainder);
+  const binary = atob(base64);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  _textDecoder ??= new TextDecoder();
+  return _textDecoder.decode(bytes);
+}
+
+/** Turn one auth-cookie value into the session JSON string it carries. */
+function _decodeAuthCookieValue(rawValue: string): string {
+  let value = rawValue;
+  try {
+    value = decodeURIComponent(rawValue);
+  } catch {
+    // Not percent-encoded: use the value as read.
+  }
+  return value.startsWith(AUTH_COOKIE_PREFIX)
+    ? _decodeBase64Url(value.slice(AUTH_COOKIE_PREFIX.length))
+    : value;
+}
+
+/**
+ * Each sb-*-auth-token value from document.cookie, reassembling chunked cookies
+ * (`sb-*-auth-token.0`, `.1`, …) in index order. @supabase/ssr splits large
+ * sessions across numbered cookies; the parts concatenate back to one value.
+ */
+function _collectAuthCookieValues(cookieString: string): string[] {
+  if (!cookieString) return [];
+
+  const singles: string[] = [];
+  const chunkGroups = new Map<string, Array<{ index: number; value: string }>>();
+
+  for (const part of cookieString.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    const name = part.slice(0, eq).trim();
+    if (!name) continue;
+    const value = part.slice(eq + 1).trim();
+
+    // A trailing `.N` marks a chunk; the base name owns the auth-key shape, so
+    // _looksLikeSupabaseAuthKey stays the single source of truth for it.
+    const chunk = /^(.+)\.(\d+)$/.exec(name);
+    if (chunk && _looksLikeSupabaseAuthKey(chunk[1])) {
+      const group = chunkGroups.get(chunk[1]) ?? [];
+      group.push({ index: Number(chunk[2]), value });
+      chunkGroups.set(chunk[1], group);
+    } else if (_looksLikeSupabaseAuthKey(name)) {
+      singles.push(value);
+    }
+  }
+
+  const values = [...singles];
+  for (const group of chunkGroups.values()) {
+    group.sort((a, b) => a.index - b.index);
+    values.push(group.map((entry) => entry.value).join(''));
+  }
+  return values;
+}
+
+function _readCookieSupabaseSession(): SupabaseSessionLike {
+  const cookieString = _readDocumentCookie();
+  // The cookie rarely changes between 2s ticks; skip the decode when it has not.
+  if (cookieString === _lastCookieString) return _lastCookieSession;
+  _lastCookieString = cookieString;
+
+  let result: SupabaseSessionLike = null;
+  for (const rawValue of _collectAuthCookieValues(cookieString)) {
+    try {
+      const session = _sessionFromParsedValue(
+        _parseStorageValue(_decodeAuthCookieValue(rawValue)),
+      );
+      if (session) {
+        result = session;
+        break;
+      }
+    } catch {
+      // Ignore malformed or non-Supabase cookies.
+    }
+  }
+  _lastCookieSession = result;
+  return result;
+}
+
 function _syncAutoIdentity(): void {
-  _applySession(AUTO_SOURCE, _readStoredSupabaseSession());
+  // Cookie first: an @supabase/ssr app's live session is in the cookie, and a
+  // stale localStorage token must not shadow it. localStorage apps have no auth
+  // cookie, so they fall through to the stored session unchanged.
+  const session = _readCookieSupabaseSession() ?? _readStoredSupabaseSession();
+  _applySession(AUTO_SOURCE, session);
 }
 
 function _unsubscribeConnectedClient(): void {
@@ -174,7 +284,9 @@ function _extractSubscription(
 }
 
 export function startSupabaseIdentityBridge(): void {
-  if (typeof window === 'undefined' || !_getLocalStorage()) return;
+  // Cookie sessions (@supabase/ssr) live outside localStorage, so the bridge
+  // runs whenever it has a DOM to read, not only when localStorage exists.
+  if (typeof window === 'undefined') return;
   if (_autoTimer) return;
 
   _syncAutoIdentity();
@@ -184,6 +296,7 @@ export function startSupabaseIdentityBridge(): void {
     }
   };
   window.addEventListener('storage', _storageHandler);
+  // Cookies emit no change event, so the poll is what catches cookie logins.
   _autoTimer = setInterval(_syncAutoIdentity, POLL_INTERVAL_MS);
 }
 
@@ -225,6 +338,8 @@ export function stopSupabaseIdentityBridge(): void {
     _storageHandler = null;
   }
   _unsubscribeConnectedClient();
+  _lastCookieString = null;
+  _lastCookieSession = null;
   clearIdentitySource(AUTO_SOURCE);
   clearIdentitySource(CONNECTED_SOURCE);
 }
