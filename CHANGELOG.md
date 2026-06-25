@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.12.0] — 2026-06-24
+
+### Added
+
+- **SPA navigation capture in session replay**: client-side route changes are now recorded as first-class navigation events. The replay module patches `history.pushState`/`history.replaceState` (neither fires an event natively) and listens for `popstate` (back/forward), emitting an rrweb custom event on each real URL change. This fixes downstream page segmentation, which previously saw a whole SPA session as a single page because rrweb only emits a META event on full page loads.
+  - **Event contract** (stable — the backend distiller will match on it; backend wiring in progress, #889 workstream 3): `tag: "navigation"`, `payload: { href: string, title?: string }`, where `href` is `location.href` (full URL, consistent with rrweb META URLs — no new masking) and `title` is `document.title` when non-empty.
+  - **Dedup**: an emission is skipped when the resolved URL equals the last emitted URL, killing `replaceState` query-param churn and the no-op `replaceState` SPAs fire on load (so the initial full-load META is not double-counted).
+  - **Session rotation**: the watcher survives an idle session rotation (route changes keep flowing into the rotated session) and resets its dedup baseline on rotation, so a rotated session re-emits its entry URL even when it equals the previous session's last route.
+  - **Lifecycle + safety**: the watcher lives inside the lazily-imported replay module, installs when recording starts, and tears down fully on stop (original `history.pushState`/`replaceState` restored, `popstate` listener removed) so the host app's history is never left patched. Each wrapper carries the genuine original, so a re-install on a hardened host (where teardown could not restore) recovers it instead of stacking a second wrapper. It is skipped entirely in cross-origin iframes (Lovable/Bolt editor previews) and every path fails open so it can never break the host app's routing.
+
 ## [1.11.1] — 2026-06-19
 
 ### Fixed

@@ -25,6 +25,11 @@ const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_SESSION_MS = 60 * 60 * 1000; // 60 min — rotate session after this duration
 const STORAGE_KEY = 'bworlds-replay-session';
 const TOKEN_COOKIE = 'bworlds_token';
+// Stable wire contract — the backend distiller will match on this tag to append
+// SPA route changes to a session's pages_visited. Backend wiring is in progress
+// (#889 workstream 3); until it ships the distiller still reads page from the
+// type-4 Meta event only. Do not rename.
+const NAVIGATION_TAG = 'navigation';
 const GLOBAL_REPLAY_STATE_KEY = '__bworldsLaunchKitReplayState__';
 const VITE_DEV_CLIENT_SCRIPT_SELECTOR = 'script[src*="/@vite/client"]';
 const VITE_DEV_CSS_SELECTOR = 'style[data-vite-dev-id]';
@@ -46,6 +51,12 @@ let _buildSlug: string | null = null;
 let _apiEndpoint: string | null = null;
 let _visibilityHandler: (() => void) | null = null;
 let _unloadHandler: (() => void) | null = null;
+// Navigation watcher: captured originals to restore on teardown, popstate
+// handler ref for removeEventListener, and the last emitted URL for dedup.
+let _navOriginalPushState: History['pushState'] | null = null;
+let _navOriginalReplaceState: History['replaceState'] | null = null;
+let _navPopstateHandler: (() => void) | null = null;
+let _lastNavigationUrl: string | null = null;
 // Cached from dynamic import so _hasErrors can use it at flush time
 let _EventType: { Custom: number; FullSnapshot?: number } | null = null;
 // UA captured once on startReplay() — sent only on first chunk
@@ -638,6 +649,12 @@ function _rotateSession(): void {
 
   _openNewSession(Date.now());
 
+  // A rotated session starts a fresh page-visit timeline. Drop the dedup baseline
+  // so the new session re-emits its entry URL on the next navigation, even when
+  // that URL equals the prior session's last one (idle rotation would otherwise
+  // swallow it as a duplicate and leave the new session with no navigation event).
+  _lastNavigationUrl = null;
+
   if (oldEvents.length > 0) {
     const oldChunks =
       oldSeq === 0 && !_hasFullSnapshot(oldEvents)
@@ -650,6 +667,130 @@ function _rotateSession(): void {
     _record.takeFullSnapshot(true);
   } catch {
     // rrweb throws if called outside an active recording — non-fatal.
+  }
+}
+
+/** True when running inside a cross-origin iframe (Lovable/Bolt editor preview). */
+function _isCrossOriginIframe(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Emit a navigation custom event when the URL has actually changed. Dedup on the
+ * last emitted href kills replaceState query-param churn and the no-op
+ * replaceState SPAs fire on load (which would double the initial META). Reads
+ * the active session id implicitly: addCustomEvent routes through rrweb's emit
+ * callback, so the event lands in the current session's buffer. Never throws.
+ */
+function _emitNavigation(): void {
+  try {
+    if (!_record || typeof location === 'undefined') return;
+    const href = location.href;
+    if (href === _lastNavigationUrl) return;
+    _lastNavigationUrl = href;
+
+    const payload: { href: string; title?: string } = { href };
+    if (typeof document !== 'undefined' && document.title) {
+      payload.title = document.title;
+    }
+    _record.addCustomEvent(NAVIGATION_TAG, payload);
+  } catch {
+    // Navigation capture is best-effort — never break the host app.
+  }
+}
+
+// Marker carried by our history wrappers so a re-install can recover the genuine
+// original even when a prior teardown could not restore it (hardened host where
+// reassigning history.pushState throws). Without it, the next install would
+// capture our stale wrapper as the "original" and stack a second wrapper, firing
+// every route change twice.
+type NavOriginalCarrier = { __bworldsNavOriginal__?: History['pushState'] };
+
+/**
+ * Wrap one history method so it delegates to the genuine original and then emits
+ * a navigation event. If the current method is already one of our wrappers, read
+ * the genuine original off it instead of re-wrapping the wrapper. Returns the
+ * genuine original for later restoration.
+ */
+function _wrapHistoryMethod(current: History['pushState']): {
+  wrapper: History['pushState'];
+  original: History['pushState'];
+} {
+  const original =
+    (current as NavOriginalCarrier).__bworldsNavOriginal__ ?? current;
+  const wrapper = function (
+    this: History,
+    data: unknown,
+    unused: string,
+    url?: string | URL | null,
+  ): void {
+    original.call(this, data, unused, url);
+    _emitNavigation();
+  };
+  (wrapper as NavOriginalCarrier).__bworldsNavOriginal__ = original;
+  return { wrapper, original };
+}
+
+/**
+ * Patch history.pushState/replaceState (neither fires an event natively) and
+ * listen for popstate so client-side route changes are recorded as first-class
+ * navigation events. Skipped in cross-origin iframes. The whole install is
+ * wrapped so a hostile environment cannot break the host app's routing.
+ */
+function _startNavigationWatcher(): void {
+  if (typeof window === 'undefined' || typeof history === 'undefined') return;
+  if (_isCrossOriginIframe()) return;
+  if (_navPopstateHandler) return; // already installed
+
+  try {
+    _lastNavigationUrl = typeof location !== 'undefined' ? location.href : null;
+
+    const push = _wrapHistoryMethod(history.pushState);
+    history.pushState = push.wrapper;
+    _navOriginalPushState = push.original;
+
+    const replace = _wrapHistoryMethod(history.replaceState);
+    history.replaceState = replace.wrapper;
+    _navOriginalReplaceState = replace.original;
+
+    _navPopstateHandler = () => _emitNavigation();
+    window.addEventListener('popstate', _navPopstateHandler);
+  } catch {
+    // Leave the host app's history untouched if patching failed midway.
+    _stopNavigationWatcher();
+  }
+}
+
+/**
+ * Restore the original history methods and remove the popstate listener. Called
+ * from stopReplay and as the failed-install fallback, so the host app's history
+ * is never left patched once replay stops. Session rotation deliberately does NOT
+ * call this — the patch must survive a rotation so navigation keeps being captured
+ * in the rotated session.
+ */
+function _stopNavigationWatcher(): void {
+  try {
+    if (_navOriginalPushState) {
+      history.pushState = _navOriginalPushState;
+    }
+    if (_navOriginalReplaceState) {
+      history.replaceState = _navOriginalReplaceState;
+    }
+    if (_navPopstateHandler) {
+      window.removeEventListener('popstate', _navPopstateHandler);
+    }
+  } catch {
+    // ignore — restoration is best-effort
+  } finally {
+    _navOriginalPushState = null;
+    _navOriginalReplaceState = null;
+    _navPopstateHandler = null;
+    _lastNavigationUrl = null;
   }
 }
 
@@ -670,6 +811,7 @@ export function stopReplay(): void {
     window.removeEventListener('beforeunload', _unloadHandler);
     _unloadHandler = null;
   }
+  _stopNavigationWatcher();
   // Reset module state so _resolveSession starts clean on next startReplay.
   // Clearing the shared session id covers manual stop and the 429 daily-cap
   // stop (which routes through stopReplay) — errors captured after this point
@@ -781,6 +923,7 @@ export async function startReplay(
 
     _stopRecording = stop;
     _markReplayRecording();
+    _startNavigationWatcher();
 
     // Recording is genuinely active: errors that fired during the replay
     // module's dynamic import are still queued (10s flush) with a null session

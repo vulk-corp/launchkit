@@ -12,6 +12,7 @@
 - **rrweb is external + lazy.** Dynamic `import('./replay')` only on first session. Main bundle ~6.5 kB.
 - **Replay owns the session id; error capture only reads it.** `replay.ts` publishes the active session id through `session-state.ts` (set on open/resume/rotation, cleared on stop, 429 cap stop, and failed start) — never export a getter from `replay.ts`, that defeats the dynamic-import boundary. `enqueueError` stamps `sessionId` + `capturedAt` at capture time, never at flush: a batch can span a session rotation. `backstampQueuedErrors` fills null-session entries only, preserves `capturedAt`, and is called only from `startReplay`'s success path.
 - **Telemetry strings are string-typed, capped, and well-formed.** `enqueueError` is the single enforcement chokepoint for `message` (≤ `MAX_MESSAGE_LENGTH`, 5000), `stack` (≤ `MAX_STACK_LENGTH`, 10000), and `url` (≤ `MAX_URL_LENGTH`, 2048): always strings, lone surrogates replaced with U+FFFD, never cut mid-surrogate-pair. The API rejects the entire `/api/telemetry/errors` batch when one item carries an invalid field. `normalizeThrown` never throws; unreadable values become `[error details could not be read]`.
+- **Navigation watcher restores the host's history on stop.** The SPA navigation watcher (history `pushState`/`replaceState` patch + `popstate` listener) lives inside the lazily-imported replay module, installs when recording starts, and tears down fully on stop — original `history.pushState`/`replaceState` restored, listener removed. Never leave the host app's history patched after stop. Skip entirely in cross-origin iframes; wrap install/emit in try/catch so route changes can never break the host app.
 
 ## Commands
 
@@ -34,7 +35,7 @@ CI: Node 22, runs on main/next push + PRs (type-check, build, test).
 | `src/error-capture.ts` | `window.onerror` + `unhandledrejection` + `console.error` wrapper. Batches 5 errors OR 10s, flushes on page hidden. Stamps `sessionId` (from session-state) + `capturedAt` at enqueue |
 | `src/network-capture.ts` | `window.fetch` wrapper. Enqueues HTTP ≥ 400 responses and rejected fetches with `Network error - {method} {url}` prefix. Skips `apiEndpoint` URLs (no self-capture) |
 | `src/normalize-thrown.ts` | Any thrown value → `{message, stack}`: Error as-is, string/primitive verbatim, object → `message` field → `error` field → safe JSON → `[error details could not be read]`. Depth-capped, never throws. Exports `truncateMessage`, `sanitizeAndTruncate` + the `MAX_*_LENGTH` server caps |
-| `src/replay.ts` | rrweb record, 10s flush, 512 KB chunks, sessionStorage persistence. Publishes session id to session-state, back-stamps queued errors on start |
+| `src/replay.ts` | rrweb record, 10s flush, 512 KB chunks, sessionStorage persistence. Publishes session id to session-state, back-stamps queued errors on start. Watches SPA navigation (history patch + popstate) and emits a `navigation` custom event per route change |
 | `src/session-state.ts` | Shared replay-session id holder. replay writes, error-capture reads at enqueue. Zero imports |
 | `src/identity-state.ts` | Shared identity holder. `index.ts` writes, replay payload reads |
 | `src/badge-widget.ts` | Shadow DOM badge. Fetches `/api/telemetry/badge-counts` |
@@ -55,6 +56,17 @@ Design rationale for `normalize-thrown.ts` and the capture paths — keep it her
 - `onerror`: a non-Error `error` param is normalized (the browser-stringified `message` would read "Uncaught [object Object]"); Error instances and absent `error` (cross-origin "Script error.") keep the browser message untouched. The capture body is wrapped in try/catch so a poisoned value (throwing `stack` getter) drops one capture without blocking the host app's own onerror chain.
 - Console path: an Error arg with an empty message falls back to `String(arg)` ("Error: ..."); non-Error args run through a budget loop that stops normalizing once the joined length passes the message cap — `enqueueError` would cut the excess anyway, so their stringify cost is skipped.
 - `[error details could not be read]` is builder-facing copy (dashboard row, alert email, Fix prompt): plain language, and a single literal keeps server-side grouping intact.
+
+## Navigation event contract
+
+SPA route changes are recorded as rrweb custom events so the backend distiller can segment a single-page session into pages. The contract is **stable** — the distiller (`bworlds-api`, #889 workstream 3) will match on it and append to `pages_visited` once that wiring ships. Do not rename the tag or reshape the payload without coordinating that change.
+
+- **tag**: `"navigation"`
+- **payload**: `{ href: string, title?: string }` — `href` is `location.href` (full URL, recorded exactly as rrweb already records META URLs; no new masking, query-param PII is a separate decision), `title` is `document.title` when non-empty.
+- **Emitted on**: `history.pushState`, `history.replaceState` (both patched — neither fires natively), and `popstate` (back/forward). `hashchange` is not covered (hash routers fall through); revisit if a HashRouter build needs in-session pages.
+- **Deduped**: an emission whose resolved `href` equals the last emitted one is dropped. The baseline is seeded to `location.href` at install, so the initial full-load META is not double-counted and `replaceState` query-param churn is silenced.
+- **Across rotation**: the watcher survives an idle session rotation (the patch is intentionally not torn down on rotate). `_rotateSession` clears the dedup baseline so each rotated session re-emits its entry URL instead of swallowing it as a duplicate.
+- Capture only. The initial page is already represented by rrweb's full-load META (type 4); no synthetic navigation event is emitted for it.
 
 ## API endpoints
 
@@ -82,6 +94,57 @@ Replay payload includes `token` (read from `bworlds_token` cookie) so backend re
 - Fake timers for heartbeat/error-capture: `vi.useFakeTimers()` + `vi.advanceTimersByTime()`.
 - Replay tests: hoisted `vi.hoisted()` to capture rrweb emit callback. `vi.setSystemTime()` for session rotation.
 - Always pass `gate: false` in non-gate tests (auto-gate triggers overlay + `check()` side effects).
+
+## Local testing (unreleased build)
+
+To exercise an unreleased SDK change in a real consumer app without an npm release, link the local build with `yalc` (no global install — use `pnpm dlx`). `yalc` ships `dist/`, so build first.
+
+Publish from this repo:
+
+```bash
+npm run build
+pnpm dlx yalc publish        # pushes the build to the local yalc store
+```
+
+Link it in the consumer app's **package** directory, then install from its root so the workspace picks up the link:
+
+```bash
+pnpm dlx yalc add @bworlds/launchkit   # rewrites the dep to file:.yalc/...
+pnpm install                           # from the consumer monorepo root
+```
+
+Iterate after each SDK change:
+
+```bash
+npm run build && pnpm dlx yalc push    # re-pushes to every linked consumer
+```
+
+then restart the consumer dev server (Next.js will not hot-swap a relinked package).
+
+**Point the consumer's `init()` at the local stack**, or the origin guard silently disables every subsystem:
+
+```js
+init({
+  buildSlug: '<local-slug>',              // must exist in the local BWorlds DB
+  apiEndpoint: 'http://localhost:3941',   // local bworlds-api (default port)
+  gateOrigin: 'http://localhost:3939',    // local bworlds-web (default port)
+  dev: true,                              // bypass the origin guard on localhost
+});
+```
+
+Worktree stacks shift the ports (base 4900/5900/6900/7900; web +39, api +41). Without `dev: true` the SDK fetches remote config, sees `localhost` does not match the build's registered origin, and goes fully silent (no console output) — that is the most common "nothing happens" cause.
+
+**Seed the build slug first.** If `buildSlug` is absent from the local DB, `/api/monetization/validate-token` returns `valid: false` for everyone and `/access/<slug>` 404s. Seed it from the BWorlds stack (e.g. `pnpm seed:demo` loads the `market-echo` demo build) before testing.
+
+**Verify.** With the consumer dev server up and DevTools → Network open, a reload should show `POST http://localhost:3941/api/telemetry/heartbeat` and a `validate-token` call hitting the **local** API, not `api.bworlds.co`. For SPA navigation specifically, click through routes and confirm `/api/telemetry/replay-events` payloads carry `navigation` custom events.
+
+**Common failure modes.** Redirect lands on `app.bworlds.co` → consumer env not loaded, restart its dev server. SDK behaves like the old version → stale yalc link, re-run `npm run build && pnpm dlx yalc push` then restart. `git status` shows `file:.yalc/...` → a link was left in place, revert before committing.
+
+Revert in the consumer when done — **never commit** `file:.yalc/...` or `yalc.lock`:
+
+```bash
+pnpm dlx yalc remove @bworlds/launchkit && pnpm install
+```
 
 ## Release
 
