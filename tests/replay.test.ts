@@ -1,9 +1,14 @@
 import { startReplay, stopReplay } from '../src/replay';
 import { enqueueError, startErrorCapture, stopErrorCapture } from '../src/error-capture';
 import { sendTelemetry } from '../src/telemetry-sender';
+import { getVisitorId } from '../src/visitor-state';
 
 vi.mock('../src/telemetry-sender', () => ({
   sendTelemetry: vi.fn(),
+}));
+
+vi.mock('../src/visitor-state', () => ({
+  getVisitorId: vi.fn(() => 'visitor-fixed-id'),
 }));
 
 const mockSendTelemetry = vi.mocked(sendTelemetry);
@@ -965,8 +970,8 @@ describe('sessionId wire format', () => {
   });
 
   it('uuid_fallback_format: the non-crypto fallback id still matches the UUID shape', async () => {
-    // Drop crypto.randomUUID so _generateSessionId takes the Math.random
-    // fallback (restored by vi.unstubAllGlobals in afterEach).
+    // Drop crypto.randomUUID so generateUuid takes the Math.random fallback
+    // (restored by vi.unstubAllGlobals in afterEach).
     vi.stubGlobal('crypto', {});
 
     await startReplay(BUILD_SLUG, API_ENDPOINT);
@@ -984,6 +989,39 @@ describe('sessionId wire format', () => {
 
     const [error] = lastFlushedErrors();
     expect(error.sessionId).toBe(sessionId);
+  });
+});
+
+describe('visitor identity', () => {
+  it('stamps every replay chunk with the visitor id', async () => {
+    visibilityState = 'hidden';
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    emit!({ type: 2, timestamp: Date.now(), data: {} });
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    const body = parseFetchBody(fetchMock.mock.calls[0]);
+    expect(body.visitorId).toBe('visitor-fixed-id');
+  });
+
+  it('omits the visitor id from the payload when none is available', async () => {
+    vi.mocked(getVisitorId).mockReturnValue(null);
+    try {
+      visibilityState = 'hidden';
+      await startReplay(BUILD_SLUG, API_ENDPOINT);
+      const emit = hoisted.getEmit();
+      emit!({ type: 2, timestamp: Date.now(), data: {} });
+
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+      const body = parseFetchBody(fetchMock.mock.calls[0]);
+      expect(body).not.toHaveProperty('visitorId');
+    } finally {
+      vi.mocked(getVisitorId).mockReturnValue('visitor-fixed-id');
+    }
   });
 });
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.13.0] — 2026-06-25
+
+### Added
+
+- **Cross-session visitor identity**: the SDK generates a stable anonymous visitor id and sends it on every replay chunk, so a returning visitor's sessions can be grouped under one identity and their earlier anonymous sessions attach to their account once they identify. The id is a UUID persisted in `localStorage` (key `bworlds-visitor-id`), scoped to the exact origin so it never leaks between builder apps that share a parent domain (e.g. `*.lovable.app`). Sent only on `/api/telemetry/replay-events`, as an additive `visitorId` field that servers which do not read it ignore. Fail-open: when `localStorage` is unavailable (private mode, blocked), the id lives in memory for the page's lifetime and nothing throws.
+
 ## [1.12.0] — 2026-06-24
 
 ### Added

@@ -38,6 +38,8 @@ CI: Node 22, runs on main/next push + PRs (type-check, build, test).
 | `src/replay.ts` | rrweb record, 10s flush, 512 KB chunks, sessionStorage persistence. Publishes session id to session-state, back-stamps queued errors on start. Watches SPA navigation (history patch + popstate) and emits a `navigation` custom event per route change |
 | `src/session-state.ts` | Shared replay-session id holder. replay writes, error-capture reads at enqueue. Zero imports |
 | `src/identity-state.ts` | Shared identity holder. `index.ts` writes, replay payload reads |
+| `src/visitor-state.ts` | Stable anonymous visitor id, persisted in `localStorage` (`bworlds-visitor-id`), origin-scoped. Replay payload reads it so the backend groups a returning visitor's sessions. globalThis-backed, fail-open |
+| `src/uuid.ts` | UUID v4 generator shared by session id + visitor id |
 | `src/badge-widget.ts` | Shadow DOM badge. Fetches `/api/telemetry/badge-counts` |
 | `src/remote-config.ts` | `/api/telemetry/sdk-config` fetch, sessionStorage cache |
 | `src/telemetry-sender.ts` | POST JSON + `keepalive`, silent fail |
@@ -86,6 +88,8 @@ SPA route changes are recorded as rrweb custom events so the backend distiller c
 - `gate` — boolean, auto-gating toggle.
 
 Replay payload includes `token` (read from `bworlds_token` cookie) so backend resolves user identity.
+
+Replay payload also includes `visitorId` on every chunk: a stable anonymous visitor id (UUID) from `visitor-state.ts`, persisted in `localStorage` and origin-scoped. Sent regardless of identity so the backend groups a visitor's sessions and links their earlier anonymous sessions once they identify. The errors endpoint rejects unknown fields (422 the batch), so the visitor id rides the replay payload only.
 
 ## Testing
 

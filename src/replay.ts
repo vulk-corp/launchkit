@@ -13,6 +13,8 @@
 
 import type { eventWithTime, record as rrwebRecord } from 'rrweb';
 import { setReplaySessionId } from './session-state';
+import { getVisitorId } from './visitor-state';
+import { generateUuid } from './uuid';
 import { backstampQueuedErrors, unstampQueuedErrors } from './error-capture';
 
 const SDK_TAG = '[@bworlds/launchkit]';
@@ -64,7 +66,7 @@ let _userAgent: string | null = null;
 let _firstChunkAcked = false;
 let _viteDevCssFullSnapshotSeen = false;
 let _viteDevCssSnapshotRetryScheduled = false;
-const _instanceId = _generateSessionId();
+const _instanceId = generateUuid();
 
 type Identity = { email: string | null; userId: string | null };
 type GetIdentity = () => Identity;
@@ -102,15 +104,6 @@ interface SnapshotNodeLike {
   childNodes?: SnapshotNodeLike[];
 }
 
-function _generateSessionId(): string {
-  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-    return crypto.randomUUID();
-  }
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
-  });
-}
 
 function _getReplayWindow(): (Window & {
   [GLOBAL_REPLAY_STATE_KEY]?: ReplayGlobalState;
@@ -287,7 +280,7 @@ function _saveSession(): void {
 }
 
 function _openNewSession(now: number): void {
-  _sessionId = _generateSessionId();
+  _sessionId = generateUuid();
   _sequenceNumber = 0;
   _sessionStartedAt = now;
   _firstChunkAcked = false;
@@ -384,6 +377,9 @@ function _buildPayload(
     email = _readCookieEmail();
   }
 
+  // Sent on every chunk, identified or not. visitor-state.ts owns the rationale.
+  const visitorId = getVisitorId();
+
   return {
     buildSlug: _buildSlug,
     sessionId,
@@ -392,6 +388,7 @@ function _buildPayload(
     ...(token && { token }),
     events,
     hasErrors: _hasErrors(events),
+    ...(visitorId && { visitorId }),
     ...(email && { userEmail: email }),
     ...(userId && { userId }),
     // UA sent on first chunk only; omitted on subsequent chunks
