@@ -24,9 +24,9 @@ const GZIP_MIN_BYTES = 64 * 1024;
 const REPLAY_EVENTS_PATH = '/api/telemetry/replay-events';
 const GZIP_ENCODING = 'gzip';
 const JSON_CONTENT_TYPE = 'application/json';
-// A session is only replayable once its first chunk (the FullSnapshot) lands.
-// Cap how many times we retry or abandon-and-resnapshot to establish it, so a
-// permanently rejected or un-shrinkable first chunk cannot loop forever.
+// A session video is only replayable once its first chunk (the FullSnapshot) lands.
+// Retry that bootstrap chunk a bounded number of times, then keep collecting the
+// session as telemetry-only so the backend can still surface non-video data.
 const FIRST_CHUNK_MAX_ATTEMPTS = 5;
 const FIRST_CHUNK_BACKOFF_BASE_MS = FLUSH_INTERVAL_MS;
 const FIRST_CHUNK_BACKOFF_MAX_MS = 5 * 60 * 1000;
@@ -309,6 +309,8 @@ function _openNewSession(now: number): void {
   _sequenceNumber = 0;
   _sessionStartedAt = now;
   _firstChunkAcked = false;
+  _firstChunkAttempts = 0;
+  _firstChunkRetryAfter = 0;
   setReplaySessionId(_sessionId);
   _saveSession();
 }
@@ -570,7 +572,9 @@ async function _buildReplayRequestBody(
   serialized: SerializedChunk,
 ): Promise<ReplayRequestBody> {
   const compressed = await _gzipBody(serialized.bytes);
-  if (!compressed) return _rawRequestBody(serialized);
+  if (!compressed || compressed.byteLength >= serialized.rawBytes) {
+    return _rawRequestBody(serialized);
+  }
 
   return {
     body: compressed,
@@ -652,50 +656,32 @@ function _beginFreshSession(): void {
   try {
     _record?.takeFullSnapshot(true);
   } catch {
-    // rrweb throws if called outside an active recording — non-fatal.
+    // rrweb throws if called outside an active recording. Non-fatal.
   }
 }
 
 /**
- * Count a failed attempt to deliver the session's first chunk and decide whether
- * to keep trying. Returns true once the attempt budget is spent and recording has
- * been stopped, so the caller must not retry or open another session. With
- * `backoff` the same chunk is retried after exponential delay (a rejected upload);
- * the abandon path passes false because it already produces a brand-new chunk.
+ * Count a rejected attempt to deliver the session's first chunk. Returns true
+ * once the retry budget is spent, so the caller can stop blocking later chunks
+ * behind a video bootstrap chunk that may never land.
  */
-function _registerFirstChunkFailure(backoff: boolean): boolean {
+function _registerFirstChunkFailure(): boolean {
   _firstChunkAttempts += 1;
   if (_firstChunkAttempts >= FIRST_CHUNK_MAX_ATTEMPTS) {
     console.warn(
-      `${SDK_TAG} Replay session could not deliver its first chunk after ${FIRST_CHUNK_MAX_ATTEMPTS} attempts. Recording stopped.`,
+      `${SDK_TAG} Replay session could not deliver its first chunk after ${FIRST_CHUNK_MAX_ATTEMPTS} attempts. Continuing without replay video.`,
     );
-    stopReplay();
+    _firstChunkAttempts = 0;
+    _firstChunkRetryAfter = 0;
     return true;
   }
-  if (backoff) {
-    const delay = Math.min(
-      FIRST_CHUNK_BACKOFF_MAX_MS,
-      FIRST_CHUNK_BACKOFF_BASE_MS * 2 ** (_firstChunkAttempts - 1),
-    );
-    _firstChunkRetryAfter = Date.now() + delay;
-  }
+
+  const delay = Math.min(
+    FIRST_CHUNK_BACKOFF_MAX_MS,
+    FIRST_CHUNK_BACKOFF_BASE_MS * 2 ** (_firstChunkAttempts - 1),
+  );
+  _firstChunkRetryAfter = Date.now() + delay;
   return false;
-}
-
-function _abandonCurrentSessionAfterFirstChunkDrop(sessionId: string): void {
-  if (!_record || _sessionId !== sessionId) return;
-
-  try {
-    _pendingChunks = _pendingChunks.filter((chunk) => chunk.sessionId !== sessionId);
-    _eventBuffer = [];
-    unstampQueuedErrors(sessionId);
-    _beginFreshSession();
-    console.warn(
-      `${SDK_TAG} Replay session abandoned because its first chunk could not be uploaded. Starting a fresh session.`,
-    );
-  } catch {
-    // Replay recovery is best-effort and must never break the host app.
-  }
 }
 
 async function _uploadReservedChunks(chunks: ReplayChunk[]): Promise<ReplayChunk[]> {
@@ -709,14 +695,16 @@ async function _uploadReservedChunks(chunks: ReplayChunk[]): Promise<ReplayChunk
     const isActiveFirstChunk =
       chunk.sequenceNumber === 0 && chunk.sessionId === _sessionId;
     if (result === 'retry') {
-      if (isActiveFirstChunk && _registerFirstChunkFailure(true)) return [];
+      if (isActiveFirstChunk && _registerFirstChunkFailure()) continue;
       return chunks.slice(i);
     }
     if (result === 'dropped' && chunk.sequenceNumber === 0) {
-      if (isActiveFirstChunk && !_registerFirstChunkFailure(false)) {
-        _abandonCurrentSessionAfterFirstChunkDrop(chunk.sessionId);
+      if (isActiveFirstChunk) {
+        console.warn(
+          `${SDK_TAG} Replay session is continuing without its first chunk. Replay video may be unavailable.`,
+        );
       }
-      return [];
+      continue;
     }
     if (result === 'ok') _markFirstChunkAcked(chunk);
   }
@@ -726,7 +714,7 @@ async function _uploadReservedChunks(chunks: ReplayChunk[]): Promise<ReplayChunk
 async function _flush(_isFinal = false): Promise<void> {
   if (_capReached || _flushing) return;
   // Hold off while a rejected first chunk is in exponential backoff.
-  if (_firstChunkRetryAfter > Date.now()) return;
+  if (!_isFinal && _firstChunkRetryAfter > Date.now()) return;
   const sessionId = _sessionId;
   if (!sessionId) return;
   if (_pendingChunks.length === 0 && _eventBuffer.length === 0) return;
@@ -734,10 +722,7 @@ async function _flush(_isFinal = false): Promise<void> {
   try {
     if (_pendingChunks.length > 0) {
       const chunks = _pendingChunks.splice(0);
-      const currentChunks = chunks.filter(
-        (chunk) => chunk.sessionId === sessionId,
-      );
-      const failed = await _uploadReservedChunks(currentChunks);
+      const failed = await _uploadReservedChunks(chunks);
       if (failed.length > 0 && _sessionId === sessionId) {
         _pendingChunks.unshift(...failed);
       }
@@ -784,10 +769,17 @@ function _beaconFlush(): void {
 
   const sessionId = _sessionId;
   const chunks: ReplayChunk[] = [];
+  const skippedChunks: ReplayChunk[] = [];
 
   if (_pendingChunks.length > 0) {
     const pending = _pendingChunks.splice(0);
-    chunks.push(...pending.filter((chunk) => chunk.sessionId === sessionId));
+    for (const chunk of pending) {
+      if (chunk.sessionId === sessionId) {
+        chunks.push(chunk);
+      } else {
+        skippedChunks.push(chunk);
+      }
+    }
   }
 
   if (_eventBuffer.length > 0) {
@@ -805,8 +797,8 @@ function _beaconFlush(): void {
   // adds latency. Undelivered chunks stay queued for the next flush if the page
   // survives, otherwise they are lost with the page.
   const failed = chunks.filter((chunk) => !_beaconPostChunk(chunk));
-  if (failed.length > 0 && _sessionId === sessionId) {
-    _pendingChunks.unshift(...failed);
+  if ((failed.length > 0 || skippedChunks.length > 0) && _sessionId === sessionId) {
+    _pendingChunks.unshift(...skippedChunks, ...failed);
   }
 }
 
@@ -835,7 +827,11 @@ function _rotateSession(): void {
       oldSeq === 0 && !_hasFullSnapshot(oldEvents)
         ? []
         : _planChunks(oldEvents, oldSessionId, oldSeq);
-    _uploadReservedChunks(oldChunks).catch(() => {});
+    void _uploadReservedChunks(oldChunks)
+      .then((failed) => {
+        if (failed.length > 0) _pendingChunks.unshift(...failed);
+      })
+      .catch(() => {});
   }
 }
 

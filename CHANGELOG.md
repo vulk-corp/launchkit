@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.14.0] — 2026-06-29
+## [1.14.0] - 2026-06-29
 
 ### Added
 
@@ -9,7 +9,7 @@
 
 ### Fixed
 
-- **Ghost replay session prevention**: when the required first replay chunk cannot be delivered, the SDK no longer uploads later incremental events under the same session id, so dashboard-visible replay sessions are never assembled from incremental events alone. Recovery is bounded — a rejected first chunk retries with exponential backoff, an un-shrinkable one starts a fresh session, and after a capped number of failed attempts recording stops instead of looping. Page unload never triggers session recovery, so teardown stays fast.
+- **Replay sessions without video bootstrap stay observable**: when the required first replay chunk cannot be delivered, the SDK retries it with bounded exponential backoff, then keeps uploading later chunks under the same session id so dashboard-visible telemetry remains available even when replay video is unavailable. Page unload never triggers session recovery, so teardown stays fast.
 
 ## [1.13.0] — 2026-06-25
 
