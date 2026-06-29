@@ -955,6 +955,7 @@ describe('sequence reservation', () => {
 
   it('does not recover the session when sendBeacon drops the first chunk on unload', async () => {
     const sendBeaconMock = vi.fn(() => false);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     Object.defineProperty(navigator, 'sendBeacon', {
       configurable: true,
       value: sendBeaconMock,
@@ -968,6 +969,9 @@ describe('sequence reservation', () => {
     window.dispatchEvent(new Event('beforeunload'));
 
     expect(sendBeaconMock).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`Replay beacon chunk ${sessionId}#0 was not queued`),
+    );
     // The page is unloading: no fresh session, no re-snapshot. The recovery would
     // never get another flush and would only add teardown latency.
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
@@ -984,6 +988,35 @@ describe('sequence reservation', () => {
     const body = parseFetchBody(fetchMock.mock.calls[0]);
     expect(body.sessionId).toBe(sessionId);
     expect(body.sequenceNumber).toBe(0);
+
+    warnSpy.mockRestore();
+  });
+
+  it('logs when sendBeacon cannot send an oversized first chunk', async () => {
+    const sendBeaconMock = vi.fn(() => true);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: sendBeaconMock,
+    });
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    const sessionId = readStoredSession().id;
+
+    emit!({
+      type: 2,
+      timestamp: Date.now(),
+      data: { html: 'x'.repeat(520_000) },
+    });
+    window.dispatchEvent(new Event('beforeunload'));
+
+    expect(sendBeaconMock).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`Replay beacon chunk ${sessionId}#0 too large`),
+    );
+
+    errorSpy.mockRestore();
   });
 
   it('continues uploading later chunks after the first chunk fails the maximum number of attempts', async () => {

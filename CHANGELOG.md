@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.14.1] - 2026-06-30
+
+### Fixed
+
+- **Replay beacon diagnostics**: unload-time replay uploads now log when the browser refuses a beacon chunk or when the raw beacon payload exceeds the transport budget, making missing first chunks visible during local debugging.
+
 ## [1.14.0] - 2026-06-29
 
 ### Added

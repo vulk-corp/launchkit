@@ -562,6 +562,20 @@ function _rawRequestBody(serialized: SerializedChunk): ReplayRequestBody {
   };
 }
 
+function _chunkSizeLabel(bytes: number): string {
+  return `${(bytes / 1024).toFixed(0)} KB`;
+}
+
+function _logReplayChunkDropped(
+  chunk: ReplayChunk,
+  bodyBytes: number,
+  transport: 'fetch' | 'beacon',
+): void {
+  console.error(
+    `${SDK_TAG} Replay ${transport} chunk ${chunk.sessionId}#${chunk.sequenceNumber} too large (${_chunkSizeLabel(bodyBytes)}, limit ${_chunkSizeLabel(MAX_CHUNK_BYTES)}). Event dropped.`,
+  );
+}
+
 /**
  * Gzip a chunk at or above GZIP_MIN_BYTES, falling back to the raw JSON string
  * when the browser lacks CompressionStream or compression fails. The caller's
@@ -597,9 +611,7 @@ async function _postChunk(chunk: ReplayChunk): Promise<UploadResult> {
   if (requestBody.bodyBytes > MAX_CHUNK_BYTES) {
     // A single rrweb event over the transport cap even after gzip should not
     // happen in practice; surface it as an error, not routine noise.
-    console.error(
-      `${SDK_TAG} Replay event too large (${(requestBody.bodyBytes / 1024).toFixed(0)} KB, limit ${MAX_CHUNK_BYTES / 1024} KB). Event dropped.`,
-    );
+    _logReplayChunkDropped(chunk, requestBody.bodyBytes, 'fetch');
     return 'dropped'; // not retryable
   }
 
@@ -753,12 +765,21 @@ function _beaconPostChunk(chunk: ReplayChunk): boolean {
   const { bytes, rawBytes } = _serializeChunk(chunk);
   // sendBeacon is synchronous, so the async gzip path cannot run on unload; the
   // raw size gate is the correct one for the plain JSON body actually sent.
-  if (rawBytes > MAX_CHUNK_BYTES) return false;
+  if (rawBytes > MAX_CHUNK_BYTES) {
+    _logReplayChunkDropped(chunk, rawBytes, 'beacon');
+    return false;
+  }
 
-  return navigator.sendBeacon(
+  const queued = navigator.sendBeacon(
     `${_apiEndpoint}${REPLAY_EVENTS_PATH}`,
     new Blob([bytes], { type: JSON_CONTENT_TYPE }),
   );
+  if (!queued) {
+    console.warn(
+      `${SDK_TAG} Replay beacon chunk ${chunk.sessionId}#${chunk.sequenceNumber} was not queued by the browser (${_chunkSizeLabel(rawBytes)}).`,
+    );
+  }
+  return queued;
 }
 
 /** Synchronous flush via sendBeacon for page unload. */
