@@ -278,6 +278,10 @@ function _shouldBufferReplayEvent(event: eventWithTime): boolean {
   return false;
 }
 
+function _shouldFlushFirstSnapshot(event: eventWithTime): boolean {
+  return _sequenceNumber === 0 && _isFullSnapshotEvent(event);
+}
+
 function _loadSession(): StoredSession | null {
   try {
     const raw = sessionStorage.getItem(STORAGE_KEY);
@@ -567,12 +571,18 @@ function _chunkSizeLabel(bytes: number): string {
 }
 
 function _logReplayChunkDropped(
-  chunk: ReplayChunk,
   bodyBytes: number,
   transport: 'fetch' | 'beacon',
 ): void {
-  console.error(
-    `${SDK_TAG} Replay ${transport} chunk ${chunk.sessionId}#${chunk.sequenceNumber} too large (${_chunkSizeLabel(bodyBytes)}, limit ${_chunkSizeLabel(MAX_CHUNK_BYTES)}). Event dropped.`,
+  if (transport === 'beacon') {
+    console.warn(
+      `${SDK_TAG} Replay final upload is too large for unload delivery (${_chunkSizeLabel(bodyBytes)}, limit ${_chunkSizeLabel(MAX_CHUNK_BYTES)}). Recent replay events may be missing.`,
+    );
+    return;
+  }
+
+  console.warn(
+    `${SDK_TAG} Replay chunk too large (${_chunkSizeLabel(bodyBytes)}, limit ${_chunkSizeLabel(MAX_CHUNK_BYTES)}). Event dropped.`,
   );
 }
 
@@ -611,7 +621,7 @@ async function _postChunk(chunk: ReplayChunk): Promise<UploadResult> {
   if (requestBody.bodyBytes > MAX_CHUNK_BYTES) {
     // A single rrweb event over the transport cap even after gzip should not
     // happen in practice; surface it as an error, not routine noise.
-    _logReplayChunkDropped(chunk, requestBody.bodyBytes, 'fetch');
+    _logReplayChunkDropped(requestBody.bodyBytes, 'fetch');
     return 'dropped'; // not retryable
   }
 
@@ -766,7 +776,7 @@ function _beaconPostChunk(chunk: ReplayChunk): boolean {
   // sendBeacon is synchronous, so the async gzip path cannot run on unload; the
   // raw size gate is the correct one for the plain JSON body actually sent.
   if (rawBytes > MAX_CHUNK_BYTES) {
-    _logReplayChunkDropped(chunk, rawBytes, 'beacon');
+    _logReplayChunkDropped(rawBytes, 'beacon');
     return false;
   }
 
@@ -776,7 +786,7 @@ function _beaconPostChunk(chunk: ReplayChunk): boolean {
   );
   if (!queued) {
     console.warn(
-      `${SDK_TAG} Replay beacon chunk ${chunk.sessionId}#${chunk.sequenceNumber} was not queued by the browser (${_chunkSizeLabel(rawBytes)}).`,
+      `${SDK_TAG} Replay final upload was not queued by the browser (${_chunkSizeLabel(rawBytes)}). Recent replay events may be missing.`,
     );
   }
   return queued;
@@ -1089,6 +1099,9 @@ export async function startReplay(
         }
         if (!_shouldBufferReplayEvent(event)) return;
         _eventBuffer.push(event);
+        if (_shouldFlushFirstSnapshot(event)) {
+          _flush().catch(() => {});
+        }
       },
       maskInputOptions: {
         password: true,

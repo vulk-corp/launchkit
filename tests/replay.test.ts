@@ -327,6 +327,8 @@ describe('Vite dev CSS readiness', () => {
     });
 
     emit!(fullSnapshotEvent(true, 'initial-styled'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
     emit!(fullSnapshotEvent(false, 'styleless-checkout'));
 
     await vi.waitFor(() => {
@@ -334,14 +336,20 @@ describe('Vite dev CSS readiness', () => {
     });
 
     document.dispatchEvent(new Event('visibilitychange'));
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
-    const body = parseFetchBody(fetchMock.mock.calls[0]);
-    const events = body.events as Array<{ data?: { marker?: string } }>;
-    expect(events.map((event) => event.data?.marker)).toEqual([
-      'initial-styled',
-      'retry-styled',
-    ]);
+    const initialBody = parseFetchBody(fetchMock.mock.calls[0]);
+    const retryBody = parseFetchBody(fetchMock.mock.calls[1]);
+    expect(
+      (initialBody.events as Array<{ data?: { marker?: string } }>).map(
+        (event) => event.data?.marker,
+      ),
+    ).toEqual(['initial-styled']);
+    expect(
+      (retryBody.events as Array<{ data?: { marker?: string } }>).map(
+        (event) => event.data?.marker,
+      ),
+    ).toEqual(['retry-styled']);
   });
 });
 
@@ -367,6 +375,7 @@ describe('session rotation', () => {
     const emit = hoisted.getEmit();
 
     emit!({ type: 2, timestamp: Date.now(), data: {} });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
     const oldSessionId = readStoredSession().id;
 
@@ -374,11 +383,11 @@ describe('session rotation', () => {
     emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
     await flushMicrotasks();
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const body = parseFetchBody(fetchMock.mock.calls[0]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = parseFetchBody(fetchMock.mock.calls[1]);
     expect(body.sessionId).toBe(oldSessionId);
-    expect(body.sequenceNumber).toBe(0);
-    expect((body.events as unknown[]).length).toBe(2);
+    expect(body.sequenceNumber).toBe(1);
+    expect((body.events as unknown[]).length).toBe(1);
   });
 
   it('starts the new session at sequenceNumber 0 and emits subsequent chunks under it', async () => {
@@ -394,10 +403,8 @@ describe('session rotation', () => {
     await flushMicrotasks();
 
     const newSessionId = readStoredSession().id;
-    expect(readStoredSession().seq).toBe(0);
+    await vi.waitFor(() => expect(readStoredSession().seq).toBe(1));
 
-    document.dispatchEvent(new Event('visibilitychange'));
-    await flushMicrotasks();
     const latestBody = parseFetchBody(
       fetchMock.mock.calls[fetchMock.mock.calls.length - 1],
     );
@@ -571,10 +578,10 @@ describe('error–session stamping', () => {
 
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();
-    emit!({ type: 2, timestamp: Date.now(), data: {} });
 
     // Chunk upload hits the daily cap; replay stops itself via stopReplay().
     fetchMock.mockResolvedValue({ ok: false, status: 429 } as Response);
+    emit!({ type: 2, timestamp: Date.now(), data: {} });
     document.dispatchEvent(new Event('visibilitychange'));
     await flushMicrotasks();
     expect(hoisted.stopRecording).toHaveBeenCalled();
@@ -953,7 +960,7 @@ describe('sequence reservation', () => {
     expect(typeof init.body).toBe('string');
   });
 
-  it('does not recover the session when sendBeacon drops the first chunk on unload', async () => {
+  it('does not recover the session when sendBeacon drops a chunk on unload', async () => {
     const sendBeaconMock = vi.fn(() => false);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     Object.defineProperty(navigator, 'sendBeacon', {
@@ -966,35 +973,34 @@ describe('sequence reservation', () => {
     const sessionId = readStoredSession().id;
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await flushMicrotasks();
+    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'before-unload' } });
     window.dispatchEvent(new Event('beforeunload'));
 
     expect(sendBeaconMock).toHaveBeenCalledTimes(1);
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining(`Replay beacon chunk ${sessionId}#0 was not queued`),
+      expect.stringContaining('Replay final upload was not queued by the browser'),
     );
-    // The page is unloading: no fresh session, no re-snapshot. The recovery would
-    // never get another flush and would only add teardown latency.
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
     expect(readStoredSession().id).toBe(sessionId);
-    expect(readStoredSession().firstChunkAcked).toBe(false);
 
-    // The undelivered first chunk stays queued under the same session and uploads
-    // on the next flush if the page survives the unload.
+    // The undelivered chunk stays queued under the same session and uploads on the
+    // next flush if the page survives the unload.
     visibilityState = 'hidden';
-    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'after-beacon-failure' } });
     document.dispatchEvent(new Event('visibilitychange'));
 
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    const body = parseFetchBody(fetchMock.mock.calls[0]);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const body = parseFetchBody(fetchMock.mock.calls[1]);
     expect(body.sessionId).toBe(sessionId);
-    expect(body.sequenceNumber).toBe(0);
+    expect(body.sequenceNumber).toBe(1);
 
     warnSpy.mockRestore();
   });
 
-  it('logs when sendBeacon cannot send an oversized first chunk', async () => {
+  it('logs when sendBeacon cannot send an oversized chunk', async () => {
     const sendBeaconMock = vi.fn(() => true);
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     Object.defineProperty(navigator, 'sendBeacon', {
       configurable: true,
       value: sendBeaconMock,
@@ -1002,21 +1008,22 @@ describe('sequence reservation', () => {
 
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();
-    const sessionId = readStoredSession().id;
 
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     emit!({
-      type: 2,
+      type: 3,
       timestamp: Date.now(),
       data: { html: 'x'.repeat(520_000) },
     });
     window.dispatchEvent(new Event('beforeunload'));
 
     expect(sendBeaconMock).not.toHaveBeenCalled();
-    expect(errorSpy).toHaveBeenCalledWith(
-      expect.stringContaining(`Replay beacon chunk ${sessionId}#0 too large`),
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Replay final upload is too large for unload delivery'),
     );
 
-    errorSpy.mockRestore();
+    warnSpy.mockRestore();
   });
 
   it('continues uploading later chunks after the first chunk fails the maximum number of attempts', async () => {
@@ -1071,6 +1078,8 @@ describe('sequence reservation', () => {
       timestamp: Date.now(),
       data: { html: 'x'.repeat(310_000) },
     });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await flushMicrotasks();
     emit!({
       type: 3,
       timestamp: Date.now(),
