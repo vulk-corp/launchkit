@@ -23,6 +23,13 @@ const MAX_CHUNK_BYTES = 512_000; // 512 KB per chunk
 const GZIP_MIN_BYTES = 64 * 1024;
 const REPLAY_EVENTS_PATH = '/api/telemetry/replay-events';
 const GZIP_ENCODING = 'gzip';
+const JSON_CONTENT_TYPE = 'application/json';
+// A session is only replayable once its first chunk (the FullSnapshot) lands.
+// Cap how many times we retry or abandon-and-resnapshot to establish it, so a
+// permanently rejected or un-shrinkable first chunk cannot loop forever.
+const FIRST_CHUNK_MAX_ATTEMPTS = 5;
+const FIRST_CHUNK_BACKOFF_BASE_MS = FLUSH_INTERVAL_MS;
+const FIRST_CHUNK_BACKOFF_MAX_MS = 5 * 60 * 1000;
 // rrweb slimDOMOptions: each `true` strips that node from the FullSnapshot, it
 // is not an "enable" toggle. These are head metadata and inert scripts that the
 // replay never renders, so dropping them at serialization shrinks the snapshot
@@ -80,6 +87,8 @@ let _EventType: { Custom: number; FullSnapshot?: number } | null = null;
 // UA captured once on startReplay() — sent only on first chunk
 let _userAgent: string | null = null;
 let _firstChunkAcked = false;
+let _firstChunkAttempts = 0;
+let _firstChunkRetryAfter = 0;
 let _viteDevCssFullSnapshotSeen = false;
 let _viteDevCssSnapshotRetryScheduled = false;
 const _instanceId = generateUuid();
@@ -513,55 +522,78 @@ type ReplayRequestBody = {
   headers: Record<string, string>;
 };
 
-async function _gzipBody(body: string): Promise<Blob | null> {
+type SerializedChunk = {
+  payload: string;
+  bytes: Uint8Array<ArrayBuffer>;
+  rawBytes: number;
+};
+
+function _serializeChunk(chunk: ReplayChunk): SerializedChunk {
+  const isFirst = chunk.sequenceNumber === 0;
+  const payload = JSON.stringify(
+    _buildPayload(chunk.events, chunk.sessionId, chunk.sequenceNumber, isFirst),
+  );
+  // TextEncoder always returns a plain (non-shared) ArrayBuffer-backed view.
+  const bytes = new TextEncoder().encode(payload) as Uint8Array<ArrayBuffer>;
+  return { payload, bytes, rawBytes: bytes.byteLength };
+}
+
+async function _gzipBody(bytes: Uint8Array<ArrayBuffer>): Promise<ArrayBuffer | null> {
   const CompressionStreamCtor = globalThis.CompressionStream;
   if (!CompressionStreamCtor) return null;
 
   try {
-    const stream = new Blob([body])
+    const stream = new Blob([bytes])
       .stream()
       .pipeThrough(new CompressionStreamCtor(GZIP_ENCODING));
-    const buffer = await new Response(stream).arrayBuffer();
-    return new Blob([buffer], { type: 'application/json' });
+    return await new Response(stream).arrayBuffer();
   } catch {
     return null;
   }
 }
 
-async function _compressOversizedReplayBody(
-  body: string,
-  rawBytes: number,
+function _rawRequestBody(serialized: SerializedChunk): ReplayRequestBody {
+  return {
+    body: serialized.payload,
+    bodyBytes: serialized.rawBytes,
+    headers: { 'Content-Type': JSON_CONTENT_TYPE },
+  };
+}
+
+/**
+ * Gzip a chunk at or above GZIP_MIN_BYTES, falling back to the raw JSON string
+ * when the browser lacks CompressionStream or compression fails. The caller's
+ * size gate runs on bodyBytes, so a chunk too large raw but small enough
+ * compressed is still sent.
+ */
+async function _buildReplayRequestBody(
+  serialized: SerializedChunk,
 ): Promise<ReplayRequestBody> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  const compressed = await _gzipBody(body);
-  if (!compressed) return { body, bodyBytes: rawBytes, headers };
+  const compressed = await _gzipBody(serialized.bytes);
+  if (!compressed) return _rawRequestBody(serialized);
 
   return {
     body: compressed,
-    bodyBytes: compressed.size,
-    headers: { ...headers, 'Content-Encoding': GZIP_ENCODING },
+    bodyBytes: compressed.byteLength,
+    headers: { 'Content-Type': JSON_CONTENT_TYPE, 'Content-Encoding': GZIP_ENCODING },
   };
 }
 
 async function _postChunk(chunk: ReplayChunk): Promise<UploadResult> {
   if (!_buildSlug || !_apiEndpoint || chunk.events.length === 0) return 'ok';
 
-  const isFirst = chunk.sequenceNumber === 0;
-  const payload = JSON.stringify(
-    _buildPayload(chunk.events, chunk.sessionId, chunk.sequenceNumber, isFirst),
-  );
-  const rawBytes = new TextEncoder().encode(payload).byteLength;
+  const serialized = _serializeChunk(chunk);
+  // Small chunks (the common case) keep a synchronous raw path so the upload
+  // fires in the same task as the flush; only larger chunks pay the async gzip.
   const requestBody =
-    rawBytes < GZIP_MIN_BYTES
-      ? {
-          body: payload,
-          bodyBytes: rawBytes,
-          headers: { 'Content-Type': 'application/json' },
-        }
-      : await _compressOversizedReplayBody(payload, rawBytes);
+    serialized.rawBytes < GZIP_MIN_BYTES
+      ? _rawRequestBody(serialized)
+      : await _buildReplayRequestBody(serialized);
 
   if (requestBody.bodyBytes > MAX_CHUNK_BYTES) {
-    console.warn(
+    // A single rrweb event over the transport cap even after gzip should not
+    // happen in practice; surface it as an error, not routine noise.
+    console.error(
       `${SDK_TAG} Replay event too large (${(requestBody.bodyBytes / 1024).toFixed(0)} KB, limit ${MAX_CHUNK_BYTES / 1024} KB). Event dropped.`,
     );
     return 'dropped'; // not retryable
@@ -603,7 +635,51 @@ async function _postChunk(chunk: ReplayChunk): Promise<UploadResult> {
 function _markFirstChunkAcked(chunk: ReplayChunk): void {
   if (chunk.sequenceNumber !== 0 || _sessionId !== chunk.sessionId) return;
   _firstChunkAcked = true;
+  _firstChunkAttempts = 0;
+  _firstChunkRetryAfter = 0;
   _saveSession();
+}
+
+/**
+ * Open a fresh session and force a FullSnapshot so it is independently
+ * replayable. Clears the navigation dedup baseline so the new session re-emits
+ * its entry URL on the next route change instead of swallowing it as a duplicate
+ * of the previous session's last URL.
+ */
+function _beginFreshSession(): void {
+  _openNewSession(Date.now());
+  _lastNavigationUrl = null;
+  try {
+    _record?.takeFullSnapshot(true);
+  } catch {
+    // rrweb throws if called outside an active recording — non-fatal.
+  }
+}
+
+/**
+ * Count a failed attempt to deliver the session's first chunk and decide whether
+ * to keep trying. Returns true once the attempt budget is spent and recording has
+ * been stopped, so the caller must not retry or open another session. With
+ * `backoff` the same chunk is retried after exponential delay (a rejected upload);
+ * the abandon path passes false because it already produces a brand-new chunk.
+ */
+function _registerFirstChunkFailure(backoff: boolean): boolean {
+  _firstChunkAttempts += 1;
+  if (_firstChunkAttempts >= FIRST_CHUNK_MAX_ATTEMPTS) {
+    console.warn(
+      `${SDK_TAG} Replay session could not deliver its first chunk after ${FIRST_CHUNK_MAX_ATTEMPTS} attempts. Recording stopped.`,
+    );
+    stopReplay();
+    return true;
+  }
+  if (backoff) {
+    const delay = Math.min(
+      FIRST_CHUNK_BACKOFF_MAX_MS,
+      FIRST_CHUNK_BACKOFF_BASE_MS * 2 ** (_firstChunkAttempts - 1),
+    );
+    _firstChunkRetryAfter = Date.now() + delay;
+  }
+  return false;
 }
 
 function _abandonCurrentSessionAfterFirstChunkDrop(sessionId: string): void {
@@ -613,17 +689,10 @@ function _abandonCurrentSessionAfterFirstChunkDrop(sessionId: string): void {
     _pendingChunks = _pendingChunks.filter((chunk) => chunk.sessionId !== sessionId);
     _eventBuffer = [];
     unstampQueuedErrors(sessionId);
-    _openNewSession(Date.now());
-    _lastNavigationUrl = null;
+    _beginFreshSession();
     console.warn(
       `${SDK_TAG} Replay session abandoned because its first chunk could not be uploaded. Starting a fresh session.`,
     );
-
-    try {
-      _record.takeFullSnapshot(true);
-    } catch {
-      // rrweb throws if called outside an active recording.
-    }
   } catch {
     // Replay recovery is best-effort and must never break the host app.
   }
@@ -634,9 +703,19 @@ async function _uploadReservedChunks(chunks: ReplayChunk[]): Promise<ReplayChunk
     if (_capReached) return [];
     const chunk = chunks[i];
     const result = await _postChunk(chunk);
-    if (result === 'retry') return chunks.slice(i);
+    // First-chunk recovery only applies to the active session. An idle rotation
+    // uploads the previous session's tail through here too; those failures must
+    // not spend the new session's attempt budget.
+    const isActiveFirstChunk =
+      chunk.sequenceNumber === 0 && chunk.sessionId === _sessionId;
+    if (result === 'retry') {
+      if (isActiveFirstChunk && _registerFirstChunkFailure(true)) return [];
+      return chunks.slice(i);
+    }
     if (result === 'dropped' && chunk.sequenceNumber === 0) {
-      _abandonCurrentSessionAfterFirstChunkDrop(chunk.sessionId);
+      if (isActiveFirstChunk && !_registerFirstChunkFailure(false)) {
+        _abandonCurrentSessionAfterFirstChunkDrop(chunk.sessionId);
+      }
       return [];
     }
     if (result === 'ok') _markFirstChunkAcked(chunk);
@@ -646,6 +725,8 @@ async function _uploadReservedChunks(chunks: ReplayChunk[]): Promise<ReplayChunk
 
 async function _flush(_isFinal = false): Promise<void> {
   if (_capReached || _flushing) return;
+  // Hold off while a rejected first chunk is in exponential backoff.
+  if (_firstChunkRetryAfter > Date.now()) return;
   const sessionId = _sessionId;
   if (!sessionId) return;
   if (_pendingChunks.length === 0 && _eventBuffer.length === 0) return;
@@ -684,16 +765,14 @@ async function _flush(_isFinal = false): Promise<void> {
 function _beaconPostChunk(chunk: ReplayChunk): boolean {
   if (!_buildSlug || !_apiEndpoint || chunk.events.length === 0) return true;
 
-  const isFirst = chunk.sequenceNumber === 0;
-  const body = JSON.stringify(
-    _buildPayload(chunk.events, chunk.sessionId, chunk.sequenceNumber, isFirst),
-  );
-  const bodyBytes = new TextEncoder().encode(body).byteLength;
-  if (bodyBytes > MAX_CHUNK_BYTES) return false;
+  const { bytes, rawBytes } = _serializeChunk(chunk);
+  // sendBeacon is synchronous, so the async gzip path cannot run on unload; the
+  // raw size gate is the correct one for the plain JSON body actually sent.
+  if (rawBytes > MAX_CHUNK_BYTES) return false;
 
   return navigator.sendBeacon(
     `${_apiEndpoint}${REPLAY_EVENTS_PATH}`,
-    new Blob([body], { type: 'application/json' }),
+    new Blob([bytes], { type: JSON_CONTENT_TYPE }),
   );
 }
 
@@ -721,15 +800,11 @@ function _beaconFlush(): void {
     }
   }
 
-  const failed: ReplayChunk[] = [];
-  for (const chunk of chunks) {
-    if (_beaconPostChunk(chunk)) continue;
-    if (chunk.sequenceNumber === 0) {
-      _abandonCurrentSessionAfterFirstChunkDrop(chunk.sessionId);
-      return;
-    }
-    failed.push(chunk);
-  }
+  // The page is unloading: never run session recovery here. A fresh session
+  // would never get another flush, and re-snapshotting the DOM mid-teardown only
+  // adds latency. Undelivered chunks stay queued for the next flush if the page
+  // survives, otherwise they are lost with the page.
+  const failed = chunks.filter((chunk) => !_beaconPostChunk(chunk));
   if (failed.length > 0 && _sessionId === sessionId) {
     _pendingChunks.unshift(...failed);
   }
@@ -741,11 +816,10 @@ function _beaconFlush(): void {
  * can resume with an independently replayable session.
  *
  * Sequence:
- *   1. snapshot old identity + buffered events
- *   2. generate a new session id, reset seq, persist
+ *   1. capture the old identity + buffered events
+ *   2. open a fresh session (new id, reset seq, persist) and force a FullSnapshot
+ *      so the new session is independently replayable
  *   3. fire-and-forget flush of the old tail under the old identity
- *   4. trigger rrweb.takeFullSnapshot(true) so the new session starts with a
- *      type-2 snapshot and is independently replayable
  */
 function _rotateSession(): void {
   if (!_record || !_sessionId) return;
@@ -754,13 +828,7 @@ function _rotateSession(): void {
   const oldSessionId = _sessionId;
   const oldSeq = _sequenceNumber;
 
-  _openNewSession(Date.now());
-
-  // A rotated session starts a fresh page-visit timeline. Drop the dedup baseline
-  // so the new session re-emits its entry URL on the next navigation, even when
-  // that URL equals the prior session's last one (idle rotation would otherwise
-  // swallow it as a duplicate and leave the new session with no navigation event).
-  _lastNavigationUrl = null;
+  _beginFreshSession();
 
   if (oldEvents.length > 0) {
     const oldChunks =
@@ -768,12 +836,6 @@ function _rotateSession(): void {
         ? []
         : _planChunks(oldEvents, oldSessionId, oldSeq);
     _uploadReservedChunks(oldChunks).catch(() => {});
-  }
-
-  try {
-    _record.takeFullSnapshot(true);
-  } catch {
-    // rrweb throws if called outside an active recording — non-fatal.
   }
 }
 
@@ -936,6 +998,8 @@ export function stopReplay(): void {
   _flushing = false;
   _starting = false;
   _firstChunkAcked = false;
+  _firstChunkAttempts = 0;
+  _firstChunkRetryAfter = 0;
   _viteDevCssFullSnapshotSeen = false;
   _viteDevCssSnapshotRetryScheduled = false;
   _releaseReplayLock();

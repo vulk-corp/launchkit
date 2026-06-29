@@ -764,6 +764,8 @@ describe('sequence reservation', () => {
     expect(failedBody.sequenceNumber).toBe(0);
 
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'after-failure' } });
+    // The first chunk's retry is held in exponential backoff; advance past it.
+    setNow(START_NOW + 60_000);
     document.dispatchEvent(new Event('visibilitychange'));
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
@@ -783,6 +785,7 @@ describe('sequence reservation', () => {
     visibilityState = 'hidden';
     vi.stubGlobal('CompressionStream', undefined);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();
@@ -815,6 +818,7 @@ describe('sequence reservation', () => {
     ]);
 
     warnSpy.mockRestore();
+    errorSpy.mockRestore();
   });
 
   it('keeps small replay chunks on the raw JSON upload path', async () => {
@@ -876,7 +880,7 @@ describe('sequence reservation', () => {
 
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const init = fetchMock.mock.calls[0][1] as {
-      body: Blob;
+      body: ArrayBuffer;
       headers: Record<string, string>;
     };
 
@@ -884,14 +888,14 @@ describe('sequence reservation', () => {
       'Content-Type': 'application/json',
       'Content-Encoding': 'gzip',
     });
-    expect(init.body).toBeInstanceOf(Blob);
-    expect(init.body.size).toBeLessThan(512_000);
+    expect(init.body).toBeInstanceOf(ArrayBuffer);
+    expect(init.body.byteLength).toBeLessThan(512_000);
     expect(readStoredSession().id).toBe(sessionId);
     expect(readStoredSession().firstChunkAcked).toBe(true);
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
   });
 
-  it('abandons the session when sendBeacon cannot upload the first chunk', async () => {
+  it('does not recover the session when sendBeacon drops the first chunk on unload', async () => {
     const sendBeaconMock = vi.fn(() => false);
     Object.defineProperty(navigator, 'sendBeacon', {
       configurable: true,
@@ -900,26 +904,56 @@ describe('sequence reservation', () => {
 
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();
-    const abandonedSessionId = readStoredSession().id;
+    const sessionId = readStoredSession().id;
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
     window.dispatchEvent(new Event('beforeunload'));
 
     expect(sendBeaconMock).toHaveBeenCalledTimes(1);
-    expect(hoisted.takeFullSnapshot).toHaveBeenCalledWith(true);
+    // The page is unloading: no fresh session, no re-snapshot. The recovery would
+    // never get another flush and would only add teardown latency.
+    expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
+    expect(readStoredSession().id).toBe(sessionId);
+    expect(readStoredSession().firstChunkAcked).toBe(false);
 
-    const freshSessionId = readStoredSession().id;
-    expect(freshSessionId).not.toBe(abandonedSessionId);
-    expect(readStoredSession().seq).toBe(0);
-
+    // The undelivered first chunk stays queued under the same session and uploads
+    // on the next flush if the page survives the unload.
     visibilityState = 'hidden';
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'after-beacon-failure' } });
     document.dispatchEvent(new Event('visibilitychange'));
 
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const body = parseFetchBody(fetchMock.mock.calls[0]);
-    expect(body.sessionId).toBe(freshSessionId);
+    expect(body.sessionId).toBe(sessionId);
     expect(body.sequenceNumber).toBe(0);
+  });
+
+  it('stops recording after the first chunk fails the maximum number of attempts', async () => {
+    visibilityState = 'hidden';
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValue({ ok: false, status: 500 } as Response);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+
+    // Each rejected first chunk schedules exponential backoff; clear it before
+    // each retry. The fifth attempt exhausts the budget and stops recording.
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      setNow(START_NOW + attempt * 300_000);
+      document.dispatchEvent(new Event('visibilitychange'));
+      await flushMicrotasks();
+      expect(fetchMock).toHaveBeenCalledTimes(attempt);
+    }
+
+    // Recording stopped: its handlers are gone, so further flushes send nothing.
+    setNow(START_NOW + 6 * 300_000);
+    document.dispatchEvent(new Event('visibilitychange'));
+    await flushMicrotasks();
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+
+    warnSpy.mockRestore();
   });
 
   it('assigns distinct sequenceNumbers to oversized split chunks', async () => {
