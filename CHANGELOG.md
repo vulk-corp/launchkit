@@ -1,10 +1,15 @@
 # Changelog
 
-## [1.13.1] - 2026-06-29
+## [1.14.0] — 2026-06-29
+
+### Added
+
+- **Gzip upload for large replay chunks**: replay chunks at least 64 KiB now use browser-native gzip (`CompressionStream`) when available, so large valid initial snapshots fit the transport budget without adding compression overhead to the small chunks that make up the common case.
+- **Leaner replay snapshots**: rrweb `slimDOMOptions` drops replay-irrelevant `<head>` metadata (favicon, social, robots, http-equiv, verification meta), inert scripts, comments, and head whitespace from the `FullSnapshot`, shrinking it at the source before gzip without affecting visual fidelity.
 
 ### Fixed
 
-- **Ghost replay session prevention**: replay chunks at least 64 KiB now use browser-native gzip upload when available, so large valid initial snapshots can still fit the transport budget without adding compression overhead to small chunks. Snapshots also omit replay-irrelevant head/script noise via conservative rrweb `slimDOMOptions`. When the required first replay chunk is still dropped as non-retryable, the SDK abandons that unplayable session instead of uploading later incremental events under the same session id. Recording continues under a fresh session id and requests a new rrweb `FullSnapshot`, so dashboard-visible replay sessions are not created from incremental events alone.
+- **Ghost replay session prevention**: when the required first replay chunk cannot be delivered, the SDK no longer uploads later incremental events under the same session id, so dashboard-visible replay sessions are never assembled from incremental events alone. Recovery is bounded — a rejected first chunk retries with exponential backoff, an un-shrinkable one starts a fresh session, and after a capped number of failed attempts recording stops instead of looping. Page unload never triggers session recovery, so teardown stays fast.
 
 ## [1.13.0] — 2026-06-25
 
