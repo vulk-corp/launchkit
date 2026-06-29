@@ -23,6 +23,20 @@ const MAX_CHUNK_BYTES = 512_000; // 512 KB per chunk
 const GZIP_MIN_BYTES = 64 * 1024;
 const REPLAY_EVENTS_PATH = '/api/telemetry/replay-events';
 const GZIP_ENCODING = 'gzip';
+// rrweb slimDOMOptions: each `true` strips that node from the FullSnapshot, it
+// is not an "enable" toggle. These are head metadata and inert scripts that the
+// replay never renders, so dropping them at serialization shrinks the snapshot
+// before gzip without losing any visual fidelity.
+const REPLAY_SLIM_DOM_OPTIONS = {
+  script: true,
+  comment: true,
+  headFavicon: true,
+  headWhitespace: true,
+  headMetaSocial: true,
+  headMetaRobots: true,
+  headMetaHttpEquiv: true,
+  headMetaVerification: true,
+} as const;
 // Align with Sentry Replay: a user returning within 15 minutes continues the
 // same replay session. Server-side assembly is independent and append-only.
 const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
@@ -998,6 +1012,7 @@ export async function startReplay(
       maskInputOptions: {
         password: true,
       },
+      slimDOMOptions: REPLAY_SLIM_DOM_OPTIONS,
       blockSelector: '[data-rrweb-block]',
       maskTextSelector: '[data-rrweb-mask]',
     });

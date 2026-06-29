@@ -277,6 +277,27 @@ afterEach(() => {
 // Tests
 // ---------------------------------------------------------------------------
 
+describe('record options', () => {
+  it('removes replay-irrelevant head and script noise from snapshots', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+    expect(hoisted.recordFactory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        slimDOMOptions: {
+          script: true,
+          comment: true,
+          headFavicon: true,
+          headWhitespace: true,
+          headMetaSocial: true,
+          headMetaRobots: true,
+          headMetaHttpEquiv: true,
+          headMetaVerification: true,
+        },
+      }),
+    );
+  });
+});
+
 describe('Vite dev CSS readiness', () => {
   it('waits for Vite dev CSS before starting rrweb', async () => {
     appendViteClientScript();
