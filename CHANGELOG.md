@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.13.1] - 2026-06-29
+
+### Fixed
+
+- **Ghost replay session prevention**: when the required first replay chunk is dropped as non-retryable, the SDK now abandons that unplayable session instead of uploading later incremental events under the same session id. Recording continues under a fresh session id and requests a new rrweb `FullSnapshot`, so dashboard-visible replay sessions are not created from incremental events alone.
+
 ## [1.13.0] — 2026-06-25
 
 ### Added

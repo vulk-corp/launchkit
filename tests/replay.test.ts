@@ -718,6 +718,7 @@ describe('sequence reservation', () => {
 
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();
+    const stored = readStoredSession();
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
     document.dispatchEvent(new Event('visibilitychange'));
@@ -733,11 +734,81 @@ describe('sequence reservation', () => {
     const retryBody = parseFetchBody(fetchMock.mock.calls[1]);
     expect(retryBody.sequenceNumber).toBe(0);
     expect(retryBody.events).toEqual(failedBody.events);
+    expect(readStoredSession().id).toBe(stored.id);
+    expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
 
     await flushMicrotasks();
     document.dispatchEvent(new Event('visibilitychange'));
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
     expect(parseFetchBody(fetchMock.mock.calls[2]).sequenceNumber).toBe(1);
+  });
+
+  it('abandons the session when the first chunk is dropped', async () => {
+    visibilityState = 'hidden';
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    const abandonedSessionId = readStoredSession().id;
+
+    emit!({
+      type: 2,
+      timestamp: Date.now(),
+      data: { html: 'x'.repeat(520_000) },
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await vi.waitFor(() => expect(hoisted.takeFullSnapshot).toHaveBeenCalledWith(true));
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const freshSessionId = readStoredSession().id;
+    expect(freshSessionId).not.toBe(abandonedSessionId);
+    expect(readStoredSession().seq).toBe(0);
+
+    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'fresh-session' } });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const body = parseFetchBody(fetchMock.mock.calls[0]);
+    expect(body.sessionId).toBe(freshSessionId);
+    expect(body.sequenceNumber).toBe(0);
+    expect(body.events).toMatchObject([
+      { type: 2, data: {} },
+      { type: 3, data: { marker: 'fresh-session' } },
+    ]);
+
+    warnSpy.mockRestore();
+  });
+
+  it('abandons the session when sendBeacon cannot upload the first chunk', async () => {
+    const sendBeaconMock = vi.fn(() => false);
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: sendBeaconMock,
+    });
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    const abandonedSessionId = readStoredSession().id;
+
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    window.dispatchEvent(new Event('beforeunload'));
+
+    expect(sendBeaconMock).toHaveBeenCalledTimes(1);
+    expect(hoisted.takeFullSnapshot).toHaveBeenCalledWith(true);
+
+    const freshSessionId = readStoredSession().id;
+    expect(freshSessionId).not.toBe(abandonedSessionId);
+    expect(readStoredSession().seq).toBe(0);
+
+    visibilityState = 'hidden';
+    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'after-beacon-failure' } });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const body = parseFetchBody(fetchMock.mock.calls[0]);
+    expect(body.sessionId).toBe(freshSessionId);
+    expect(body.sequenceNumber).toBe(0);
   });
 
   it('assigns distinct sequenceNumbers to oversized split chunks', async () => {

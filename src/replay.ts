@@ -233,7 +233,7 @@ function _scheduleViteDevCssFullSnapshot(): void {
       try {
         _record.takeFullSnapshot(true);
       } catch {
-        // rrweb throws if called outside an active recording — non-fatal.
+        // rrweb throws if called outside an active recording.
       }
     })
     .finally(() => {
@@ -546,12 +546,39 @@ function _markFirstChunkAcked(chunk: ReplayChunk): void {
   _saveSession();
 }
 
+function _abandonCurrentSessionAfterFirstChunkDrop(sessionId: string): void {
+  if (!_record || _sessionId !== sessionId) return;
+
+  try {
+    _pendingChunks = _pendingChunks.filter((chunk) => chunk.sessionId !== sessionId);
+    _eventBuffer = [];
+    unstampQueuedErrors(sessionId);
+    _openNewSession(Date.now());
+    _lastNavigationUrl = null;
+    console.warn(
+      `${SDK_TAG} Replay session abandoned because its first chunk could not be uploaded. Starting a fresh session.`,
+    );
+
+    try {
+      _record.takeFullSnapshot(true);
+    } catch {
+      // rrweb throws if called outside an active recording.
+    }
+  } catch {
+    // Replay recovery is best-effort and must never break the host app.
+  }
+}
+
 async function _uploadReservedChunks(chunks: ReplayChunk[]): Promise<ReplayChunk[]> {
   for (let i = 0; i < chunks.length; i += 1) {
     if (_capReached) return [];
     const chunk = chunks[i];
     const result = await _postChunk(chunk);
     if (result === 'retry') return chunks.slice(i);
+    if (result === 'dropped' && chunk.sequenceNumber === 0) {
+      _abandonCurrentSessionAfterFirstChunkDrop(chunk.sessionId);
+      return [];
+    }
     if (result === 'ok') _markFirstChunkAcked(chunk);
   }
   return [];
@@ -636,7 +663,12 @@ function _beaconFlush(): void {
 
   const failed: ReplayChunk[] = [];
   for (const chunk of chunks) {
-    if (!_beaconPostChunk(chunk)) failed.push(chunk);
+    if (_beaconPostChunk(chunk)) continue;
+    if (chunk.sequenceNumber === 0) {
+      _abandonCurrentSessionAfterFirstChunkDrop(chunk.sessionId);
+      return;
+    }
+    failed.push(chunk);
   }
   if (failed.length > 0 && _sessionId === sessionId) {
     _pendingChunks.unshift(...failed);
