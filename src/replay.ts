@@ -20,7 +20,9 @@ import { backstampQueuedErrors, unstampQueuedErrors } from './error-capture';
 const SDK_TAG = '[@bworlds/launchkit]';
 const FLUSH_INTERVAL_MS = 10_000;
 const MAX_CHUNK_BYTES = 512_000; // 512 KB per chunk
+const GZIP_MIN_BYTES = 64 * 1024;
 const REPLAY_EVENTS_PATH = '/api/telemetry/replay-events';
+const GZIP_ENCODING = 'gzip';
 // Align with Sentry Replay: a user returning within 15 minutes continues the
 // same replay session. Server-side assembly is independent and append-only.
 const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
@@ -491,18 +493,62 @@ function _reserveChunksForEvents(
 
 type UploadResult = 'ok' | 'retry' | 'dropped';
 
+type ReplayRequestBody = {
+  body: BodyInit;
+  bodyBytes: number;
+  headers: Record<string, string>;
+};
+
+async function _gzipBody(body: string): Promise<Blob | null> {
+  const CompressionStreamCtor = globalThis.CompressionStream;
+  if (!CompressionStreamCtor) return null;
+
+  try {
+    const stream = new Blob([body])
+      .stream()
+      .pipeThrough(new CompressionStreamCtor(GZIP_ENCODING));
+    const buffer = await new Response(stream).arrayBuffer();
+    return new Blob([buffer], { type: 'application/json' });
+  } catch {
+    return null;
+  }
+}
+
+async function _compressOversizedReplayBody(
+  body: string,
+  rawBytes: number,
+): Promise<ReplayRequestBody> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const compressed = await _gzipBody(body);
+  if (!compressed) return { body, bodyBytes: rawBytes, headers };
+
+  return {
+    body: compressed,
+    bodyBytes: compressed.size,
+    headers: { ...headers, 'Content-Encoding': GZIP_ENCODING },
+  };
+}
+
 async function _postChunk(chunk: ReplayChunk): Promise<UploadResult> {
   if (!_buildSlug || !_apiEndpoint || chunk.events.length === 0) return 'ok';
 
   const isFirst = chunk.sequenceNumber === 0;
-  const body = JSON.stringify(
+  const payload = JSON.stringify(
     _buildPayload(chunk.events, chunk.sessionId, chunk.sequenceNumber, isFirst),
   );
-  const bodyBytes = new TextEncoder().encode(body).byteLength;
+  const rawBytes = new TextEncoder().encode(payload).byteLength;
+  const requestBody =
+    rawBytes < GZIP_MIN_BYTES
+      ? {
+          body: payload,
+          bodyBytes: rawBytes,
+          headers: { 'Content-Type': 'application/json' },
+        }
+      : await _compressOversizedReplayBody(payload, rawBytes);
 
-  if (bodyBytes > MAX_CHUNK_BYTES) {
+  if (requestBody.bodyBytes > MAX_CHUNK_BYTES) {
     console.warn(
-      `${SDK_TAG} Replay event too large (${(bodyBytes / 1024).toFixed(0)} KB, limit ${MAX_CHUNK_BYTES / 1024} KB). Event dropped.`,
+      `${SDK_TAG} Replay event too large (${(requestBody.bodyBytes / 1024).toFixed(0)} KB, limit ${MAX_CHUNK_BYTES / 1024} KB). Event dropped.`,
     );
     return 'dropped'; // not retryable
   }
@@ -510,8 +556,8 @@ async function _postChunk(chunk: ReplayChunk): Promise<UploadResult> {
   try {
     const resp = await fetch(`${_apiEndpoint}${REPLAY_EVENTS_PATH}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
+      headers: requestBody.headers,
+      body: requestBody.body,
     });
 
     if (resp.status === 429) {

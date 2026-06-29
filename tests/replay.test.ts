@@ -68,6 +68,7 @@ interface StoredSession {
   seq: number;
   startedAt: number;
   lastActivityAt: number;
+  firstChunkAcked?: boolean;
 }
 
 const fetchMock = vi.fn();
@@ -196,6 +197,7 @@ function lastFlushedErrors(): Array<{ sessionId: string | null; capturedAt: numb
 let visibilityState: DocumentVisibilityState = 'visible';
 let originalVisibilityDescriptor: PropertyDescriptor | undefined;
 let originalSendBeaconDescriptor: PropertyDescriptor | undefined;
+let originalBlobStreamDescriptor: PropertyDescriptor | undefined;
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] });
@@ -225,6 +227,10 @@ beforeEach(() => {
   originalSendBeaconDescriptor =
     Object.getOwnPropertyDescriptor(Navigator.prototype, 'sendBeacon') ??
     Object.getOwnPropertyDescriptor(navigator, 'sendBeacon');
+  originalBlobStreamDescriptor = Object.getOwnPropertyDescriptor(
+    Blob.prototype,
+    'stream',
+  );
   Object.defineProperty(document, 'visibilityState', {
     configurable: true,
     get: () => visibilityState,
@@ -253,6 +259,15 @@ afterEach(() => {
     );
   } else {
     Reflect.deleteProperty(navigator, 'sendBeacon');
+  }
+  if (originalBlobStreamDescriptor) {
+    Object.defineProperty(
+      Blob.prototype,
+      'stream',
+      originalBlobStreamDescriptor,
+    );
+  } else {
+    Reflect.deleteProperty(Blob.prototype, 'stream');
   }
   vi.unstubAllGlobals();
   vi.useRealTimers();
@@ -745,6 +760,7 @@ describe('sequence reservation', () => {
 
   it('abandons the session when the first chunk is dropped', async () => {
     visibilityState = 'hidden';
+    vi.stubGlobal('CompressionStream', undefined);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     await startReplay(BUILD_SLUG, API_ENDPOINT);
@@ -778,6 +794,80 @@ describe('sequence reservation', () => {
     ]);
 
     warnSpy.mockRestore();
+  });
+
+  it('keeps small replay chunks on the raw JSON upload path', async () => {
+    visibilityState = 'hidden';
+    const CompressionStreamMock = vi.fn();
+    vi.stubGlobal(
+      'CompressionStream',
+      CompressionStreamMock as unknown as typeof CompressionStream,
+    );
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const init = fetchMock.mock.calls[0][1] as {
+      body: string;
+      headers: Record<string, string>;
+    };
+
+    expect(init.headers).toEqual({ 'Content-Type': 'application/json' });
+    expect(typeof init.body).toBe('string');
+    expect(CompressionStreamMock).not.toHaveBeenCalled();
+  });
+
+  it('uploads a compressed oversized first chunk when gzip fits the transport budget', async () => {
+    visibilityState = 'hidden';
+    const pipeThrough = vi.fn(() => 'compressed-stream');
+    Object.defineProperty(Blob.prototype, 'stream', {
+      configurable: true,
+      value: vi.fn(() => ({ pipeThrough })),
+    });
+    vi.stubGlobal(
+      'CompressionStream',
+      class FakeCompressionStream {} as unknown as typeof CompressionStream,
+    );
+    vi.stubGlobal(
+      'Response',
+      class FakeResponse {
+        constructor(readonly body: unknown) {}
+        async arrayBuffer() {
+          return new Uint8Array([1, 2, 3]).buffer;
+        }
+      } as unknown as typeof Response,
+    );
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    const sessionId = readStoredSession().id;
+
+    emit!({
+      type: 2,
+      timestamp: Date.now(),
+      data: { html: 'x'.repeat(520_000) },
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const init = fetchMock.mock.calls[0][1] as {
+      body: Blob;
+      headers: Record<string, string>;
+    };
+
+    expect(init.headers).toMatchObject({
+      'Content-Type': 'application/json',
+      'Content-Encoding': 'gzip',
+    });
+    expect(init.body).toBeInstanceOf(Blob);
+    expect(init.body.size).toBeLessThan(512_000);
+    expect(readStoredSession().id).toBe(sessionId);
+    expect(readStoredSession().firstChunkAcked).toBe(true);
+    expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
   });
 
   it('abandons the session when sendBeacon cannot upload the first chunk', async () => {
