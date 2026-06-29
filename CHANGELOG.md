@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.14.0] - 2026-06-29
+
+### Added
+
+- **Gzip upload for large replay chunks**: replay chunks at least 64 KiB now use browser-native gzip (`CompressionStream`) when available, so large valid initial snapshots fit the transport budget without adding compression overhead to the small chunks that make up the common case.
+- **Leaner replay snapshots**: rrweb `slimDOMOptions` drops replay-irrelevant `<head>` metadata (favicon, social, robots, http-equiv, verification meta), inert scripts, comments, and head whitespace from the `FullSnapshot`, shrinking it at the source before gzip without affecting visual fidelity.
+
+### Fixed
+
+- **Replay sessions without video bootstrap stay observable**: when the required first replay chunk cannot be delivered, the SDK retries it with bounded exponential backoff, then keeps uploading later chunks under the same session id so dashboard-visible telemetry remains available even when replay video is unavailable. Page unload never triggers session recovery, so teardown stays fast.
+
 ## [1.13.0] — 2026-06-25
 
 ### Added
