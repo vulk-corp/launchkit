@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.14.3] - 2026-06-30
+
+### Fixed
+
+- **Durable replay bootstrap retry**: the SDK now persists the sequence 0 FullSnapshot chunk until it is acknowledged, then restores and resends that same bootstrap chunk after a reload or canceled fetch so the backend can still receive the replay video bootstrap.
+
 ## [1.14.2] - 2026-06-30
 
 ### Fixed

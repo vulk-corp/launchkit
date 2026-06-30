@@ -59,6 +59,7 @@ vi.mock('rrweb', () => {
 
 const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const STORAGE_KEY = 'bworlds-replay-session';
+const BOOTSTRAP_STORAGE_KEY = 'bworlds-replay-bootstrap-chunk';
 const BUILD_SLUG = 'test-build';
 const API_ENDPOINT = 'https://api.test';
 const START_NOW = 1_000_000;
@@ -88,6 +89,14 @@ async function parseBeaconBody(call: unknown[]): Promise<Record<string, unknown>
 
 function readStoredSession(): StoredSession {
   return JSON.parse(sessionStorage.getItem(STORAGE_KEY)!) as StoredSession;
+}
+
+function readStoredBootstrap(): { sessionId: string; sequenceNumber: 0; events: unknown[] } {
+  return JSON.parse(sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY)!) as {
+    sessionId: string;
+    sequenceNumber: 0;
+    events: unknown[];
+  };
 }
 
 function okResponse() {
@@ -981,6 +990,73 @@ describe('sequence reservation', () => {
     expect(init.body).toBeInstanceOf(ArrayBuffer);
     expect(readStoredSession().seq).toBe(1);
     expect(readStoredSession().firstChunkAcked).toBe(true);
+  });
+
+  it('persists the bootstrap chunk until sequenceNumber 0 is acknowledged', async () => {
+    visibilityState = 'hidden';
+    let releaseFetch!: (value: Response) => void;
+    fetchMock.mockReset();
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          releaseFetch = resolve;
+        }),
+    );
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    const sessionId = readStoredSession().id;
+
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    const storedBootstrap = readStoredBootstrap();
+    expect(storedBootstrap.sessionId).toBe(sessionId);
+    expect(storedBootstrap.sequenceNumber).toBe(0);
+    expect(storedBootstrap.events).toMatchObject([
+      { type: 2, data: { marker: 'initial' } },
+    ]);
+
+    releaseFetch(okResponse());
+    await flushMicrotasks();
+    expect(sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY)).toBeNull();
+  });
+
+  it('resends a stored bootstrap chunk after reload before recording new chunks', async () => {
+    visibilityState = 'hidden';
+    sessionStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        id: 'persisted-session',
+        seq: 1,
+        startedAt: START_NOW - 1_000,
+        lastActivityAt: START_NOW - 500,
+        firstChunkAcked: false,
+      }),
+    );
+    sessionStorage.setItem(
+      BOOTSTRAP_STORAGE_KEY,
+      JSON.stringify({
+        sessionId: 'persisted-session',
+        sequenceNumber: 0,
+        createdAt: START_NOW - 500,
+        events: [{ type: 2, timestamp: START_NOW - 500, data: { marker: 'persisted' } }],
+      }),
+    );
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const body = parseFetchBody(fetchMock.mock.calls[0]);
+    expect(body.sessionId).toBe('persisted-session');
+    expect(body.sequenceNumber).toBe(0);
+    expect(body.events).toMatchObject([
+      { type: 2, data: { marker: 'persisted' } },
+    ]);
+    expect(readStoredSession().id).toBe('persisted-session');
+    expect(readStoredSession().seq).toBe(1);
+    expect(readStoredSession().firstChunkAcked).toBe(true);
+    expect(sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY)).toBeNull();
   });
 
   it('uses raw JSON when gzip would make the chunk larger', async () => {

@@ -49,6 +49,7 @@ const REPLAY_SLIM_DOM_OPTIONS = {
 const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_SESSION_MS = 60 * 60 * 1000; // 60 min — rotate session after this duration
 const STORAGE_KEY = 'bworlds-replay-session';
+const BOOTSTRAP_STORAGE_KEY = 'bworlds-replay-bootstrap-chunk';
 const TOKEN_COOKIE = 'bworlds_token';
 // Stable wire contract — the backend distiller will match on this tag to append
 // SPA route changes to a session's pages_visited. Backend wiring is in progress
@@ -119,6 +120,13 @@ interface ReplayChunk {
   sessionId: string;
   sequenceNumber: number;
   events: eventWithTime[];
+}
+
+interface StoredBootstrapChunk {
+  sessionId: string;
+  sequenceNumber: 0;
+  events: eventWithTime[];
+  createdAt: number;
 }
 
 interface ReplayGlobalState {
@@ -296,6 +304,71 @@ function _loadSession(): StoredSession | null {
   }
 }
 
+function _loadStoredBootstrapChunk(now = Date.now()): StoredBootstrapChunk | null {
+  try {
+    const raw = sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY);
+    if (!raw) return null;
+    const stored = JSON.parse(raw) as Partial<StoredBootstrapChunk>;
+    if (
+      typeof stored.sessionId !== 'string' ||
+      stored.sequenceNumber !== 0 ||
+      !Array.isArray(stored.events) ||
+      typeof stored.createdAt !== 'number' ||
+      now - stored.createdAt >= IDLE_TIMEOUT_MS
+    ) {
+      sessionStorage.removeItem(BOOTSTRAP_STORAGE_KEY);
+      return null;
+    }
+    return stored as StoredBootstrapChunk;
+  } catch {
+    return null;
+  }
+}
+
+function _saveStoredBootstrapChunk(chunk: ReplayChunk): void {
+  if (chunk.sequenceNumber !== 0) return;
+  try {
+    const stored: StoredBootstrapChunk = {
+      sessionId: chunk.sessionId,
+      sequenceNumber: 0,
+      events: chunk.events,
+      createdAt: Date.now(),
+    };
+    sessionStorage.setItem(BOOTSTRAP_STORAGE_KEY, JSON.stringify(stored));
+  } catch {
+    // Bootstrap persistence is a durability upgrade; capture stays fail-open.
+  }
+}
+
+function _clearStoredBootstrapChunk(sessionId?: string): void {
+  try {
+    if (sessionId) {
+      const stored = _loadStoredBootstrapChunk();
+      if (stored && stored.sessionId !== sessionId) return;
+    }
+    sessionStorage.removeItem(BOOTSTRAP_STORAGE_KEY);
+  } catch {
+    // sessionStorage unavailable. Not fatal.
+  }
+}
+
+function _restoreStoredBootstrapChunk(): boolean {
+  if (!_sessionId || _firstChunkAcked) return false;
+  const stored = _loadStoredBootstrapChunk();
+  if (!stored || stored.sessionId !== _sessionId) return false;
+  const isAlreadyQueued = _pendingChunks.some(
+    (chunk) => chunk.sessionId === stored.sessionId && chunk.sequenceNumber === 0,
+  );
+  if (!isAlreadyQueued) {
+    _pendingChunks.unshift({
+      sessionId: stored.sessionId,
+      sequenceNumber: 0,
+      events: stored.events,
+    });
+  }
+  return true;
+}
+
 function _saveSession(): void {
   if (!_sessionId) return;
   try {
@@ -308,7 +381,7 @@ function _saveSession(): void {
     };
     sessionStorage.setItem(STORAGE_KEY, JSON.stringify(data));
   } catch {
-    // sessionStorage unavailable — not fatal
+    // sessionStorage unavailable. Not fatal.
   }
 }
 
@@ -332,6 +405,7 @@ function _openNewSession(now: number): void {
 function _resolveSession(): boolean {
   const now = Date.now();
   const stored = _loadSession();
+  const storedBootstrap = _loadStoredBootstrapChunk(now);
 
   if (stored) {
     const idleMs = now - stored.lastActivityAt;
@@ -339,8 +413,16 @@ function _resolveSession(): boolean {
 
     if (idleMs < IDLE_TIMEOUT_MS && ageMs < MAX_SESSION_MS) {
       if (stored.seq > 0 && stored.firstChunkAcked !== true) {
-        _openNewSession(now);
-        return true;
+        if (storedBootstrap?.sessionId !== stored.id) {
+          _openNewSession(now);
+          return true;
+        }
+        _sessionId = stored.id;
+        _sequenceNumber = Math.max(stored.seq, 1);
+        _sessionStartedAt = stored.startedAt;
+        _firstChunkAcked = false;
+        setReplaySessionId(_sessionId);
+        return false;
       }
       _sessionId = stored.id;
       _sequenceNumber = stored.seq;
@@ -349,6 +431,16 @@ function _resolveSession(): boolean {
       setReplaySessionId(_sessionId);
       return false;
     }
+  }
+
+  if (storedBootstrap) {
+    _sessionId = storedBootstrap.sessionId;
+    _sequenceNumber = 1;
+    _sessionStartedAt = storedBootstrap.createdAt;
+    _firstChunkAcked = false;
+    setReplaySessionId(_sessionId);
+    _saveSession();
+    return false;
   }
 
   _openNewSession(now);
@@ -554,9 +646,14 @@ function _reserveChunksForEvents(
   const firstSequenceNumber = _reserveSequenceRange(sessionId, planned.length);
   if (firstSequenceNumber === null) return null;
 
-  return firstSequenceNumber === planned[0]?.sequenceNumber
-    ? planned
-    : _planChunks(normalizedEvents, sessionId, firstSequenceNumber);
+  const chunks =
+    firstSequenceNumber === planned[0]?.sequenceNumber
+      ? planned
+      : _planChunks(normalizedEvents, sessionId, firstSequenceNumber);
+  if (chunks[0]?.sequenceNumber === 0) {
+    _saveStoredBootstrapChunk(chunks[0]);
+  }
+  return chunks;
 }
 
 type UploadResult = 'ok' | 'retry' | 'dropped';
@@ -702,6 +799,7 @@ function _markFirstChunkAcked(chunk: ReplayChunk): void {
   _firstChunkAcked = true;
   _firstChunkAttempts = 0;
   _firstChunkRetryAfter = 0;
+  _clearStoredBootstrapChunk(chunk.sessionId);
   _saveSession();
 }
 
@@ -760,6 +858,7 @@ async function _uploadReservedChunks(chunks: ReplayChunk[]): Promise<ReplayChunk
       return chunks.slice(i);
     }
     if (result === 'dropped' && chunk.sequenceNumber === 0) {
+      _clearStoredBootstrapChunk(chunk.sessionId);
       if (isActiveFirstChunk) {
         console.warn(
           `${SDK_TAG} Replay session is continuing without its first chunk. Replay video may be unavailable.`,
@@ -1051,6 +1150,7 @@ export function stopReplay(): void {
   // Clearing the shared session id covers manual stop and the 429 daily-cap
   // stop (which routes through stopReplay) — errors captured after this point
   // must not point at a session whose footage has ended.
+  _clearStoredBootstrapChunk(_sessionId ?? undefined);
   setReplaySessionId(null);
   _sessionId = null;
   _sequenceNumber = 0;
@@ -1091,6 +1191,7 @@ export async function startReplay(
     _lastEventAt = 0;
     _viteDevCssFullSnapshotSeen = false;
     _viteDevCssSnapshotRetryScheduled = false;
+    let shouldFlushStoredBootstrap = false;
 
     // Capture UA once per replay session — sent on first chunk only
     if (typeof navigator !== 'undefined' && navigator.userAgent) {
@@ -1120,6 +1221,7 @@ export async function startReplay(
     const { record, EventType } = rrweb;
     _EventType = EventType;
     _record = record;
+    shouldFlushStoredBootstrap = _restoreStoredBootstrapChunk();
 
     await _waitForViteDevCssReady();
     if (!_starting) return;
@@ -1188,6 +1290,10 @@ export async function startReplay(
 
     document.addEventListener('visibilitychange', _visibilityHandler);
     window.addEventListener('beforeunload', _unloadHandler);
+
+    if (shouldFlushStoredBootstrap) {
+      _flush().catch(() => {});
+    }
   } finally {
     _starting = false;
     if (!_stopRecording) _releaseReplayLock();
