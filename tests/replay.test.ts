@@ -1421,6 +1421,218 @@ describe('stopReplay cleanup', () => {
   });
 });
 
+
+describe('link activation watcher', () => {
+  async function settleLinkActivation(): Promise<void> {
+    await Promise.resolve();
+  }
+
+  function lastLinkActivationCall() {
+    const calls = hoisted.addCustomEvent.mock.calls;
+    return calls[calls.length - 1] as [
+      string,
+      {
+        href: string;
+        currentHref: string;
+        target?: string;
+        button: number;
+        metaKey: boolean;
+        ctrlKey: boolean;
+        shiftKey: boolean;
+        altKey: boolean;
+        download: boolean;
+        sameOrigin: boolean;
+        sameDocument: boolean;
+        sourceEventAtMs: number;
+      },
+    ];
+  }
+
+  function appendLink(attributes: Record<string, string>) {
+    const link = document.createElement('a');
+    for (const [name, value] of Object.entries(attributes)) {
+      link.setAttribute(name, value);
+    }
+    link.textContent = 'Open';
+    document.body.appendChild(link);
+    return link;
+  }
+
+  function clickLink(link: Element, init: MouseEventInit = {}) {
+    link.dispatchEvent(
+      new MouseEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        button: 0,
+        ...init,
+      }),
+    );
+  }
+
+  it('emits a link_activation custom event for a navigable link click', async () => {
+    history.replaceState({}, '', '/current');
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const link = appendLink({ href: '/checkout', target: '_blank', download: '' });
+
+    setNow(START_NOW + 123);
+    clickLink(link, { metaKey: true, shiftKey: true });
+    await settleLinkActivation();
+
+    expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+    expect(lastLinkActivationCall()).toEqual([
+      'link_activation',
+      {
+        href: new URL('/checkout', location.href).href,
+        currentHref: new URL('/current', location.href).href,
+        target: '_blank',
+        button: 0,
+        metaKey: true,
+        ctrlKey: false,
+        shiftKey: true,
+        altKey: false,
+        download: true,
+        sameOrigin: true,
+        sameDocument: false,
+        sourceEventAtMs: START_NOW + 123,
+      },
+    ]);
+  });
+
+  it('captures link clicks even when the host stops propagation', async () => {
+    history.replaceState({}, '', '/current');
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const link = appendLink({ href: '/after-stop-propagation' });
+    link.addEventListener('click', (event) => event.stopPropagation());
+
+    clickLink(link);
+    await settleLinkActivation();
+
+    expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+    expect(lastLinkActivationCall()[0]).toBe('link_activation');
+  });
+
+  it('records the href from click time before host handlers mutate the link', async () => {
+    history.replaceState({}, '', '/current');
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const link = appendLink({ href: '/clicked' });
+    link.addEventListener('click', () => {
+      link.setAttribute('href', '/mutated');
+    });
+
+    clickLink(link);
+    await settleLinkActivation();
+
+    expect(lastLinkActivationCall()).toEqual([
+      'link_activation',
+      expect.objectContaining({ href: new URL('/clicked', location.href).href }),
+    ]);
+  });
+
+  it('skips link clicks cancelled by the host app', async () => {
+    history.replaceState({}, '', '/current');
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const link = appendLink({ href: '/cancelled' });
+    link.addEventListener('click', (event) => event.preventDefault());
+
+    clickLink(link);
+    await settleLinkActivation();
+
+    expect(hoisted.addCustomEvent).not.toHaveBeenCalled();
+  });
+
+  it('keeps modified clicks and new-tab targets as link activations', async () => {
+    history.replaceState({}, '', '/current');
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const link = appendLink({ href: 'https://external.test/path', target: '_blank' });
+
+    clickLink(link, { ctrlKey: true, altKey: true });
+    await settleLinkActivation();
+
+    expect(lastLinkActivationCall()).toEqual([
+      'link_activation',
+      expect.objectContaining({
+        href: 'https://external.test/path',
+        target: '_blank',
+        ctrlKey: true,
+        altKey: true,
+        sameOrigin: false,
+        sameDocument: false,
+      }),
+    ]);
+  });
+
+  it('ignores non-navigable links', async () => {
+    history.replaceState({}, '', '/current');
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+    const withoutHref = document.createElement('a');
+    withoutHref.textContent = 'Missing href';
+    document.body.appendChild(withoutHref);
+    const javascriptLink = appendLink({ href: 'javascript:void(0)' });
+    const disabledLink = appendLink({ href: '/disabled', disabled: '' });
+    const ariaDisabledLink = appendLink({ href: '/aria-disabled', 'aria-disabled': 'true' });
+
+    for (const link of [withoutHref, javascriptLink, disabledLink, ariaDisabledLink]) {
+      clickLink(link);
+      await settleLinkActivation();
+    }
+
+    expect(hoisted.addCustomEvent).not.toHaveBeenCalled();
+  });
+
+  it('marks same-document hash activations without dropping them', async () => {
+    history.replaceState({}, '', '/docs?tab=api#intro');
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const link = appendLink({ href: '#details' });
+
+    clickLink(link);
+    await settleLinkActivation();
+
+    expect(lastLinkActivationCall()).toEqual([
+      'link_activation',
+      expect.objectContaining({
+        href: new URL('/docs?tab=api#details', location.href).href,
+        currentHref: new URL('/docs?tab=api#intro', location.href).href,
+        sameOrigin: true,
+        sameDocument: true,
+      }),
+    ]);
+  });
+
+  it('removes the click listener when replay stops', async () => {
+    history.replaceState({}, '', '/current');
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const link = appendLink({ href: '/after-stop' });
+
+    stopReplay();
+    clickLink(link);
+    await settleLinkActivation();
+
+    expect(hoisted.addCustomEvent).not.toHaveBeenCalled();
+  });
+
+  it('does not install inside a cross-origin iframe', async () => {
+    history.replaceState({}, '', '/current');
+    const ownSelf = Object.getOwnPropertyDescriptor(window, 'self');
+    Object.defineProperty(window, 'self', { configurable: true, get: () => ({}) });
+    try {
+      await startReplay(BUILD_SLUG, API_ENDPOINT);
+      const link = appendLink({ href: '/iframe-link' });
+
+      clickLink(link);
+      await settleLinkActivation();
+
+      expect(hoisted.addCustomEvent).not.toHaveBeenCalled();
+    } finally {
+      if (ownSelf) {
+        Object.defineProperty(window, 'self', ownSelf);
+      } else {
+        Reflect.deleteProperty(window, 'self');
+      }
+    }
+  });
+});
+
 describe('navigation watcher', () => {
   function lastNavigationCall() {
     const calls = hoisted.addCustomEvent.mock.calls;

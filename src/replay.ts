@@ -56,6 +56,7 @@ const TOKEN_COOKIE = 'bworlds_token';
 // (#889 workstream 3); until it ships the distiller still reads page from the
 // type-4 Meta event only. Do not rename.
 const NAVIGATION_TAG = 'navigation';
+const LINK_ACTIVATION_TAG = 'link_activation';
 const GLOBAL_REPLAY_STATE_KEY = '__bworldsLaunchKitReplayState__';
 const VITE_DEV_CLIENT_SCRIPT_SELECTOR = 'script[src*="/@vite/client"]';
 const VITE_DEV_CSS_SELECTOR = 'style[data-vite-dev-id]';
@@ -83,6 +84,7 @@ let _navOriginalPushState: History['pushState'] | null = null;
 let _navOriginalReplaceState: History['replaceState'] | null = null;
 let _navPopstateHandler: (() => void) | null = null;
 let _lastNavigationUrl: string | null = null;
+let _linkClickHandler: ((event: MouseEvent) => void) | null = null;
 // Cached from dynamic import so _hasErrors can use it at flush time
 let _EventType: {
   Custom: number;
@@ -143,6 +145,22 @@ interface SnapshotNodeLike {
   childNodes?: SnapshotNodeLike[];
 }
 
+type LinkActivationElement = HTMLAnchorElement | HTMLAreaElement;
+
+interface LinkActivationPayload {
+  href: string;
+  currentHref: string;
+  target?: string;
+  button: number;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  download: boolean;
+  sameOrigin: boolean;
+  sameDocument: boolean;
+  sourceEventAtMs: number;
+}
 
 function _getReplayWindow(): (Window & {
   [GLOBAL_REPLAY_STATE_KEY]?: ReplayGlobalState;
@@ -1072,6 +1090,130 @@ function _emitNavigation(): void {
   }
 }
 
+
+function _deferUntilClickPropagationSettles(callback: () => void): void {
+  try {
+    if (typeof queueMicrotask === 'function') {
+      queueMicrotask(callback);
+      return;
+    }
+    Promise.resolve().then(callback).catch(() => {});
+  } catch {
+    // Link activation capture is best-effort.
+  }
+}
+
+function _findActivatableLink(target: EventTarget | null): LinkActivationElement | null {
+  if (!(target instanceof Element)) return null;
+  const link = target.closest('a[href], area[href]');
+  if (!(link instanceof HTMLAnchorElement) && !(link instanceof HTMLAreaElement)) {
+    return null;
+  }
+  return link;
+}
+
+function _hasDisabledLinkMarker(link: LinkActivationElement): boolean {
+  const disabledMarker = link.closest('[disabled], [aria-disabled="true"]');
+  return disabledMarker !== null && disabledMarker.contains(link);
+}
+
+function _resolvedLinkUrl(link: LinkActivationElement): URL | null {
+  const rawHref = link.getAttribute('href')?.trim();
+  if (!rawHref || rawHref.toLowerCase().startsWith('javascript:')) return null;
+
+  try {
+    return new URL(link.href, location.href);
+  } catch {
+    return null;
+  }
+}
+
+function _buildLinkActivationPayload(
+  link: LinkActivationElement,
+  event: MouseEvent,
+  sourceEventAtMs: number,
+): LinkActivationPayload | null {
+  try {
+    if (typeof location === 'undefined' || _hasDisabledLinkMarker(link)) return null;
+    const linkUrl = _resolvedLinkUrl(link);
+    if (!linkUrl) return null;
+
+    const currentUrl = new URL(location.href);
+    const href = linkUrl.href;
+    const currentHref = currentUrl.href;
+    if (href === currentHref) return null;
+
+    const target = link.getAttribute('target')?.trim();
+    const payload: LinkActivationPayload = {
+      href,
+      currentHref,
+      button: event.button,
+      metaKey: event.metaKey,
+      ctrlKey: event.ctrlKey,
+      shiftKey: event.shiftKey,
+      altKey: event.altKey,
+      download: link.hasAttribute('download'),
+      sameOrigin: linkUrl.origin === currentUrl.origin,
+      sameDocument:
+        linkUrl.origin === currentUrl.origin &&
+        linkUrl.pathname === currentUrl.pathname &&
+        linkUrl.search === currentUrl.search,
+      sourceEventAtMs,
+    };
+    if (target) payload.target = target;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function _emitLinkActivation(payload: LinkActivationPayload): void {
+  try {
+    _record?.addCustomEvent(LINK_ACTIVATION_TAG, payload);
+  } catch {
+    // Link activation capture is best-effort.
+  }
+}
+
+function _startLinkActivationWatcher(): void {
+  if (typeof document === 'undefined') return;
+  if (_isCrossOriginIframe()) return;
+  if (_linkClickHandler) return;
+
+  _linkClickHandler = (event: MouseEvent) => {
+    try {
+      const link = _findActivatableLink(event.target);
+      if (!link) return;
+      const payload = _buildLinkActivationPayload(link, event, Date.now());
+      if (!payload) return;
+
+      _deferUntilClickPropagationSettles(() => {
+        if (!event.defaultPrevented) _emitLinkActivation(payload);
+      });
+    } catch {
+      // Link activation capture is best-effort.
+    }
+  };
+
+  try {
+    document.addEventListener('click', _linkClickHandler, { capture: true });
+  } catch {
+    _linkClickHandler = null;
+  }
+}
+
+function _stopLinkActivationWatcher(): void {
+  try {
+    if (_linkClickHandler) {
+      document.removeEventListener('click', _linkClickHandler, { capture: true });
+    }
+  } catch {
+    // ignore, cleanup is best-effort
+  } finally {
+    _linkClickHandler = null;
+  }
+}
+
 // Marker carried by our history wrappers so a re-install can recover the genuine
 // original even when a prior teardown could not restore it (hardened host where
 // reassigning history.pushState throws). Without it, the next install would
@@ -1180,6 +1322,7 @@ export function stopReplay(): void {
     _unloadHandler = null;
   }
   _stopNavigationWatcher();
+  _stopLinkActivationWatcher();
   // Reset module state so _resolveSession starts clean on next startReplay.
   // Clearing the shared session id covers manual stop and the 429 daily-cap
   // stop (which routes through stopReplay) — errors captured after this point
@@ -1301,6 +1444,7 @@ export async function startReplay(
     _stopRecording = stop;
     _markReplayRecording();
     _startNavigationWatcher();
+    _startLinkActivationWatcher();
 
     // Recording is genuinely active: errors that fired during the replay
     // module's dynamic import are still queued (10s flush) with a null session

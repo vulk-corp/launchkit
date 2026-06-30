@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.14.5] - 2026-06-30
+
+### Added
+
+- **Link activation replay intent**: session replay now records navigable link clicks as `link_activation` custom events with the clicked `href`, current URL, target, modifiers, download flag, same-origin/same-document classification, and click timestamp. Backend classifiers can count these as navigation reactions without polluting page views or guessing from end-of-session timelines.
+
 ## [1.14.4] - 2026-06-30
 
 ### Fixed
