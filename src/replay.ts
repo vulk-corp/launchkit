@@ -123,6 +123,8 @@ interface ReplayChunk {
 }
 
 interface StoredBootstrapChunk {
+  buildSlug: string;
+  apiEndpoint: string;
   sessionId: string;
   sequenceNumber: 0;
   events: eventWithTime[];
@@ -304,31 +306,47 @@ function _loadSession(): StoredSession | null {
   }
 }
 
+function _removeStoredBootstrapChunk(): void {
+  try {
+    sessionStorage.removeItem(BOOTSTRAP_STORAGE_KEY);
+  } catch {
+    // sessionStorage unavailable. Not fatal.
+  }
+}
+
 function _loadStoredBootstrapChunk(now = Date.now()): StoredBootstrapChunk | null {
   try {
     const raw = sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY);
     if (!raw) return null;
     const stored = JSON.parse(raw) as Partial<StoredBootstrapChunk>;
+    const events = stored.events;
+    const hasMatchingContext =
+      stored.buildSlug === _buildSlug && stored.apiEndpoint === _apiEndpoint;
     if (
+      !hasMatchingContext ||
       typeof stored.sessionId !== 'string' ||
       stored.sequenceNumber !== 0 ||
-      !Array.isArray(stored.events) ||
+      !Array.isArray(events) ||
+      !_hasFullSnapshot(events as eventWithTime[]) ||
       typeof stored.createdAt !== 'number' ||
       now - stored.createdAt >= IDLE_TIMEOUT_MS
     ) {
-      sessionStorage.removeItem(BOOTSTRAP_STORAGE_KEY);
+      _removeStoredBootstrapChunk();
       return null;
     }
     return stored as StoredBootstrapChunk;
   } catch {
+    _removeStoredBootstrapChunk();
     return null;
   }
 }
 
 function _saveStoredBootstrapChunk(chunk: ReplayChunk): void {
-  if (chunk.sequenceNumber !== 0) return;
+  if (chunk.sequenceNumber !== 0 || !_buildSlug || !_apiEndpoint) return;
   try {
     const stored: StoredBootstrapChunk = {
+      buildSlug: _buildSlug,
+      apiEndpoint: _apiEndpoint,
       sessionId: chunk.sessionId,
       sequenceNumber: 0,
       events: chunk.events,
@@ -346,7 +364,7 @@ function _clearStoredBootstrapChunk(sessionId?: string): void {
       const stored = _loadStoredBootstrapChunk();
       if (stored && stored.sessionId !== sessionId) return;
     }
-    sessionStorage.removeItem(BOOTSTRAP_STORAGE_KEY);
+    _removeStoredBootstrapChunk();
   } catch {
     // sessionStorage unavailable. Not fatal.
   }
@@ -412,17 +430,17 @@ function _resolveSession(): boolean {
     const ageMs = now - stored.startedAt;
 
     if (idleMs < IDLE_TIMEOUT_MS && ageMs < MAX_SESSION_MS) {
-      if (stored.seq > 0 && stored.firstChunkAcked !== true) {
-        if (storedBootstrap?.sessionId !== stored.id) {
-          _openNewSession(now);
-          return true;
-        }
+      if (stored.firstChunkAcked !== true && storedBootstrap?.sessionId === stored.id) {
         _sessionId = stored.id;
         _sequenceNumber = Math.max(stored.seq, 1);
         _sessionStartedAt = stored.startedAt;
         _firstChunkAcked = false;
         setReplaySessionId(_sessionId);
         return false;
+      }
+      if (stored.seq > 0 && stored.firstChunkAcked !== true) {
+        _openNewSession(now);
+        return true;
       }
       _sessionId = stored.id;
       _sequenceNumber = stored.seq;
@@ -854,7 +872,10 @@ async function _uploadReservedChunks(chunks: ReplayChunk[]): Promise<ReplayChunk
     const isActiveFirstChunk =
       chunk.sequenceNumber === 0 && chunk.sessionId === _sessionId;
     if (result === 'retry') {
-      if (isActiveFirstChunk && _registerFirstChunkFailure()) continue;
+      if (isActiveFirstChunk && _registerFirstChunkFailure()) {
+        _clearStoredBootstrapChunk(chunk.sessionId);
+        continue;
+      }
       return chunks.slice(i);
     }
     if (result === 'dropped' && chunk.sequenceNumber === 0) {
@@ -880,13 +901,25 @@ async function _flush(_isFinal = false): Promise<void> {
   if (_pendingChunks.length === 0 && _eventBuffer.length === 0) return;
   _flushing = true;
   try {
+    let deferredPendingChunks: ReplayChunk[] = [];
     if (_pendingChunks.length > 0) {
       const chunks = _pendingChunks.splice(0);
-      const failed = await _uploadReservedChunks(chunks);
-      if (failed.length > 0 && _sessionId === sessionId) {
-        _pendingChunks.unshift(...failed);
+      const currentChunks = chunks.filter((chunk) => chunk.sessionId === sessionId);
+      deferredPendingChunks = chunks.filter((chunk) => chunk.sessionId !== sessionId);
+      if (currentChunks.length > 0) {
+        const failed = await _uploadReservedChunks(currentChunks);
+        if (_sessionId === sessionId) {
+          _pendingChunks.unshift(...failed, ...deferredPendingChunks);
+        }
+        return;
       }
-      return;
+      if (_eventBuffer.length === 0) {
+        const failed = await _uploadReservedChunks(deferredPendingChunks);
+        if (failed.length > 0 && _sessionId === sessionId) {
+          _pendingChunks.unshift(...failed);
+        }
+        return;
+      }
     }
 
     const events = _eventBuffer.splice(0);
@@ -894,13 +927,14 @@ async function _flush(_isFinal = false): Promise<void> {
     if (!chunks) {
       if (_sessionId === sessionId) {
         _eventBuffer.unshift(...events);
+        _pendingChunks.unshift(...deferredPendingChunks);
       }
       return;
     }
 
     const failed = await _uploadReservedChunks(chunks);
-    if (failed.length > 0 && _sessionId === sessionId) {
-      _pendingChunks.unshift(...failed);
+    if (_sessionId === sessionId) {
+      _pendingChunks.unshift(...failed, ...deferredPendingChunks);
     }
   } finally {
     _flushing = false;

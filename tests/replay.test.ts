@@ -91,8 +91,16 @@ function readStoredSession(): StoredSession {
   return JSON.parse(sessionStorage.getItem(STORAGE_KEY)!) as StoredSession;
 }
 
-function readStoredBootstrap(): { sessionId: string; sequenceNumber: 0; events: unknown[] } {
+function readStoredBootstrap(): {
+  buildSlug: string;
+  apiEndpoint: string;
+  sessionId: string;
+  sequenceNumber: 0;
+  events: unknown[];
+} {
   return JSON.parse(sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY)!) as {
+    buildSlug: string;
+    apiEndpoint: string;
     sessionId: string;
     sequenceNumber: 0;
     events: unknown[];
@@ -419,6 +427,37 @@ describe('session rotation', () => {
     );
     expect(latestBody.sessionId).toBe(newSessionId);
     expect(latestBody.sequenceNumber).toBe(0);
+  });
+
+  it('does not let failed chunks from a rotated session block the active session', async () => {
+    visibilityState = 'hidden';
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'old-bootstrap' } });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await flushMicrotasks();
+    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'old-tail' } });
+
+    hoisted.takeFullSnapshot.mockImplementation(() => {});
+    fetchMock
+      .mockResolvedValueOnce({ ok: false, status: 500 } as Response)
+      .mockResolvedValue(okResponse());
+
+    setNow(START_NOW + IDLE_TIMEOUT_MS + 1_000);
+    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'new-before-snapshot' } });
+    await flushMicrotasks();
+
+    const newSessionId = readStoredSession().id;
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'new-bootstrap' } });
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    const latestBody = parseFetchBody(fetchMock.mock.calls[2]);
+    expect(latestBody.sessionId).toBe(newSessionId);
+    expect(latestBody.sequenceNumber).toBe(0);
+    expect(latestBody.events).toMatchObject([
+      { type: 2, data: { marker: 'new-bootstrap' } },
+    ]);
   });
 
   it('does not rotate when emit fires under the idle threshold', async () => {
@@ -1011,6 +1050,8 @@ describe('sequence reservation', () => {
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
 
     const storedBootstrap = readStoredBootstrap();
+    expect(storedBootstrap.buildSlug).toBe(BUILD_SLUG);
+    expect(storedBootstrap.apiEndpoint).toBe(API_ENDPOINT);
     expect(storedBootstrap.sessionId).toBe(sessionId);
     expect(storedBootstrap.sequenceNumber).toBe(0);
     expect(storedBootstrap.events).toMatchObject([
@@ -1037,6 +1078,8 @@ describe('sequence reservation', () => {
     sessionStorage.setItem(
       BOOTSTRAP_STORAGE_KEY,
       JSON.stringify({
+        buildSlug: BUILD_SLUG,
+        apiEndpoint: API_ENDPOINT,
         sessionId: 'persisted-session',
         sequenceNumber: 0,
         createdAt: START_NOW - 500,
@@ -1056,6 +1099,105 @@ describe('sequence reservation', () => {
     expect(readStoredSession().id).toBe('persisted-session');
     expect(readStoredSession().seq).toBe(1);
     expect(readStoredSession().firstChunkAcked).toBe(true);
+    expect(sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY)).toBeNull();
+  });
+
+  it('keeps sequence numbers monotone when stored session seq is stale', async () => {
+    visibilityState = 'hidden';
+    sessionStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        id: 'persisted-session',
+        seq: 0,
+        startedAt: START_NOW - 1_000,
+        lastActivityAt: START_NOW - 500,
+        firstChunkAcked: false,
+      }),
+    );
+    sessionStorage.setItem(
+      BOOTSTRAP_STORAGE_KEY,
+      JSON.stringify({
+        buildSlug: BUILD_SLUG,
+        apiEndpoint: API_ENDPOINT,
+        sessionId: 'persisted-session',
+        sequenceNumber: 0,
+        createdAt: START_NOW - 500,
+        events: [{ type: 2, timestamp: START_NOW - 500, data: { marker: 'persisted' } }],
+      }),
+    );
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await flushMicrotasks();
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'after-restore' } });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(parseFetchBody(fetchMock.mock.calls[1]).sequenceNumber).toBe(1);
+    expect(readStoredSession().seq).toBe(2);
+  });
+
+  it('ignores stored bootstrap chunks from another build context', async () => {
+    visibilityState = 'hidden';
+    sessionStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        id: 'persisted-session',
+        seq: 1,
+        startedAt: START_NOW - 1_000,
+        lastActivityAt: START_NOW - 500,
+        firstChunkAcked: false,
+      }),
+    );
+    sessionStorage.setItem(
+      BOOTSTRAP_STORAGE_KEY,
+      JSON.stringify({
+        buildSlug: 'other-build',
+        apiEndpoint: API_ENDPOINT,
+        sessionId: 'persisted-session',
+        sequenceNumber: 0,
+        createdAt: START_NOW - 500,
+        events: [{ type: 2, timestamp: START_NOW - 500, data: { marker: 'persisted' } }],
+      }),
+    );
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(readStoredSession().id).not.toBe('persisted-session');
+    expect(sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY)).toBeNull();
+  });
+
+  it('ignores stored bootstrap chunks without a FullSnapshot', async () => {
+    visibilityState = 'hidden';
+    sessionStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        id: 'persisted-session',
+        seq: 1,
+        startedAt: START_NOW - 1_000,
+        lastActivityAt: START_NOW - 500,
+        firstChunkAcked: false,
+      }),
+    );
+    sessionStorage.setItem(
+      BOOTSTRAP_STORAGE_KEY,
+      JSON.stringify({
+        buildSlug: BUILD_SLUG,
+        apiEndpoint: API_ENDPOINT,
+        sessionId: 'persisted-session',
+        sequenceNumber: 0,
+        createdAt: START_NOW - 500,
+        events: [{ type: 4, timestamp: START_NOW - 500, data: { href: 'https://app.test' } }],
+      }),
+    );
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(readStoredSession().id).not.toBe('persisted-session');
     expect(sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY)).toBeNull();
   });
 
@@ -1191,6 +1333,7 @@ describe('sequence reservation', () => {
       await flushMicrotasks();
       expect(fetchMock).toHaveBeenCalledTimes(attempt);
     }
+    expect(sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY)).toBeNull();
 
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'telemetry-only' } });
     document.dispatchEvent(new Event('visibilitychange'));

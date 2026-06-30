@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.14.4] - 2026-06-30
+
+### Fixed
+
+- **Replay bootstrap persistence hardening**: stored bootstrap chunks are now bound to their build and API endpoint, validated to contain a FullSnapshot, cleared after retry exhaustion, restored with monotone sequence numbers, and no longer block active-session uploads behind stale rotated chunks.
+
 ## [1.14.3] - 2026-06-30
 
 ### Fixed
