@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.14.6] - 2026-06-30
+
+### Added
+
+- **Replay upload diagnostics**: replay chunk upload failures now emit `sdk-replay` diagnostics through telemetry errors with session id, sequence number, attempt, failure reason, HTTP status, payload sizes, transport, FullSnapshot presence, event count, and SDK version. Sequence 0 remains exhaustively reported because it gates video replay, while later chunk retries are sampled to keep outage volume bounded.
+
 ## [1.14.5] - 2026-06-30
 
 ### Added

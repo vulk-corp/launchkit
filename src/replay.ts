@@ -13,9 +13,12 @@
 
 import type { eventWithTime, record as rrwebRecord } from 'rrweb';
 import { setReplaySessionId } from './session-state';
+import { sendTelemetry } from './telemetry-sender';
 import { getVisitorId } from './visitor-state';
 import { generateUuid } from './uuid';
 import { backstampQueuedErrors, unstampQueuedErrors } from './error-capture';
+
+declare const __SDK_VERSION__: string;
 
 const SDK_TAG = '[@bworlds/launchkit]';
 const FLUSH_INTERVAL_MS = 10_000;
@@ -96,6 +99,7 @@ let _userAgent: string | null = null;
 let _firstChunkAcked = false;
 let _firstChunkAttempts = 0;
 let _firstChunkRetryAfter = 0;
+const _chunkFailureAttempts = new Map<string, number>();
 let _viteDevCssFullSnapshotSeen = false;
 let _viteDevCssSnapshotRetryScheduled = false;
 const _instanceId = generateUuid();
@@ -692,7 +696,28 @@ function _reserveChunksForEvents(
   return chunks;
 }
 
-type UploadResult = 'ok' | 'retry' | 'dropped';
+type ReplayChunkDiagnosticReason =
+  | 'http_retry'
+  | 'network_retry'
+  | 'body_too_large'
+  | 'beacon_body_too_large'
+  | 'beacon_not_queued'
+  | 'retry_budget_exhausted';
+
+type UploadResult =
+  | { status: 'ok' }
+  | ({ status: 'retry' | 'dropped' } & ReplayChunkDiagnosticDetails);
+
+type ReplayTransport = 'fetch' | 'beacon';
+
+type ReplayChunkDiagnosticDetails = {
+  reason: ReplayChunkDiagnosticReason;
+  httpStatus?: number;
+  rawBytes: number;
+  compressedBytes: number | null;
+  transport: ReplayTransport;
+  hasFullSnapshot: boolean;
+};
 
 type ReplayRequestBody = {
   body: BodyInit;
@@ -714,6 +739,103 @@ function _serializeChunk(chunk: ReplayChunk): SerializedChunk {
   // TextEncoder always returns a plain (non-shared) ArrayBuffer-backed view.
   const bytes = new TextEncoder().encode(payload) as Uint8Array<ArrayBuffer>;
   return { payload, bytes, rawBytes: bytes.byteLength };
+}
+
+function _sdkVersion(): string {
+  return typeof __SDK_VERSION__ !== 'undefined' ? __SDK_VERSION__ : 'unknown';
+}
+
+function _compressedBytes(requestBody: ReplayRequestBody): number | null {
+  return requestBody.headers['Content-Encoding'] === GZIP_ENCODING
+    ? requestBody.bodyBytes
+    : null;
+}
+
+function _replayChunkDiagnosticDetails(
+  chunk: ReplayChunk,
+  rawBytes: number,
+  compressedBytes: number | null,
+  transport: ReplayTransport,
+  reason: ReplayChunkDiagnosticReason,
+  httpStatus?: number,
+): ReplayChunkDiagnosticDetails {
+  return {
+    reason,
+    ...(httpStatus !== undefined && { httpStatus }),
+    rawBytes,
+    compressedBytes,
+    transport,
+    hasFullSnapshot: _hasFullSnapshot(chunk.events),
+  };
+}
+
+function _chunkFailureKey(chunk: ReplayChunk): string {
+  return `${chunk.sessionId}:${chunk.sequenceNumber}`;
+}
+
+function _nextChunkFailureAttempt(chunk: ReplayChunk): number {
+  const key = _chunkFailureKey(chunk);
+  const attempt = (_chunkFailureAttempts.get(key) ?? 0) + 1;
+  _chunkFailureAttempts.set(key, attempt);
+  return attempt;
+}
+
+function _clearChunkFailureAttempt(chunk: ReplayChunk): void {
+  _chunkFailureAttempts.delete(_chunkFailureKey(chunk));
+}
+
+function _nextDiagnosticAttempt(chunk: ReplayChunk): number {
+  return chunk.sequenceNumber === 0 && chunk.sessionId === _sessionId
+    ? _firstChunkAttempts + 1
+    : _nextChunkFailureAttempt(chunk);
+}
+
+function _shouldSendReplayChunkDiagnostic(
+  chunk: ReplayChunk,
+  attempt: number,
+  reason: ReplayChunkDiagnosticReason,
+): boolean {
+  if (chunk.sequenceNumber === 0) return true;
+  if (reason !== 'http_retry' && reason !== 'network_retry') return true;
+  return attempt === 1 || attempt === 3 || attempt === 5 || attempt % 10 === 0;
+}
+
+function _sendReplayChunkDiagnostic(
+  chunk: ReplayChunk,
+  attempt: number,
+  details: ReplayChunkDiagnosticDetails,
+): void {
+  if (!_buildSlug) return;
+  if (!_shouldSendReplayChunkDiagnostic(chunk, attempt, details.reason)) return;
+
+  sendTelemetry('/api/telemetry/errors', {
+    buildSlug: _buildSlug,
+    errors: [
+      {
+        message: `Replay chunk ${details.reason}`,
+        stack: null,
+        url: null,
+        source: 'sdk-replay',
+        sessionId: chunk.sessionId,
+        capturedAt: Date.now(),
+        metadata: {
+          diagnostic: 'replay_chunk',
+          sessionId: chunk.sessionId,
+          sequenceNumber: chunk.sequenceNumber,
+          isBootstrap: chunk.sequenceNumber === 0,
+          attempt,
+          reason: details.reason,
+          httpStatus: details.httpStatus ?? null,
+          rawBytes: details.rawBytes,
+          compressedBytes: details.compressedBytes,
+          transport: details.transport,
+          hasFullSnapshot: details.hasFullSnapshot,
+          eventCount: chunk.events.length,
+          sdkVersion: _sdkVersion(),
+        },
+      },
+    ],
+  });
 }
 
 async function _gzipBody(bytes: Uint8Array<ArrayBuffer>): Promise<ArrayBuffer | null> {
@@ -780,7 +902,9 @@ async function _buildReplayRequestBody(
 }
 
 async function _postChunk(chunk: ReplayChunk): Promise<UploadResult> {
-  if (!_buildSlug || !_apiEndpoint || chunk.events.length === 0) return 'ok';
+  if (!_buildSlug || !_apiEndpoint || chunk.events.length === 0) {
+    return { status: 'ok' };
+  }
 
   const serialized = _serializeChunk(chunk);
   // Small chunks (the common case) keep a synchronous raw path so the upload
@@ -794,7 +918,16 @@ async function _postChunk(chunk: ReplayChunk): Promise<UploadResult> {
     // A single rrweb event over the transport cap even after gzip should not
     // happen in practice; surface it as an error, not routine noise.
     _logReplayChunkDropped(requestBody.bodyBytes, 'fetch');
-    return 'dropped'; // not retryable
+    return {
+      status: 'dropped',
+      ..._replayChunkDiagnosticDetails(
+        chunk,
+        serialized.rawBytes,
+        _compressedBytes(requestBody),
+        'fetch',
+        'body_too_large',
+      ),
+    };
   }
 
   try {
@@ -810,23 +943,42 @@ async function _postChunk(chunk: ReplayChunk): Promise<UploadResult> {
         `${SDK_TAG} Session replay daily cap reached. Recording stopped.`,
       );
       stopReplay();
-      return 'ok'; // not retryable
+      return { status: 'ok' }; // not retryable
     }
 
     if (!resp.ok) {
       console.warn(
         `${SDK_TAG} Replay chunk upload failed (HTTP ${resp.status}).`,
       );
-      return 'retry';
+      return {
+        status: 'retry',
+        ..._replayChunkDiagnosticDetails(
+          chunk,
+          serialized.rawBytes,
+          _compressedBytes(requestBody),
+          'fetch',
+          'http_retry',
+          resp.status,
+        ),
+      };
     }
 
-    return 'ok';
+    return { status: 'ok' };
   } catch (err: unknown) {
     console.warn(
       `${SDK_TAG} Replay chunk upload failed (network error).`,
       err,
     );
-    return 'retry';
+    return {
+      status: 'retry',
+      ..._replayChunkDiagnosticDetails(
+        chunk,
+        serialized.rawBytes,
+        _compressedBytes(requestBody),
+        'fetch',
+        'network_retry',
+      ),
+    };
   }
 }
 
@@ -889,23 +1041,36 @@ async function _uploadReservedChunks(chunks: ReplayChunk[]): Promise<ReplayChunk
     // not spend the new session's attempt budget.
     const isActiveFirstChunk =
       chunk.sequenceNumber === 0 && chunk.sessionId === _sessionId;
-    if (result === 'retry') {
+    if (result.status === 'retry') {
+      const attempt = _nextDiagnosticAttempt(chunk);
+      _sendReplayChunkDiagnostic(chunk, attempt, result);
       if (isActiveFirstChunk && _registerFirstChunkFailure()) {
+        _sendReplayChunkDiagnostic(chunk, FIRST_CHUNK_MAX_ATTEMPTS, {
+          ...result,
+          reason: 'retry_budget_exhausted',
+        });
         _clearStoredBootstrapChunk(chunk.sessionId);
         continue;
       }
       return chunks.slice(i);
     }
-    if (result === 'dropped' && chunk.sequenceNumber === 0) {
-      _clearStoredBootstrapChunk(chunk.sessionId);
-      if (isActiveFirstChunk) {
-        console.warn(
-          `${SDK_TAG} Replay session is continuing without its first chunk. Replay video may be unavailable.`,
-        );
+    if (result.status === 'dropped') {
+      _sendReplayChunkDiagnostic(chunk, _nextDiagnosticAttempt(chunk), result);
+      _clearChunkFailureAttempt(chunk);
+      if (chunk.sequenceNumber === 0) {
+        _clearStoredBootstrapChunk(chunk.sessionId);
+        if (isActiveFirstChunk) {
+          console.warn(
+            `${SDK_TAG} Replay session is continuing without its first chunk. Replay video may be unavailable.`,
+          );
+        }
       }
       continue;
     }
-    if (result === 'ok') _markFirstChunkAcked(chunk);
+    if (result.status === 'ok') {
+      _clearChunkFailureAttempt(chunk);
+      _markFirstChunkAcked(chunk);
+    }
   }
   return [];
 }
@@ -967,6 +1132,17 @@ function _beaconPostChunk(chunk: ReplayChunk): boolean {
   // raw size gate is the correct one for the plain JSON body actually sent.
   if (rawBytes > MAX_CHUNK_BYTES) {
     _logReplayChunkDropped(rawBytes, 'beacon');
+    _sendReplayChunkDiagnostic(
+      chunk,
+      _nextDiagnosticAttempt(chunk),
+      _replayChunkDiagnosticDetails(
+        chunk,
+        rawBytes,
+        null,
+        'beacon',
+        'beacon_body_too_large',
+      ),
+    );
     return false;
   }
 
@@ -978,6 +1154,19 @@ function _beaconPostChunk(chunk: ReplayChunk): boolean {
     console.warn(
       `${SDK_TAG} Replay final upload was not queued by the browser (${_chunkSizeLabel(rawBytes)}). Recent replay events may be missing.`,
     );
+    _sendReplayChunkDiagnostic(
+      chunk,
+      _nextDiagnosticAttempt(chunk),
+      _replayChunkDiagnosticDetails(
+        chunk,
+        rawBytes,
+        null,
+        'beacon',
+        'beacon_not_queued',
+      ),
+    );
+  } else {
+    _clearChunkFailureAttempt(chunk);
   }
   return queued;
 }
@@ -1343,6 +1532,7 @@ export function stopReplay(): void {
   _firstChunkAcked = false;
   _firstChunkAttempts = 0;
   _firstChunkRetryAfter = 0;
+  _chunkFailureAttempts.clear();
   _viteDevCssFullSnapshotSeen = false;
   _viteDevCssSnapshotRetryScheduled = false;
   _releaseReplayLock();

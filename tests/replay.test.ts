@@ -211,6 +211,25 @@ function lastFlushedErrors(): Array<{ sessionId: string | null; capturedAt: numb
   return payload.errors;
 }
 
+function replayDiagnostics(): Array<{
+  source: string;
+  sessionId: string;
+  metadata: Record<string, unknown>;
+}> {
+  return mockSendTelemetry.mock.calls
+    .filter(([path]) => path === '/api/telemetry/errors')
+    .flatMap(([, payload]) => {
+      const body = payload as {
+        errors: Array<{
+          source: string;
+          sessionId: string;
+          metadata: Record<string, unknown>;
+        }>;
+      };
+      return body.errors.filter((error) => error.source === 'sdk-replay');
+    });
+}
+
 let visibilityState: DocumentVisibilityState = 'visible';
 let originalVisibilityDescriptor: PropertyDescriptor | undefined;
 let originalSendBeaconDescriptor: PropertyDescriptor | undefined;
@@ -856,6 +875,68 @@ describe('sequence reservation', () => {
     expect(parseFetchBody(fetchMock.mock.calls[1]).sequenceNumber).toBe(0);
   });
 
+  it('rate-limits retry diagnostics for later chunks', async () => {
+    visibilityState = 'hidden';
+    fetchMock.mockReset();
+    fetchMock
+      .mockResolvedValueOnce(okResponse())
+      .mockResolvedValueOnce({ ok: false, status: 503 } as Response)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as Response)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as Response)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as Response)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as Response)
+      .mockResolvedValue(okResponse());
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    const sessionId = readStoredSession().id;
+
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await flushMicrotasks();
+    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'later' } });
+
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(attempt + 1));
+      await flushMicrotasks();
+    }
+
+    expect(replayDiagnostics()).toMatchObject([
+      {
+        sessionId,
+        metadata: {
+          diagnostic: 'replay_chunk',
+          sessionId,
+          sequenceNumber: 1,
+          isBootstrap: false,
+          attempt: 1,
+          reason: 'http_retry',
+          httpStatus: 503,
+          rawBytes: expect.any(Number),
+          compressedBytes: null,
+          transport: 'fetch',
+          hasFullSnapshot: false,
+          sdkVersion: expect.any(String),
+        },
+      },
+      {
+        sessionId,
+        metadata: { sequenceNumber: 1, isBootstrap: false, attempt: 3 },
+      },
+      {
+        sessionId,
+        metadata: { sequenceNumber: 1, isBootstrap: false, attempt: 5 },
+      },
+    ]);
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(7));
+
+    warnSpy.mockRestore();
+  });
+
   it('continues the session when the first chunk is dropped', async () => {
     visibilityState = 'hidden';
     vi.stubGlobal('CompressionStream', undefined);
@@ -878,6 +959,23 @@ describe('sequence reservation', () => {
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
     expect(readStoredSession().id).toBe(sessionId);
     expect(readStoredSession().seq).toBe(1);
+    expect(replayDiagnostics()).toMatchObject([
+      {
+        sessionId,
+        metadata: {
+          diagnostic: 'replay_chunk',
+          sessionId,
+          sequenceNumber: 0,
+          attempt: 1,
+          reason: 'body_too_large',
+          rawBytes: expect.any(Number),
+          compressedBytes: null,
+          transport: 'fetch',
+          hasFullSnapshot: true,
+          sdkVersion: expect.any(String),
+        },
+      },
+    ]);
 
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'telemetry-only' } });
     document.dispatchEvent(new Event('visibilitychange'));
@@ -1334,6 +1432,49 @@ describe('sequence reservation', () => {
       expect(fetchMock).toHaveBeenCalledTimes(attempt);
     }
     expect(sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY)).toBeNull();
+    expect(replayDiagnostics()).toMatchObject([
+      {
+        sessionId,
+        metadata: {
+          sequenceNumber: 0,
+          attempt: 1,
+          reason: 'http_retry',
+          httpStatus: 500,
+          transport: 'fetch',
+          hasFullSnapshot: true,
+        },
+      },
+      {
+        sessionId,
+        metadata: { attempt: 2, reason: 'http_retry', httpStatus: 500 },
+      },
+      {
+        sessionId,
+        metadata: { attempt: 3, reason: 'http_retry', httpStatus: 500 },
+      },
+      {
+        sessionId,
+        metadata: { attempt: 4, reason: 'http_retry', httpStatus: 500 },
+      },
+      {
+        sessionId,
+        metadata: { attempt: 5, reason: 'http_retry', httpStatus: 500 },
+      },
+      {
+        sessionId,
+        metadata: {
+          sequenceNumber: 0,
+          attempt: 5,
+          reason: 'retry_budget_exhausted',
+          httpStatus: 500,
+          rawBytes: expect.any(Number),
+          compressedBytes: null,
+          transport: 'fetch',
+          hasFullSnapshot: true,
+          sdkVersion: expect.any(String),
+        },
+      },
+    ]);
 
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'telemetry-only' } });
     document.dispatchEvent(new Event('visibilitychange'));
