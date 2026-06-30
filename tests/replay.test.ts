@@ -871,6 +871,23 @@ describe('sequence reservation', () => {
     expect(CompressionStreamMock).not.toHaveBeenCalled();
   });
 
+  it('drops unusable incremental events before the initial FullSnapshot', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 0 } });
+    emit!({ type: 4, timestamp: Date.now(), data: { href: 'https://app.test' } });
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const body = parseFetchBody(fetchMock.mock.calls[0]);
+    expect(body.sequenceNumber).toBe(0);
+    expect(body.events).toMatchObject([
+      { type: 4 },
+      { type: 2, data: { marker: 'initial' } },
+    ]);
+  });
+
   it('uploads a compressed oversized first chunk when gzip fits the transport budget', async () => {
     visibilityState = 'hidden';
     const pipeThrough = vi.fn(() => 'compressed-stream');
@@ -918,6 +935,52 @@ describe('sequence reservation', () => {
     expect(readStoredSession().id).toBe(sessionId);
     expect(readStoredSession().firstChunkAcked).toBe(true);
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
+  });
+
+  it('keeps the initial Meta and oversized FullSnapshot in the same gzip chunk', async () => {
+    visibilityState = 'hidden';
+    const pipeThrough = vi.fn(() => 'compressed-stream');
+    Object.defineProperty(Blob.prototype, 'stream', {
+      configurable: true,
+      value: vi.fn(() => ({ pipeThrough })),
+    });
+    vi.stubGlobal(
+      'CompressionStream',
+      class FakeCompressionStream {} as unknown as typeof CompressionStream,
+    );
+    vi.stubGlobal(
+      'Response',
+      class FakeResponse {
+        constructor(readonly body: unknown) {}
+        async arrayBuffer() {
+          return new Uint8Array([1, 2, 3]).buffer;
+        }
+      } as unknown as typeof Response,
+    );
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 4, timestamp: Date.now(), data: { href: 'https://app.test' } });
+    emit!({
+      type: 2,
+      timestamp: Date.now(),
+      data: { html: 'x'.repeat(520_000) },
+    });
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const init = fetchMock.mock.calls[0][1] as {
+      body: ArrayBuffer;
+      headers: Record<string, string>;
+    };
+
+    expect(init.headers).toMatchObject({
+      'Content-Type': 'application/json',
+      'Content-Encoding': 'gzip',
+    });
+    expect(init.body).toBeInstanceOf(ArrayBuffer);
+    expect(readStoredSession().seq).toBe(1);
+    expect(readStoredSession().firstChunkAcked).toBe(true);
   });
 
   it('uses raw JSON when gzip would make the chunk larger', async () => {

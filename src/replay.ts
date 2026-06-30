@@ -83,7 +83,11 @@ let _navOriginalReplaceState: History['replaceState'] | null = null;
 let _navPopstateHandler: (() => void) | null = null;
 let _lastNavigationUrl: string | null = null;
 // Cached from dynamic import so _hasErrors can use it at flush time
-let _EventType: { Custom: number; FullSnapshot?: number } | null = null;
+let _EventType: {
+  Custom: number;
+  FullSnapshot?: number;
+  IncrementalSnapshot?: number;
+} | null = null;
 // UA captured once on startReplay() — sent only on first chunk
 let _userAgent: string | null = null;
 let _firstChunkAcked = false;
@@ -409,6 +413,20 @@ function _hasFullSnapshot(events: eventWithTime[]): boolean {
   return events.some((event) => event.type === fullSnapshotType);
 }
 
+function _dropInitialIncrementalPreamble(events: eventWithTime[]): eventWithTime[] {
+  const fullSnapshotType = _EventType?.FullSnapshot ?? 2;
+  const incrementalType = _EventType?.IncrementalSnapshot ?? 3;
+  const fullSnapshotIndex = events.findIndex(
+    (event) => event.type === fullSnapshotType,
+  );
+  if (fullSnapshotIndex <= 0) return events;
+
+  const filtered = events.filter(
+    (event, index) => index >= fullSnapshotIndex || event.type !== incrementalType,
+  );
+  return filtered.length === events.length ? events : filtered;
+}
+
 function _buildPayload(
   events: eventWithTime[],
   sessionId: string,
@@ -463,7 +481,7 @@ function _splitPoint(events: eventWithTime[], sequenceNumber: number): number {
     const fullSnapshotIndex = events.findIndex(
       (event) => event.type === (_EventType?.FullSnapshot ?? 2),
     );
-    if (fullSnapshotIndex >= mid && fullSnapshotIndex < events.length - 1) {
+    if (fullSnapshotIndex >= mid) {
       mid = fullSnapshotIndex + 1;
     }
   }
@@ -480,6 +498,25 @@ function _planChunks(
     events.length <= 1
   ) {
     return [{ sessionId, sequenceNumber: firstSequenceNumber, events }];
+  }
+
+  if (firstSequenceNumber === 0) {
+    const fullSnapshotIndex = events.findIndex(
+      (event) => event.type === (_EventType?.FullSnapshot ?? 2),
+    );
+    if (fullSnapshotIndex >= 0) {
+      const bootstrapEnd = fullSnapshotIndex + 1;
+      const bootstrapChunk = {
+        sessionId,
+        sequenceNumber: firstSequenceNumber,
+        events: events.slice(0, bootstrapEnd),
+      };
+      if (bootstrapEnd >= events.length) return [bootstrapChunk];
+      return [
+        bootstrapChunk,
+        ..._planChunks(events.slice(bootstrapEnd), sessionId, firstSequenceNumber + 1),
+      ];
+    }
   }
 
   const mid = _splitPoint(events, firstSequenceNumber);
@@ -511,13 +548,15 @@ function _reserveChunksForEvents(
   if (events.length === 0) return [];
   if (_sequenceNumber === 0 && !_hasFullSnapshot(events)) return null;
 
-  const planned = _planChunks(events, sessionId, _sequenceNumber);
+  const normalizedEvents =
+    _sequenceNumber === 0 ? _dropInitialIncrementalPreamble(events) : events;
+  const planned = _planChunks(normalizedEvents, sessionId, _sequenceNumber);
   const firstSequenceNumber = _reserveSequenceRange(sessionId, planned.length);
   if (firstSequenceNumber === null) return null;
 
   return firstSequenceNumber === planned[0]?.sequenceNumber
     ? planned
-    : _planChunks(events, sessionId, firstSequenceNumber);
+    : _planChunks(normalizedEvents, sessionId, firstSequenceNumber);
 }
 
 type UploadResult = 'ok' | 'retry' | 'dropped';

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.14.2] - 2026-06-30
+
+### Fixed
+
+- **Replay bootstrap chunk integrity**: the first replay chunk now drops unusable incremental events before the initial FullSnapshot, keeps Meta and FullSnapshot together even for large gzip-compressible snapshots, and flushes the bootstrap chunk immediately via fetch instead of relying on unload delivery.
+
 ## [1.14.1] - 2026-06-30
 
 ### Fixed
