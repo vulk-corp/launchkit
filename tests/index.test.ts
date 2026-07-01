@@ -7,6 +7,8 @@ import type { CheckResult } from '../src/check';
 import { fetchRemoteConfig, readCachedGatingEnabled } from '../src/remote-config';
 import { startBadgeWidget } from '../src/badge-widget';
 import { startReplay } from '../src/replay';
+import { startReplayTelemetry } from '../src/replay-telemetry';
+import { setReplaySessionId } from '../src/session-state';
 
 vi.mock('../src/telemetry-sender', () => ({
   configureSender: vi.fn(),
@@ -27,9 +29,22 @@ vi.mock('../src/check', () => ({
   check: vi.fn().mockResolvedValue({ valid: true, email: null, accessType: 'free', expiresAt: null, degraded: false }),
 }));
 
-vi.mock('../src/replay', () => ({
-  startReplay: vi.fn().mockResolvedValue(undefined),
-  stopReplay: vi.fn(),
+vi.mock('../src/replay', async () => {
+  const { setReplaySessionId: publishSession } =
+    await vi.importActual<typeof import('../src/session-state')>('../src/session-state');
+  return {
+    // Real startReplay publishes the session id once rrweb records; mirror that so
+    // index only wires console/network telemetry when a session is actually live.
+    startReplay: vi.fn(async () => {
+      publishSession('replay-session-test');
+    }),
+    stopReplay: vi.fn(),
+  };
+});
+
+vi.mock('../src/replay-telemetry', () => ({
+  startReplayTelemetry: vi.fn(),
+  stopReplayTelemetry: vi.fn(),
 }));
 
 vi.mock('../src/remote-config', () => ({
@@ -62,6 +77,7 @@ beforeEach(() => {
   // Reset SDK state so _initialized is false for each test.
   stop();
   vi.clearAllMocks();
+  setReplaySessionId(null);
   document.getElementById('bworlds-gate-overlay')?.remove();
   mockFetchRemoteConfig.mockResolvedValue(null);
   // Default: cold cache -> gating enabled -> overlay mounts (fail-safe).
@@ -114,6 +130,75 @@ describe('init()', () => {
   it('fetches remote config', () => {
     init({ buildSlug: 'test-app', gate: false });
     expect(mockFetchRemoteConfig).toHaveBeenCalledWith('https://api.bworlds.co', 'test-app');
+  });
+
+  it('starts replay diagnostics and console/network telemetry by default with replay', async () => {
+    init({ buildSlug: 'test-app', gate: false });
+    await flushMicrotasks();
+
+    expect(startReplayTelemetry).toHaveBeenCalledWith('test-app', 'https://api.bworlds.co', {
+      consoleTelemetry: true,
+      networkTelemetry: true,
+    });
+    expect(startReplay).toHaveBeenCalledWith(
+      'test-app',
+      'https://api.bworlds.co',
+      expect.objectContaining({ enableReplayDiagnostics: true }),
+    );
+  });
+
+  it('passes local replay telemetry flags through activation', async () => {
+    init({
+      buildSlug: 'test-app',
+      gate: false,
+      enableReplayDiagnostics: false,
+      enableConsoleTelemetry: false,
+      enableNetworkTelemetry: false,
+    });
+    await flushMicrotasks();
+
+    expect(startReplayTelemetry).toHaveBeenCalledWith('test-app', 'https://api.bworlds.co', {
+      consoleTelemetry: false,
+      networkTelemetry: false,
+    });
+    expect(startReplay).toHaveBeenCalledWith(
+      'test-app',
+      'https://api.bworlds.co',
+      expect.objectContaining({ enableReplayDiagnostics: false }),
+    );
+  });
+
+  it('does not start replay telemetry when stop() runs during replay start', async () => {
+    let releaseStart!: () => void;
+    vi.mocked(startReplay).mockImplementationOnce(async () => {
+      setReplaySessionId('replay-session-test');
+      await new Promise<void>((resolve) => {
+        releaseStart = resolve;
+      });
+    });
+
+    init({ buildSlug: 'test-app', gate: false });
+    await vi.waitFor(() => expect(startReplay).toHaveBeenCalled());
+
+    stop(); // stop while startReplay is mid-flight
+    releaseStart(); // startReplay resolves after the stop
+    await flushMicrotasks();
+
+    expect(startReplayTelemetry).not.toHaveBeenCalled();
+  });
+
+  it('does not start replay telemetry when replay fails to record', async () => {
+    // rrweb load/record failure: startReplay returns without publishing a session
+    // id, so the console/network wrappers must not be installed.
+    vi.mocked(startReplay).mockImplementationOnce(async () => {
+      setReplaySessionId(null);
+    });
+
+    init({ buildSlug: 'test-app', gate: false });
+    await flushMicrotasks();
+
+    expect(startReplay).toHaveBeenCalled();
+    expect(startReplayTelemetry).not.toHaveBeenCalled();
   });
 
   it('stops heartbeat when remote config disables monitoring', async () => {

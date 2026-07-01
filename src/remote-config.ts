@@ -37,6 +37,12 @@ export interface SdkRemoteConfig {
    * Null means "no restriction" (fail-open for backward compat).
    */
   allowedOrigin: string | null;
+  /** Optional replay diagnostic kill switch. Absent means enabled. */
+  enableReplayDiagnostics?: boolean;
+  /** Optional console timeline telemetry kill switch. Absent means enabled with replay. */
+  enableConsoleTelemetry?: boolean;
+  /** Optional network timeline telemetry kill switch. Absent means enabled with replay. */
+  enableNetworkTelemetry?: boolean;
 }
 
 // Cache is cross-tab persistent (localStorage): survives tab close/reopen.

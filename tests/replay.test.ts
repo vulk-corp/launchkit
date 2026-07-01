@@ -211,22 +211,39 @@ function lastFlushedErrors(): Array<{ sessionId: string | null; capturedAt: numb
   return payload.errors;
 }
 
+function allReplayDiagnostics(): Array<Record<string, unknown> & { sessionId: string }> {
+  return mockSendTelemetry.mock.calls
+    .filter(([path]) => path === '/api/telemetry/replay-diagnostics')
+    .flatMap(([, payload]) => {
+      const body = payload as {
+        diagnostics: Array<Record<string, unknown> & { sessionId: string }>;
+      };
+      return body.diagnostics;
+    });
+}
+
 function replayDiagnostics(): Array<{
   source: string;
   sessionId: string;
   metadata: Record<string, unknown>;
 }> {
   return mockSendTelemetry.mock.calls
-    .filter(([path]) => path === '/api/telemetry/errors')
+    .filter(([path]) => path === '/api/telemetry/replay-diagnostics')
     .flatMap(([, payload]) => {
       const body = payload as {
-        errors: Array<{
-          source: string;
-          sessionId: string;
-          metadata: Record<string, unknown>;
-        }>;
+        diagnostics: Array<Record<string, unknown> & { sessionId: string }>;
       };
-      return body.errors.filter((error) => error.source === 'sdk-replay');
+      return body.diagnostics
+        .filter((diagnostic) => String(diagnostic.type).endsWith('_failed'))
+        .map((diagnostic) => ({
+          source: 'sdk-replay',
+          sessionId: diagnostic.sessionId,
+          metadata: {
+            diagnostic: 'replay_chunk',
+            isBootstrap: diagnostic.sequenceNumber === 0,
+            ...diagnostic,
+          },
+        }));
     });
 }
 
@@ -331,6 +348,60 @@ describe('record options', () => {
         },
       }),
     );
+  });
+
+  it('emits positive replay lifecycle diagnostics and upload metadata', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    const sessionId = readStoredSession().id;
+
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    expect(allReplayDiagnostics()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'session_started', sessionId, sdkVersion: expect.any(String) }),
+        expect.objectContaining({ type: 'recorder_started', sessionId, sdkVersion: expect.any(String) }),
+        expect.objectContaining({
+          type: 'bootstrap_reserved',
+          sessionId,
+          sequenceNumber: 0,
+          eventCount: 1,
+          hasFullSnapshot: true,
+        }),
+        expect.objectContaining({
+          type: 'bootstrap_upload_attempt',
+          sessionId,
+          sequenceNumber: 0,
+          transport: 'fetch',
+          rawBytes: expect.any(Number),
+          compressedBytes: null,
+          eventCount: 1,
+          hasFullSnapshot: true,
+        }),
+        expect.objectContaining({
+          type: 'bootstrap_upload_ok',
+          sessionId,
+          sequenceNumber: 0,
+          transport: 'fetch',
+          rawBytes: expect.any(Number),
+        }),
+      ]),
+    );
+
+    const payload = parseFetchBody(fetchMock.mock.calls[0]);
+    expect(payload).toEqual(
+      expect.objectContaining({
+        sdkVersion: expect.any(String),
+        transport: 'fetch',
+        isFirstChunk: true,
+        hasFullSnapshot: true,
+        rawBytes: expect.any(Number),
+        eventCount: 1,
+        sequenceNumber: 0,
+      }),
+    );
+    expect(payload).not.toHaveProperty('compressedBytes');
   });
 });
 
@@ -781,7 +852,7 @@ describe('sequence reservation', () => {
     expect(parseFetchBody(fetchMock.mock.calls[1]).sequenceNumber).toBe(1);
   });
 
-  it('uses the next sequenceNumber for beforeunload sendBeacon during the initial fetch', async () => {
+  it('uses the next sequenceNumber for pagehide sendBeacon during the initial fetch', async () => {
     visibilityState = 'hidden';
 
     let releaseFetch!: (value: Response) => void;
@@ -807,7 +878,7 @@ describe('sequence reservation', () => {
     document.dispatchEvent(new Event('visibilitychange'));
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'unload' } });
 
-    window.dispatchEvent(new Event('beforeunload'));
+    window.dispatchEvent(new Event('pagehide'));
 
     expect(parseFetchBody(fetchMock.mock.calls[0]).sequenceNumber).toBe(0);
     expect(sendBeaconMock).toHaveBeenCalledTimes(1);
@@ -1355,7 +1426,7 @@ describe('sequence reservation', () => {
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     await flushMicrotasks();
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'before-unload' } });
-    window.dispatchEvent(new Event('beforeunload'));
+    window.dispatchEvent(new Event('pagehide'));
 
     expect(sendBeaconMock).toHaveBeenCalledTimes(1);
     expect(warnSpy).toHaveBeenCalledWith(
@@ -1364,15 +1435,12 @@ describe('sequence reservation', () => {
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
     expect(readStoredSession().id).toBe(sessionId);
 
-    // The undelivered chunk stays queued under the same session and uploads on the
-    // next flush if the page survives the unload.
+    // No retry-in-place: a terminal pagehide is the page's last event, so the
+    // beacon-dropped chunk is not re-queued. A later flush finds nothing to send.
     visibilityState = 'hidden';
     document.dispatchEvent(new Event('visibilitychange'));
-
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    const body = parseFetchBody(fetchMock.mock.calls[1]);
-    expect(body.sessionId).toBe(sessionId);
-    expect(body.sequenceNumber).toBe(1);
+    await flushMicrotasks();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
 
     warnSpy.mockRestore();
   });
@@ -1395,7 +1463,7 @@ describe('sequence reservation', () => {
       timestamp: Date.now(),
       data: { html: 'x'.repeat(520_000) },
     });
-    window.dispatchEvent(new Event('beforeunload'));
+    window.dispatchEvent(new Event('pagehide'));
 
     expect(sendBeaconMock).not.toHaveBeenCalled();
     expect(warnSpy).toHaveBeenCalledWith(
@@ -1544,7 +1612,165 @@ describe('sequence reservation', () => {
   });
 });
 
+describe('unload transport', () => {
+  async function startWithBootstrap() {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit()!;
+    emit({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await flushMicrotasks();
+    return emit;
+  }
+
+  it('flushes on capture via the compressed fetch path when the buffer passes the soft byte cap', async () => {
+    const pipeThrough = vi.fn(() => 'compressed-stream');
+    Object.defineProperty(Blob.prototype, 'stream', {
+      configurable: true,
+      value: vi.fn(() => ({ pipeThrough })),
+    });
+    vi.stubGlobal(
+      'CompressionStream',
+      class FakeCompressionStream {} as unknown as typeof CompressionStream,
+    );
+    vi.stubGlobal(
+      'Response',
+      class FakeResponse {
+        constructor(readonly body: unknown) {}
+        async arrayBuffer() {
+          return new Uint8Array([1, 2, 3]).buffer;
+        }
+      } as unknown as typeof Response,
+    );
+
+    const emit = await startWithBootstrap();
+
+    // A heavy incremental event crosses FLUSH_SOFT_MAX_BYTES (0.9 MB); it must
+    // leave on the compressed fetch path at capture, with no page-hidden event
+    // and no timer, so it never accumulates into the unload residual.
+    emit({ type: 3, timestamp: Date.now(), data: { html: 'x'.repeat(950_000) } });
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(fetchMock.mock.calls[1][0]).toBe(`${API_ENDPOINT}/api/telemetry/replay-events`);
+    const init = fetchMock.mock.calls[1][1] as { headers: Record<string, string> };
+    expect(init.headers['Content-Encoding']).toBe('gzip');
+  });
+
+  it('flushes on capture when a mid-session FullSnapshot is re-checked out', async () => {
+    const emit = await startWithBootstrap();
+
+    emit({ type: 3, timestamp: Date.now(), data: { source: 2, marker: 'incremental' } });
+    // A re-checkout FullSnapshot mid-session (rrweb re-snapshots on tab return)
+    // must flush immediately, not wait for the timer or land in the beacon.
+    emit({ type: 2, timestamp: Date.now(), data: { marker: 're-checkout' } });
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const body = parseFetchBody(fetchMock.mock.calls[1]);
+    expect(body.sequenceNumber).toBe(1);
+    expect(body.hasFullSnapshot).toBe(true);
+  });
+
+  it('drops an unload residual above the beacon cap instead of handing it to sendBeacon', async () => {
+    const sendBeaconMock = vi.fn(() => true);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: sendBeaconMock,
+    });
+
+    const emit = await startWithBootstrap();
+
+    // ~120 KB residual: within the 512 KB fetch chunk cap but past the ~64 KiB
+    // sendBeacon limit, so pagehide must drop it rather than hand the browser a
+    // body it silently discards.
+    emit({ type: 3, timestamp: Date.now(), data: { html: 'x'.repeat(120_000) } });
+    window.dispatchEvent(new Event('pagehide'));
+
+    expect(sendBeaconMock).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Replay final upload is too large for unload delivery'),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it('beacons a residual within the beacon cap on a terminal pagehide', async () => {
+    const sendBeaconMock = vi.fn(() => true);
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: sendBeaconMock,
+    });
+
+    const emit = await startWithBootstrap();
+
+    emit({ type: 3, timestamp: Date.now(), data: { source: 2, marker: 'residual' } });
+    window.dispatchEvent(new Event('pagehide'));
+
+    expect(sendBeaconMock).toHaveBeenCalledTimes(1);
+    const body = await parseBeaconBody(sendBeaconMock.mock.calls[0]);
+    expect(body.sequenceNumber).toBe(1);
+  });
+
+  it('delivers the residual on a persisted pagehide (bfcache freeze)', async () => {
+    const sendBeaconMock = vi.fn(() => true);
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: sendBeaconMock,
+    });
+
+    const emit = await startWithBootstrap();
+
+    emit({ type: 3, timestamp: Date.now(), data: { source: 2, marker: 'residual' } });
+    // A bfcache-frozen page can be evicted without ever firing a resume, so the
+    // tail is beaconed now rather than kept buffered; sendBeacon does not block
+    // the page from entering bfcache.
+    const persistedPagehide = new Event('pagehide') as Event & { persisted?: boolean };
+    Object.defineProperty(persistedPagehide, 'persisted', { value: true });
+    window.dispatchEvent(persistedPagehide);
+
+    expect(sendBeaconMock).toHaveBeenCalledTimes(1);
+    const body = await parseBeaconBody(sendBeaconMock.mock.calls[0]);
+    expect(body.sequenceNumber).toBe(1);
+  });
+
+  it('delivers a ~61 KB residual that fits the raised beacon cap', async () => {
+    const sendBeaconMock = vi.fn(() => true);
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: sendBeaconMock,
+    });
+
+    const emit = await startWithBootstrap();
+
+    // ~61 KB: above the browser-conservative 60 KB the gate used before, still
+    // under the 64 KB sendBeacon limit, so it must be delivered, not dropped.
+    emit({ type: 3, timestamp: Date.now(), data: { html: 'x'.repeat(61_000) } });
+    window.dispatchEvent(new Event('pagehide'));
+
+    expect(sendBeaconMock).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('stopReplay cleanup', () => {
+  it('invokes onStopped when recording stops', async () => {
+    const onStopped = vi.fn();
+    await startReplay(BUILD_SLUG, API_ENDPOINT, { onStopped });
+
+    stopReplay();
+
+    expect(onStopped).toHaveBeenCalledTimes(1);
+  });
+
+  it('invokes onStopped when the daily-cap 429 stops recording', async () => {
+    const onStopped = vi.fn();
+    fetchMock.mockResolvedValue({ ok: false, status: 429 } as Response);
+    visibilityState = 'hidden';
+
+    await startReplay(BUILD_SLUG, API_ENDPOINT, { onStopped });
+    const emit = hoisted.getEmit();
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+
+    await vi.waitFor(() => expect(onStopped).toHaveBeenCalled());
+  });
+
   it('clears the rrweb record reference and last-event timestamp', async () => {
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();

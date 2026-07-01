@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.15.0] - 2026-07-01
+
+### Added
+
+- **Replay audit trail**: replay uploads now carry SDK-side metadata on every chunk, including SDK version, transport, first-chunk flag, FullSnapshot presence, raw byte count, event count, and sequence number so backend audit can compare what the API received against what the browser prepared. The compressed byte count rides the diagnostics channel and the gzipped request length, since gzip runs after the payload is built.
+- **Replay lifecycle diagnostics**: the SDK now emits positive replay lifecycle diagnostics to `/api/telemetry/replay-diagnostics`, covering session start/resume, recorder start/stop, bootstrap reservation/restoration/missing states, fetch upload attempts/acks/failures, and beacon queued/not-queued outcomes. Beacon queueing stays a browser-delivery signal and never marks bootstrap acked.
+- **Replay-linked console/network telemetry**: optional replay telemetry captures bounded console `log`/`info`/`warn`/`error`/`debug` messages and fetch/XHR request metadata with session id, redacted sensitive query params/headers (camelCase-aware), batching, rate limiting, and silent fallback when the endpoint is unavailable.
+- **Telemetry controls**: `init()` accepts `enableReplayDiagnostics`, `enableConsoleTelemetry`, and `enableNetworkTelemetry`, with matching optional remote-config fields for backend kill switches. A remote toggle set to false forces the feature off even when the host opted in locally, and defaults keep replay diagnostics and console/network telemetry enabled when replay is enabled.
+
+### Fixed
+
+- **Replay chunk loss at page unload**: heavy buffers now leave on capture through the compressed fetch path — on any FullSnapshot (including the tab-return re-checkout) or once the buffer passes ~0.9 MB — and the page-hidden flush uses fetch, so large payloads upload while the page is alive. A flush whose body fits the keepalive limit survives the tab closing mid-request. The terminal `pagehide` beacon delivers a residual up to the 64 KiB `sendBeacon` limit (including on a bfcache freeze, which sendBeacon does not block) and drops anything larger once rather than retrying the same oversized beacon.
+- **Replay telemetry hardening**: the console, fetch, and XHR wrappers are fully fail-open — they never throw before delegating to the host (a non-string XHR method, an absent `Request` global), and a reference retained across teardown still forwards to the real console/fetch. Telemetry now stops with recording, including on the 429 daily cap and a stop issued mid-startup, so no wrapper outlives the session.
+- **Replay telemetry correctness**: console serialization caps depth and marks only true back-references `[Circular]`, so a value shared between two properties serializes normally; the SDK's own console output and same-origin self-calls are excluded from capture; `isSdkEndpoint` compares origins so a look-alike host or a longer port is still captured; and the request method is sanitized like every other telemetry string.
+
 ## [1.14.6] - 2026-06-30
 
 ### Added

@@ -10,21 +10,28 @@ export function startNetworkCapture(apiEndpoint: string): void {
   _installed = true;
   _apiEndpoint = apiEndpoint;
 
-  _originalFetch = window.fetch;
+  const original = window.fetch;
+  _originalFetch = original;
 
+  // Close over the original so a reference retained across teardown still
+  // forwards, and never throw before delegating to the host fetch.
   window.fetch = async (
     input: RequestInfo | URL,
     init?: RequestInit,
   ): Promise<Response> => {
-    const url = resolveUrl(input);
-    const method = init?.method?.toUpperCase() || 'GET';
-
-    if (url.startsWith(_apiEndpoint)) {
-      return _originalFetch!(input, init);
+    let url: string;
+    let method: string;
+    try {
+      url = resolveUrl(input);
+      method = init?.method?.toUpperCase() || 'GET';
+      if (isSdkEndpoint(url)) return original(input, init);
+    } catch {
+      // Instrumentation must never keep the host request from going out.
+      return original(input, init);
     }
 
     try {
-      const response = await _originalFetch!(input, init);
+      const response = await original(input, init);
 
       if (response.status >= 400) {
         try {
@@ -79,9 +86,22 @@ export function stopNetworkCapture(): void {
 
 function resolveUrl(input: RequestInfo | URL): string {
   if (typeof input === 'string') return input;
-  if (input instanceof URL) return input.href;
-  if (input instanceof Request) return input.url;
+  if (typeof URL !== 'undefined' && input instanceof URL) return input.href;
+  if (typeof Request !== 'undefined' && input instanceof Request) return input.url;
   return String(input);
+}
+
+function isSdkEndpoint(url: string): boolean {
+  if (_apiEndpoint === '') return false;
+  try {
+    // Compare origins, not a raw string prefix: a look-alike host or a longer
+    // port that merely starts with the endpoint string must not be misread as an
+    // SDK self-call and dropped from capture.
+    const base = typeof location !== 'undefined' ? location.href : undefined;
+    return new URL(url, base).origin === new URL(_apiEndpoint, base).origin;
+  } catch {
+    return false;
+  }
 }
 
 function truncateUrl(url: string): string {

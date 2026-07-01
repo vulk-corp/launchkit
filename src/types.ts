@@ -21,4 +21,10 @@ export interface LaunchKitConfig {
    *  When true, all subsystems activate regardless of origin mismatch.
    *  Do not ship with `dev: true` in production. */
   dev?: boolean;
+  /** Emit replay lifecycle diagnostics. Defaults to true when replay is enabled. */
+  enableReplayDiagnostics?: boolean;
+  /** Capture console timeline telemetry. Defaults to true when replay is enabled. */
+  enableConsoleTelemetry?: boolean;
+  /** Capture fetch/XHR timeline telemetry. Defaults to true when replay is enabled. */
+  enableNetworkTelemetry?: boolean;
 }

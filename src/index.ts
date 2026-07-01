@@ -2,10 +2,12 @@ import { configureSender } from './telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from './heartbeat';
 import { startErrorCapture, stopErrorCapture } from './error-capture';
 import { startNetworkCapture, stopNetworkCapture } from './network-capture';
+import { startReplayTelemetry, stopReplayTelemetry } from './replay-telemetry';
 import { check as _check } from './check';
 import { fetchRemoteConfig, readCachedGatingEnabled } from './remote-config';
 import { startBadgeWidget, stopBadgeWidget } from './badge-widget';
 import { setIdentity, getIdentity } from './identity-state';
+import { getReplaySessionId } from './session-state';
 import {
   connectSupabase as _connectSupabase,
   startSupabaseIdentityBridge,
@@ -28,6 +30,12 @@ let _gateOrigin = DEFAULT_GATE_ORIGIN;
 
 // Module-level ref for the dynamically-imported stopReplay function
 let _stopReplay: (() => void) | null = null;
+
+// Bumped on every replay activation and on stop(). The deferred ./replay import
+// callback captures the value at activation and bails if it no longer matches, so
+// a stop() issued during the import window cancels the pending start (_stopReplay
+// is still null then, so stop() cannot reach the recorder directly).
+let _replayActivation = 0;
 
 // Guard against double init() — prevents duplicate subsystem activation
 let _initialized = false;
@@ -223,16 +231,34 @@ function activateSubsystems(
   // Error capture and replay only run in top-level window.
   // Sandboxed iframes (e.g. Lovable/Bolt editor) are skipped.
   if (!sandboxed) {
+    const isReplayEnabled = remote?.sessionReplay !== false;
     startErrorCapture(buildSlug);
     startNetworkCapture(apiEndpoint);
     startSupabaseIdentityBridge();
-    startReplayModule(buildSlug, apiEndpoint);
+    if (isReplayEnabled) {
+      // A remote toggle set to false is a kill switch: it forces the feature off
+      // even when the host opted in locally. Both sides must allow it, defaulting
+      // on when neither is set.
+      startReplayModule(buildSlug, apiEndpoint, {
+        activation: ++_replayActivation,
+        enableReplayDiagnostics:
+          (config.enableReplayDiagnostics ?? true) && (remote?.enableReplayDiagnostics ?? true),
+        consoleTelemetry:
+          (config.enableConsoleTelemetry ?? true) && (remote?.enableConsoleTelemetry ?? true),
+        networkTelemetry:
+          (config.enableNetworkTelemetry ?? true) && (remote?.enableNetworkTelemetry ?? true),
+      });
+    }
   }
 
   // Apply remote toggles if available.
   if (remote) {
     if (!remote.monitoring) stopHeartbeat();
-    if (!remote.sessionReplay) {
+    // Mirror the enable check (sessionReplay !== false): an unset value keeps
+    // replay on, so only an explicit false tears it down. Using !sessionReplay
+    // here would start replay above then immediately run this disabled path.
+    if (remote.sessionReplay === false) {
+      stopReplayTelemetry();
       stopErrorCapture();
       stopNetworkCapture();
       stopSupabaseIdentityBridge();
@@ -274,11 +300,44 @@ function activateSubsystems(
   }
 }
 
-function startReplayModule(buildSlug: string, apiEndpoint: string): void {
+function startReplayModule(
+  buildSlug: string,
+  apiEndpoint: string,
+  options: {
+    activation: number;
+    enableReplayDiagnostics: boolean;
+    consoleTelemetry: boolean;
+    networkTelemetry: boolean;
+  },
+): void {
   import('./replay')
-    .then(({ startReplay, stopReplay }) => {
+    .then(async ({ startReplay, stopReplay }) => {
+      // stop() ran while ./replay was importing: abandon the start.
+      if (options.activation !== _replayActivation) return;
       _stopReplay = stopReplay;
-      return startReplay(buildSlug, apiEndpoint, { getIdentity });
+      await startReplay(buildSlug, apiEndpoint, {
+        getIdentity,
+        enableReplayDiagnostics: options.enableReplayDiagnostics,
+        // When recording stops for any reason (including the internal 429
+        // daily-cap stop) tear down the telemetry wrappers too.
+        onStopped: stopReplayTelemetry,
+      });
+      // stop() ran while rrweb was starting: tear the recorder back down and skip
+      // telemetry rather than leaving both running past the explicit stop.
+      if (options.activation !== _replayActivation) {
+        stopReplay();
+        return;
+      }
+      // Console/network wrappers stamp captures with the active replay session.
+      // Install them only once recording actually started: a failed rrweb load
+      // clears the session id, and starting telemetry first would capture with a
+      // null session and leave the wrappers installed until stop().
+      if (getReplaySessionId() !== null) {
+        startReplayTelemetry(buildSlug, apiEndpoint, {
+          consoleTelemetry: options.consoleTelemetry,
+          networkTelemetry: options.networkTelemetry,
+        });
+      }
     })
     .catch((err) => {
       console.warn('[@bworlds/launchkit] Session replay failed to start:', err);
@@ -319,7 +378,11 @@ export function getGateUrl(): string {
  * Stop all monitoring.
  */
 export function stop(): void {
+  // Invalidate any replay activation still waiting on the ./replay import so it
+  // does not start recording/telemetry after this stop.
+  _replayActivation++;
   stopHeartbeat();
+  stopReplayTelemetry();
   stopErrorCapture();
   stopNetworkCapture();
   stopSupabaseIdentityBridge();
