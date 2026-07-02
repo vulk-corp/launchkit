@@ -35,7 +35,23 @@ export interface CapturedError extends CapturedErrorInput {
   capturedAt: number;
 }
 
-let _queue: CapturedError[] = [];
+/**
+ * The queue lives on globalThis (mirroring session-state) so that
+ * backstampQueuedErrors/unstampQueuedErrors — called from replay.ts across
+ * the CDN bundle-split boundary — mutate the same queue the capture paths
+ * fill; a module-level array would hand the replay chunk an always-empty
+ * copy and silently break the error-session link on those builds.
+ */
+const ERROR_QUEUE_STATE_KEY = '__bworldsLaunchKitErrorQueueState__';
+
+function _queueState(): CapturedError[] {
+  const root = globalThis as typeof globalThis & {
+    [ERROR_QUEUE_STATE_KEY]?: CapturedError[];
+  };
+  root[ERROR_QUEUE_STATE_KEY] ??= [];
+  return root[ERROR_QUEUE_STATE_KEY];
+}
+
 let _intervalId: ReturnType<typeof setInterval> | null = null;
 let _buildSlug: string | null = null;
 let _installed = false;
@@ -153,7 +169,8 @@ export function enqueueError(error: CapturedErrorInput): void {
     typeof error.stack === 'string' ? sanitizeAndTruncate(error.stack, MAX_STACK_LENGTH) : null;
   const url =
     typeof error.url === 'string' ? sanitizeAndTruncate(error.url, MAX_URL_LENGTH) : null;
-  _queue.push({
+  const queue = _queueState();
+  queue.push({
     ...error,
     message,
     stack,
@@ -161,7 +178,7 @@ export function enqueueError(error: CapturedErrorInput): void {
     sessionId: getReplaySessionId(),
     capturedAt: Date.now(),
   });
-  if (_queue.length >= BATCH_SIZE_THRESHOLD) {
+  if (queue.length >= BATCH_SIZE_THRESHOLD) {
     flush();
   }
 }
@@ -177,7 +194,7 @@ export function enqueueError(error: CapturedErrorInput): void {
  * to the session window.
  */
 export function backstampQueuedErrors(sessionId: string): void {
-  for (const error of _queue) {
+  for (const error of _queueState()) {
     if (error.sessionId === null) {
       error.sessionId = sessionId;
     }
@@ -192,7 +209,7 @@ export function backstampQueuedErrors(sessionId: string): void {
  * their prior footage is legitimate.
  */
 export function unstampQueuedErrors(sessionId: string): void {
-  for (const error of _queue) {
+  for (const error of _queueState()) {
     if (error.sessionId === sessionId) {
       error.sessionId = null;
     }
@@ -200,9 +217,10 @@ export function unstampQueuedErrors(sessionId: string): void {
 }
 
 function flush(): void {
-  if (_queue.length === 0 || !_buildSlug) return;
+  const queue = _queueState();
+  if (queue.length === 0 || !_buildSlug) return;
 
-  const batch = _queue.splice(0);
+  const batch = queue.splice(0);
   sendTelemetry('/api/telemetry/errors', {
     buildSlug: _buildSlug,
     errors: batch,

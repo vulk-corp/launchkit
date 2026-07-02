@@ -5,19 +5,38 @@ interface SenderConfig {
   apiEndpoint?: string;
 }
 
-let _config: SenderConfig | null = null;
+/**
+ * Stored on globalThis (mirroring session-state) so the config stays shared
+ * when CDN ESM providers split LaunchKit across multiple bundle files — a
+ * plain module-level variable would leave the replay chunk's copy
+ * unconfigured, silently dropping every send from that side.
+ */
+const SENDER_STATE_KEY = '__bworldsLaunchKitSenderState__';
+
+interface SenderState {
+  config: SenderConfig | null;
+}
+
+function getState(): SenderState {
+  const root = globalThis as typeof globalThis & {
+    [SENDER_STATE_KEY]?: SenderState;
+  };
+  root[SENDER_STATE_KEY] ??= { config: null };
+  return root[SENDER_STATE_KEY];
+}
 
 export function configureSender(config: SenderConfig): void {
-  _config = config;
+  getState().config = config;
 }
 
 export async function sendTelemetry(
   path: string,
   body: Record<string, unknown>,
 ): Promise<void> {
-  if (!_config) return;
+  const config = getState().config;
+  if (!config) return;
 
-  const url = `${_config.apiEndpoint || DEFAULT_API_ENDPOINT}${path}`;
+  const url = `${config.apiEndpoint || DEFAULT_API_ENDPOINT}${path}`;
 
   try {
     await fetch(url, {
