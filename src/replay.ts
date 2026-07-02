@@ -2,12 +2,13 @@
  * Session replay module — rrweb recording + chunked upload.
  *
  * Dynamically imports rrweb so the bundle is not included until replay is
- * enabled. Buffers events and flushes on a periodic timer, eagerly on any
- * FullSnapshot or once the buffer passes FLUSH_SOFT_MAX_BYTES, and when the page
- * is hidden. A page-hidden flush uses a normal fetch (the compressed path, no
- * size cap) so heavy payloads leave while the page is still alive; the final
- * pagehide sends the residual via sendBeacon, gzipped synchronously. Stops
- * recording on 429 (daily cap reached).
+ * enabled. Buffers events and flushes on a periodic timer via fetch (the
+ * compressed path, no size cap), eagerly on any FullSnapshot or once the
+ * buffer passes FLUSH_SOFT_MAX_BYTES. Page hidden and pagehide both drain the
+ * residual through the synchronous sendBeacon path: hidden is the last event
+ * a dying page reliably fires, and only a body already handed to the browser
+ * survives it. A periodic FullSnapshot checkout bounds how much footage any
+ * undelivered chunk can strand. Stops recording on 429 (daily cap reached).
  *
  * Session rotation: if no rrweb events fire for longer than IDLE_TIMEOUT_MS,
  * the SDK rotates to a fresh session id, flushes the tail of the old one under
@@ -42,6 +43,16 @@ const FLUSH_SOFT_MAX_BYTES = 262_144;
 // body, gzipped by _beaconRequestBody; only a residual still above the cap after
 // compression is dropped.
 const BEACON_MAX_BYTES = 64_000;
+// One page shares a single ~64 KiB in-flight budget across every sendBeacon and
+// keepalive body it queues at unload. Replay chunks spend at most this much of
+// it, so the loss-report diagnostic and the sibling telemetry flushes
+// (errors, console/network events) still fit inside the browser's cap.
+const BEACON_UNLOAD_BUDGET_BYTES = 57_000;
+// A replay is only recoverable from its most recent FullSnapshot: a periodic
+// checkout bounds what any lost chunk can take down to one interval. Skipped
+// while the tab is hidden or no event fired since the previous checkout — a
+// snapshot of an unchanged DOM adds bytes without adding a recovery point.
+const FULL_SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
 const REPLAY_EVENTS_PATH = '/api/telemetry/replay-events';
 const REPLAY_DIAGNOSTICS_PATH = '/api/telemetry/replay-diagnostics';
 const GZIP_ENCODING = 'gzip';
@@ -97,6 +108,8 @@ let _eventBuffer: eventWithTime[] = [];
 let _bufferedBytes = 0;
 let _pendingChunks: ReplayChunk[] = [];
 let _flushTimer: ReturnType<typeof setInterval> | null = null;
+let _snapshotTimer: ReturnType<typeof setInterval> | null = null;
+let _lastPeriodicSnapshotAt = 0;
 let _stopRecording: (() => void) | null = null;
 let _record: typeof rrwebRecord | null = null;
 let _capReached = false;
@@ -810,6 +823,7 @@ type ReplayChunkDiagnosticReason =
   | 'body_too_large'
   | 'beacon_body_too_large'
   | 'beacon_not_queued'
+  | 'unload_budget_exhausted'
   | 'retry_budget_exhausted'
   | 'missing_stored_bootstrap';
 
@@ -826,6 +840,7 @@ type ReplayLifecycleDiagnosticType =
   | 'chunk_upload_failed'
   | 'beacon_queued'
   | 'beacon_not_queued'
+  | 'unload_chunks_dropped'
   | 'stored_bootstrap_restored'
   | 'stored_bootstrap_missing'
   | 'recorder_stopped';
@@ -1176,6 +1191,7 @@ function _beginFreshSession(): void {
   _lastNavigationUrl = null;
   try {
     _record?.takeFullSnapshot(true);
+    _lastPeriodicSnapshotAt = Date.now();
   } catch {
     // rrweb throws if called outside an active recording. Non-fatal.
   }
@@ -1249,10 +1265,10 @@ async function _uploadReservedChunks(chunks: ReplayChunk[]): Promise<ReplayChunk
   return [];
 }
 
-async function _flush(_isFinal = false): Promise<void> {
+async function _flush(): Promise<void> {
   if (_capReached || _flushing) return;
   // Hold off while a rejected first chunk is in exponential backoff.
-  if (!_isFinal && _firstChunkRetryAfter > Date.now()) return;
+  if (_firstChunkRetryAfter > Date.now()) return;
   const sessionId = _sessionId;
   if (!sessionId) return;
   if (_pendingChunks.length === 0 && _eventBuffer.length === 0) return;
@@ -1335,8 +1351,16 @@ function _beaconRequestBody(serialized: SerializedChunk): BeaconRequestBody {
   }
 }
 
-function _beaconPostChunk(chunk: ReplayChunk): boolean {
-  if (!_buildSlug || !_apiEndpoint || chunk.events.length === 0) return true;
+type BeaconSendOutcome = {
+  queued: boolean;
+  bodyBytes: number;
+  rawBytes: number;
+};
+
+function _beaconPostChunk(chunk: ReplayChunk, budgetRemaining: number): BeaconSendOutcome {
+  if (!_buildSlug || !_apiEndpoint || chunk.events.length === 0) {
+    return { queued: true, bodyBytes: 0, rawBytes: 0 };
+  }
 
   const serialized = _serializeChunk(chunk, 'beacon');
   const requestBody = _beaconRequestBody(serialized);
@@ -1346,6 +1370,8 @@ function _beaconPostChunk(chunk: ReplayChunk): boolean {
     requestBody.compressedBytes,
     'beacon',
   );
+  const rejection = { queued: false, bodyBytes: requestBody.bodyBytes, rawBytes: serialized.rawBytes };
+
   if (requestBody.bodyBytes > BEACON_MAX_BYTES) {
     _logReplayChunkDropped(requestBody.bodyBytes, 'beacon');
     _sendReplayChunkDiagnostic(
@@ -1354,7 +1380,17 @@ function _beaconPostChunk(chunk: ReplayChunk): boolean {
       { ...details, reason: 'beacon_body_too_large' },
       'failed',
     );
-    return false;
+    return rejection;
+  }
+
+  if (requestBody.bodyBytes > budgetRemaining) {
+    _sendReplayChunkDiagnostic(
+      chunk,
+      _nextDiagnosticAttempt(chunk),
+      { ...details, reason: 'unload_budget_exhausted' },
+      'failed',
+    );
+    return rejection;
   }
 
   const gzipQuery = requestBody.compressedBytes === null ? '' : BEACON_GZIP_QUERY;
@@ -1384,10 +1420,84 @@ function _beaconPostChunk(chunk: ReplayChunk): boolean {
     });
     _clearChunkFailureAttempt(chunk);
   }
-  return queued;
+  return { queued, bodyBytes: requestBody.bodyBytes, rawBytes: serialized.rawBytes };
 }
 
-/** Synchronous flush via sendBeacon for page unload. */
+/**
+ * Group events into chunks whose gzipped beacon body fits the per-call cap.
+ * Runs BEFORE sequence reservation: a split does not burn extra numbers, and a
+ * single event too large to ever ship by beacon is surfaced as dropped instead
+ * of consuming a doomed sequence slot. The provisional sequence number only
+ * shapes the serialized payload's digit width and the bootstrap split point.
+ */
+function _fitEventsToBeaconBodies(
+  events: eventWithTime[],
+  sessionId: string,
+  provisionalSequenceNumber: number,
+): { fitted: eventWithTime[][]; droppedEvents: eventWithTime[] } {
+  const candidate = { sessionId, sequenceNumber: provisionalSequenceNumber, events };
+  const body = _beaconRequestBody(_serializeChunk(candidate, 'beacon'));
+  if (body.bodyBytes <= BEACON_MAX_BYTES) {
+    return { fitted: [events], droppedEvents: [] };
+  }
+  if (events.length <= 1) {
+    _logReplayChunkDropped(body.bodyBytes, 'beacon');
+    return { fitted: [], droppedEvents: events };
+  }
+  const mid = _splitPoint(events, provisionalSequenceNumber);
+  const left = _fitEventsToBeaconBodies(events.slice(0, mid), sessionId, provisionalSequenceNumber);
+  const right = _fitEventsToBeaconBodies(
+    events.slice(mid),
+    sessionId,
+    provisionalSequenceNumber + Math.max(1, left.fitted.length),
+  );
+  return {
+    fitted: [...left.fitted, ...right.fitted],
+    droppedEvents: [...left.droppedEvents, ...right.droppedEvents],
+  };
+}
+
+/**
+ * Beacon counterpart of _reserveChunksForEvents: same session guards and
+ * bootstrap handling, but chunks are sized for the beacon cap before their
+ * sequence range is reserved. Null means the session changed under us and the
+ * events cannot be attributed.
+ */
+function _reserveBeaconChunks(
+  events: eventWithTime[],
+  sessionId: string,
+): { chunks: ReplayChunk[]; droppedEvents: eventWithTime[] } | null {
+  if (events.length === 0) return { chunks: [], droppedEvents: [] };
+  if (_sequenceNumber === 0 && !_hasFullSnapshot(events)) return null;
+
+  const normalizedEvents =
+    _sequenceNumber === 0 ? _dropInitialIncrementalPreamble(events) : events;
+  const { fitted, droppedEvents } = _fitEventsToBeaconBodies(
+    normalizedEvents,
+    sessionId,
+    _sequenceNumber,
+  );
+  if (fitted.length === 0) return { chunks: [], droppedEvents };
+
+  const firstSequenceNumber = _reserveSequenceRange(sessionId, fitted.length);
+  if (firstSequenceNumber === null) return null;
+
+  const chunks = fitted.map((groupEvents, index) => ({
+    sessionId,
+    sequenceNumber: firstSequenceNumber + index,
+    events: groupEvents,
+  }));
+  if (chunks[0]?.sequenceNumber === 0) {
+    _saveStoredBootstrapChunk(chunks[0]);
+  }
+  return { chunks, droppedEvents };
+}
+
+/**
+ * Synchronous flush via sendBeacon for page hidden and unload. Every step up
+ * to sendBeacon is synchronous, so a dying page cannot strand the residual in
+ * an await the way a fetch flush can.
+ */
 function _beaconFlush(): void {
   if (_capReached) return;
   if (!_buildSlug || !_apiEndpoint || !_sessionId) return;
@@ -1398,26 +1508,57 @@ function _beaconFlush(): void {
 
   if (_pendingChunks.length > 0) {
     // Only the active session's chunks can be delivered here; a deferred
-    // other-session chunk cannot be beaconed and the page is unloading, so it is
-    // dropped with the page rather than kept for a flush that never comes.
+    // other-session chunk cannot be beaconed, so it stays queued for a fetch
+    // flush that only happens if the page survives.
     const pending = _pendingChunks.splice(0);
     for (const chunk of pending) {
       if (chunk.sessionId === sessionId) chunks.push(chunk);
+      else _pendingChunks.push(chunk);
     }
   }
 
+  let droppedEventCount = 0;
+  let droppedRawBytes = 0;
+
   if (_eventBuffer.length > 0) {
     const events = _drainEventBuffer();
-    const reserved = _reserveChunksForEvents(events, sessionId);
-    if (reserved) chunks.push(...reserved);
+    const reserved = _reserveBeaconChunks(events, sessionId);
+    if (reserved) {
+      chunks.push(...reserved.chunks);
+      droppedEventCount += reserved.droppedEvents.length;
+    }
   }
 
-  // The page is unloading: never run session recovery here. Send each residual
-  // chunk once and never re-queue a failure — a body too large for the beacon
-  // cannot be re-sent through it, and there is no later flush to fetch it, so
-  // re-queuing only produced repeated same-beacon drops.
+  // Each chunk gets one beacon attempt against the browser's shared in-flight
+  // budget, lowest sequence first — earlier footage is what playback needs to
+  // stay coherent. A rejected chunk is re-queued for the fetch path: delivered
+  // if the page survives (tab switch), gone with the page otherwise. Either
+  // way the loss report below declares it, so a hole in the delivered stream
+  // stays explainable from the diagnostics channel.
+  let budgetRemaining = BEACON_UNLOAD_BUDGET_BYTES;
+  let droppedChunkCount = 0;
   for (const chunk of chunks) {
-    _beaconPostChunk(chunk);
+    const outcome = _beaconPostChunk(chunk, budgetRemaining);
+    if (outcome.queued) {
+      budgetRemaining -= outcome.bodyBytes;
+    } else {
+      droppedChunkCount += 1;
+      droppedEventCount += chunk.events.length;
+      droppedRawBytes += outcome.rawBytes;
+      _pendingChunks.push(chunk);
+    }
+  }
+
+  if (droppedChunkCount > 0 || droppedEventCount > 0) {
+    // Rides sendTelemetry's keepalive fetch: ~300 bytes, inside the slice of
+    // the browser budget that BEACON_UNLOAD_BUDGET_BYTES deliberately leaves
+    // free. Severity stays 'warning': a re-queued chunk may still land via
+    // fetch, and assembly only degrades replay_health on 'error'.
+    _sendReplayDiagnostic('unload_chunks_dropped', sessionId, 'warning', {
+      reason: 'unload_budget_exhausted',
+      eventCount: droppedEventCount,
+      rawBytes: droppedRawBytes,
+    });
   }
 }
 
@@ -1711,6 +1852,10 @@ export function stopReplay(): void {
     clearInterval(_flushTimer);
     _flushTimer = null;
   }
+  if (_snapshotTimer) {
+    clearInterval(_snapshotTimer);
+    _snapshotTimer = null;
+  }
   if (_stopRecording) {
     _stopRecording();
     _stopRecording = null;
@@ -1873,9 +2018,26 @@ export async function startReplay(
       _flush().catch(() => {});
     }, FLUSH_INTERVAL_MS);
 
+    _lastPeriodicSnapshotAt = Date.now();
+    _snapshotTimer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      if (_lastEventAt <= _lastPeriodicSnapshotAt) return;
+      try {
+        _record?.takeFullSnapshot(true);
+        _lastPeriodicSnapshotAt = Date.now();
+      } catch {
+        // rrweb throws if called outside an active recording. Non-fatal.
+      }
+    }, FULL_SNAPSHOT_INTERVAL_MS);
+
     _visibilityHandler = () => {
+      // hidden is the last event a dying page reliably fires, and any async
+      // work started here (gzip, fetch) dies with it. The residual leaves
+      // through the synchronous beacon path instead: sendBeacon hands the body
+      // to the browser, which delivers it after the page is gone. On a tab
+      // switch the page survives and recording simply continues.
       if (document.visibilityState === 'hidden') {
-        _flush(true).catch(() => {});
+        _beaconFlush();
       }
     };
     _pagehideHandler = () => {

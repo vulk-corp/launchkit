@@ -78,6 +78,33 @@ const fetchMock = vi.fn();
 /** Resolve pending microtasks (fetch promises inside _flushChunk). */
 const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+/**
+ * Captures replay's interval callbacks so fetch-retry tests can fire the
+ * periodic flush tick deterministically — the page-hidden path delivers
+ * through sendBeacon, so it cannot stand in for the fetch tick.
+ */
+let capturedIntervals: Array<{ fn: () => void; ms: number }> = [];
+
+function stubIntervalCapture(): void {
+  capturedIntervals = [];
+  let nextHandle = 1;
+  vi.stubGlobal('setInterval', ((fn: () => void, ms: number) => {
+    capturedIntervals.push({ fn, ms });
+    return nextHandle++;
+  }) as unknown as typeof setInterval);
+  vi.stubGlobal('clearInterval', (() => {}) as unknown as typeof clearInterval);
+}
+
+/** Fire the 10s flush tick captured by stubIntervalCapture. */
+function flushTick(): void {
+  capturedIntervals.find((entry) => entry.ms === 10_000)?.fn();
+}
+
+/** Fire the 5-minute periodic FullSnapshot tick captured by stubIntervalCapture. */
+function snapshotTick(): void {
+  capturedIntervals.find((entry) => entry.ms === 300_000)?.fn();
+}
+
 function parseFetchBody(call: unknown[]): Record<string, unknown> {
   const init = call[1] as { body?: string };
   return JSON.parse(init?.body ?? '{}') as Record<string, unknown>;
@@ -312,6 +339,7 @@ beforeEach(() => {
 afterEach(() => {
   stopErrorCapture();
   stopReplay();
+  vi.unstubAllGlobals();
   if (originalVisibilityDescriptor) {
     Object.defineProperty(
       Document.prototype,
@@ -833,8 +861,8 @@ describe('sequence reservation', () => {
     expect(hoisted.recordFactory).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps sequence numbers monotone when visibilitychange fires during the initial flush', async () => {
-    visibilityState = 'hidden';
+  it('keeps sequence numbers monotone when a flush tick fires during the initial flush', async () => {
+    stubIntervalCapture();
 
     let releaseFetch!: (value: Response) => void;
     fetchMock.mockReset();
@@ -850,18 +878,17 @@ describe('sequence reservation', () => {
     const emit = hoisted.getEmit();
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
-    document.dispatchEvent(new Event('visibilitychange'));
 
     expect(parseFetchBody(fetchMock.mock.calls[0]).sequenceNumber).toBe(0);
     expect(readStoredSession().seq).toBe(1);
 
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'during-fetch' } });
-    document.dispatchEvent(new Event('visibilitychange'));
+    flushTick();
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     releaseFetch(okResponse());
     await flushMicrotasks();
-    document.dispatchEvent(new Event('visibilitychange'));
+    flushTick();
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
     expect(parseFetchBody(fetchMock.mock.calls[1]).sequenceNumber).toBe(1);
@@ -906,7 +933,7 @@ describe('sequence reservation', () => {
   });
 
   it('retries a failed chunk with the same sequenceNumber and payload', async () => {
-    visibilityState = 'hidden';
+    stubIntervalCapture();
     fetchMock.mockReset();
     fetchMock
       .mockResolvedValueOnce({ ok: false, status: 500 } as Response)
@@ -917,7 +944,6 @@ describe('sequence reservation', () => {
     const stored = readStoredSession();
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
-    document.dispatchEvent(new Event('visibilitychange'));
     await flushMicrotasks();
 
     const failedBody = parseFetchBody(fetchMock.mock.calls[0]);
@@ -926,7 +952,7 @@ describe('sequence reservation', () => {
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'after-failure' } });
     // The first chunk's retry is held in exponential backoff; advance past it.
     setNow(START_NOW + 60_000);
-    document.dispatchEvent(new Event('visibilitychange'));
+    flushTick();
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
     const retryBody = parseFetchBody(fetchMock.mock.calls[1]);
@@ -936,13 +962,18 @@ describe('sequence reservation', () => {
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
 
     await flushMicrotasks();
-    document.dispatchEvent(new Event('visibilitychange'));
+    flushTick();
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
     expect(parseFetchBody(fetchMock.mock.calls[2]).sequenceNumber).toBe(1);
   });
 
-  it('lets a final visibility flush retry the first chunk during backoff', async () => {
+  it('delivers the pending first chunk through the beacon during backoff', async () => {
     visibilityState = 'hidden';
+    const sendBeaconMock = vi.fn(() => true);
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: sendBeaconMock,
+    });
     fetchMock.mockReset();
     fetchMock
       .mockResolvedValueOnce({ ok: false, status: 500 } as Response)
@@ -952,17 +983,21 @@ describe('sequence reservation', () => {
     const emit = hoisted.getEmit();
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
-    document.dispatchEvent(new Event('visibilitychange'));
     await flushMicrotasks();
 
+    // The rejected bootstrap sits in exponential backoff for the fetch path;
+    // the page-hidden beacon flush delivers it anyway — backoff protects the
+    // API from hammering, not the residual from a dying page.
     document.dispatchEvent(new Event('visibilitychange'));
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
-    expect(parseFetchBody(fetchMock.mock.calls[1]).sequenceNumber).toBe(0);
+    expect(sendBeaconMock).toHaveBeenCalledTimes(1);
+    expect(
+      (await parseBeaconBody(sendBeaconMock.mock.calls[0])).sequenceNumber,
+    ).toBe(0);
   });
 
   it('rate-limits retry diagnostics for later chunks', async () => {
-    visibilityState = 'hidden';
+    stubIntervalCapture();
     fetchMock.mockReset();
     fetchMock
       .mockResolvedValueOnce(okResponse())
@@ -984,7 +1019,7 @@ describe('sequence reservation', () => {
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'later' } });
 
     for (let attempt = 1; attempt <= 5; attempt += 1) {
-      document.dispatchEvent(new Event('visibilitychange'));
+      flushTick();
       await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(attempt + 1));
       await flushMicrotasks();
     }
@@ -1017,14 +1052,14 @@ describe('sequence reservation', () => {
       },
     ]);
 
-    document.dispatchEvent(new Event('visibilitychange'));
+    flushTick();
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(7));
 
     warnSpy.mockRestore();
   });
 
   it('continues the session when the first chunk is dropped', async () => {
-    visibilityState = 'hidden';
+    stubIntervalCapture();
     vi.stubGlobal('CompressionStream', undefined);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -1038,7 +1073,6 @@ describe('sequence reservation', () => {
       timestamp: Date.now(),
       data: { html: 'x'.repeat(520_000) },
     });
-    document.dispatchEvent(new Event('visibilitychange'));
     await flushMicrotasks();
 
     expect(fetchMock).not.toHaveBeenCalled();
@@ -1064,7 +1098,7 @@ describe('sequence reservation', () => {
     ]);
 
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'telemetry-only' } });
-    document.dispatchEvent(new Event('visibilitychange'));
+    flushTick();
 
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const body = parseFetchBody(fetchMock.mock.calls[0]);
@@ -1287,7 +1321,7 @@ describe('sequence reservation', () => {
   });
 
   it('keeps sequence numbers monotone when stored session seq is stale', async () => {
-    visibilityState = 'hidden';
+    stubIntervalCapture();
     sessionStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
@@ -1316,7 +1350,7 @@ describe('sequence reservation', () => {
     const emit = hoisted.getEmit();
 
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'after-restore' } });
-    document.dispatchEvent(new Event('visibilitychange'));
+    flushTick();
 
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     expect(parseFetchBody(fetchMock.mock.calls[1]).sequenceNumber).toBe(1);
@@ -1473,12 +1507,14 @@ describe('sequence reservation', () => {
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const seqBefore = readStoredSession().seq;
     emit!({
       type: 3,
       timestamp: Date.now(),
       // Below FLUSH_SOFT_MAX_BYTES so the residual stays buffered until pagehide,
-      // yet pseudo-random enough that gzip cannot bring it under the beacon cap:
-      // the residual is dropped and the warning fires.
+      // yet a single pseudo-random event gzip cannot bring under the beacon cap
+      // and splitting cannot shrink: it is dropped without burning a sequence
+      // number, and the loss report declares it.
       data: { html: incompressibleText(250_000) },
     });
     window.dispatchEvent(new Event('pagehide'));
@@ -1487,12 +1523,20 @@ describe('sequence reservation', () => {
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('Replay final upload is too large for unload delivery'),
     );
+    expect(readStoredSession().seq).toBe(seqBefore);
+    expect(allReplayDiagnostics()).toContainEqual(
+      expect.objectContaining({
+        type: 'unload_chunks_dropped',
+        reason: 'unload_budget_exhausted',
+        eventCount: 1,
+      }),
+    );
 
     warnSpy.mockRestore();
   });
 
   it('continues uploading later chunks after the first chunk fails the maximum number of attempts', async () => {
-    visibilityState = 'hidden';
+    stubIntervalCapture();
     fetchMock.mockReset();
     fetchMock
       .mockResolvedValueOnce({ ok: false, status: 500 } as Response)
@@ -1506,14 +1550,18 @@ describe('sequence reservation', () => {
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();
     const sessionId = readStoredSession().id;
-    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
 
-    // Each rejected first chunk schedules exponential backoff; clear it before
-    // each retry. The fifth attempt exhausts the bootstrap retry budget only.
-    const retryTimes = [10_000, 30_000, 70_000, 150_000, 310_000];
-    for (let attempt = 1; attempt <= 5; attempt += 1) {
-      setNow(START_NOW + retryTimes[attempt - 1]);
-      document.dispatchEvent(new Event('visibilitychange'));
+    // Attempt 1 is the eager flush the FullSnapshot capture triggers itself.
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    await flushMicrotasks();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Each rejected first chunk schedules exponential backoff; advance past it
+    // before each retry. The fifth attempt exhausts the bootstrap retry budget.
+    const retryTimes = [30_000, 70_000, 150_000, 310_000];
+    for (let attempt = 2; attempt <= 5; attempt += 1) {
+      setNow(START_NOW + retryTimes[attempt - 2]);
+      flushTick();
       await flushMicrotasks();
       expect(fetchMock).toHaveBeenCalledTimes(attempt);
     }
@@ -1563,7 +1611,7 @@ describe('sequence reservation', () => {
     ]);
 
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'telemetry-only' } });
-    document.dispatchEvent(new Event('visibilitychange'));
+    flushTick();
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(6));
 
     const body = parseFetchBody(fetchMock.mock.calls[5]);
@@ -1723,9 +1771,9 @@ describe('unload transport', () => {
 
     const emit = await startWithBootstrap();
 
-    // ~200 KB of pseudo-random noise gzip cannot bring under the ~64 KiB cap, so
-    // pagehide must drop it rather than hand the browser a body it silently
-    // discards.
+    // A single ~200 KB pseudo-random event gzip cannot bring under the ~64 KiB
+    // cap and splitting cannot shrink: pagehide must drop it rather than hand
+    // the browser a body it silently discards, and declare the loss.
     emit({ type: 3, timestamp: Date.now(), data: { html: incompressibleText(200_000) } });
     window.dispatchEvent(new Event('pagehide'));
 
@@ -1733,7 +1781,98 @@ describe('unload transport', () => {
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('Replay final upload is too large for unload delivery'),
     );
+    expect(allReplayDiagnostics()).toContainEqual(
+      expect.objectContaining({
+        type: 'unload_chunks_dropped',
+        eventCount: 1,
+      }),
+    );
     warnSpy.mockRestore();
+  });
+
+  it('splits an oversized unload residual, delivers the earliest part, declares the rest', async () => {
+    const sendBeaconMock = vi.fn(() => true);
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: sendBeaconMock,
+    });
+
+    const emit = await startWithBootstrap();
+
+    // Two DISTINCT pseudo-random events (identical ones would gzip-dedup into
+    // one fitting body) whose combined body exceeds the per-call beacon cap.
+    // The unload flush splits them, ships the earliest part — the footage
+    // playback needs first — until the shared in-flight budget runs out, and
+    // declares the remainder through the loss report instead of dropping the
+    // whole residual silently.
+    const noise = incompressibleText(160_000);
+    emit({ type: 3, timestamp: Date.now(), data: { html: noise.slice(0, 80_000) } });
+    emit({ type: 3, timestamp: Date.now(), data: { html: noise.slice(80_000) } });
+    window.dispatchEvent(new Event('pagehide'));
+
+    expect(sendBeaconMock).toHaveBeenCalledTimes(1);
+    const delivered = await parseBeaconBody(sendBeaconMock.mock.calls[0]);
+    expect(delivered.sequenceNumber).toBe(1);
+    expect(delivered.eventCount).toBe(1);
+    expect(allReplayDiagnostics()).toContainEqual(
+      expect.objectContaining({
+        type: 'unload_chunks_dropped',
+        reason: 'unload_budget_exhausted',
+        eventCount: 1,
+      }),
+    );
+  });
+
+  it('delivers the buffered residual through the beacon when the page is hidden', async () => {
+    const sendBeaconMock = vi.fn(() => true);
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: sendBeaconMock,
+    });
+
+    const emit = await startWithBootstrap();
+    fetchMock.mockClear();
+
+    emit({ type: 3, timestamp: Date.now(), data: { marker: 'residual' } });
+    visibilityState = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    // hidden is the last event a dying page reliably fires: the residual must
+    // leave synchronously via sendBeacon, never through an async fetch flush
+    // that dies with the page.
+    expect(sendBeaconMock).toHaveBeenCalledTimes(1);
+    expect((await parseBeaconBody(sendBeaconMock.mock.calls[0])).sequenceNumber).toBe(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('takes a periodic full snapshot while recording is active', async () => {
+    stubIntervalCapture();
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    await flushMicrotasks();
+    hoisted.takeFullSnapshot.mockClear();
+
+    // Activity since the previous checkout: the tick re-snapshots so a lost
+    // chunk can never strand more than one interval of footage.
+    setNow(START_NOW + 60_000);
+    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'activity' } });
+    snapshotTick();
+    expect(hoisted.takeFullSnapshot).toHaveBeenCalledTimes(1);
+    expect(hoisted.takeFullSnapshot).toHaveBeenCalledWith(true);
+
+    // Idle since the checkout above: an unchanged DOM earns no new snapshot.
+    hoisted.takeFullSnapshot.mockClear();
+    snapshotTick();
+    expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
+
+    // Hidden tab: skipped even with fresh activity.
+    setNow(START_NOW + 120_000);
+    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'more' } });
+    visibilityState = 'hidden';
+    snapshotTick();
+    expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
   });
 
   it('beacons a residual within the beacon cap on a terminal pagehide', async () => {
