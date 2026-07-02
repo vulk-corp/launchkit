@@ -1,3 +1,4 @@
+import { gunzipSync, strFromU8 } from 'fflate';
 import { startReplay, stopReplay } from '../src/replay';
 import { enqueueError, startErrorCapture, stopErrorCapture } from '../src/error-capture';
 import { sendTelemetry } from '../src/telemetry-sender';
@@ -84,7 +85,21 @@ function parseFetchBody(call: unknown[]): Record<string, unknown> {
 
 async function parseBeaconBody(call: unknown[]): Promise<Record<string, unknown>> {
   const blob = call[1] as Blob;
-  return JSON.parse(await blob.text()) as Record<string, unknown>;
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const isGzip = bytes[0] === 0x1f && bytes[1] === 0x8b;
+  const text = isGzip ? strFromU8(gunzipSync(bytes)) : await blob.text();
+  return JSON.parse(text) as Record<string, unknown>;
+}
+
+/** Deterministic pseudo-random text that gzip cannot meaningfully shrink. */
+function incompressibleText(length: number): string {
+  let seed = 0x2f6e2b1;
+  let out = '';
+  while (out.length < length) {
+    seed = (seed * 48271) % 0x7fffffff;
+    out += seed.toString(36);
+  }
+  return out.slice(0, length);
 }
 
 function readStoredSession(): StoredSession {
@@ -1461,7 +1476,10 @@ describe('sequence reservation', () => {
     emit!({
       type: 3,
       timestamp: Date.now(),
-      data: { html: 'x'.repeat(520_000) },
+      // Below FLUSH_SOFT_MAX_BYTES so the residual stays buffered until pagehide,
+      // yet pseudo-random enough that gzip cannot bring it under the beacon cap:
+      // the residual is dropped and the warning fires.
+      data: { html: incompressibleText(250_000) },
     });
     window.dispatchEvent(new Event('pagehide'));
 
@@ -1644,10 +1662,10 @@ describe('unload transport', () => {
 
     const emit = await startWithBootstrap();
 
-    // A heavy incremental event crosses FLUSH_SOFT_MAX_BYTES (0.9 MB); it must
+    // A heavy incremental event crosses FLUSH_SOFT_MAX_BYTES (256 KB); it must
     // leave on the compressed fetch path at capture, with no page-hidden event
     // and no timer, so it never accumulates into the unload residual.
-    emit({ type: 3, timestamp: Date.now(), data: { html: 'x'.repeat(950_000) } });
+    emit({ type: 3, timestamp: Date.now(), data: { html: 'x'.repeat(300_000) } });
 
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     expect(fetchMock.mock.calls[1][0]).toBe(`${API_ENDPOINT}/api/telemetry/replay-events`);
@@ -1669,7 +1687,33 @@ describe('unload transport', () => {
     expect(body.hasFullSnapshot).toBe(true);
   });
 
-  it('drops an unload residual above the beacon cap instead of handing it to sendBeacon', async () => {
+  it('gzips an unload residual above the beacon cap and delivers it as text/plain', async () => {
+    const sendBeaconMock = vi.fn(() => true);
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: sendBeaconMock,
+    });
+
+    const emit = await startWithBootstrap();
+
+    // ~120 KB raw residual: past the ~64 KiB sendBeacon limit, but repetitive
+    // markup compresses far below it, so pagehide delivers it gzipped with the
+    // compression query param instead of dropping it.
+    emit({ type: 3, timestamp: Date.now(), data: { html: 'x'.repeat(120_000) } });
+    window.dispatchEvent(new Event('pagehide'));
+
+    expect(sendBeaconMock).toHaveBeenCalledTimes(1);
+    const [url, blob] = sendBeaconMock.mock.calls[0] as unknown as [string, Blob];
+    expect(url).toContain('compression=gzip');
+    expect(blob.type).toBe('text/plain');
+    const body = JSON.parse(
+      strFromU8(gunzipSync(new Uint8Array(await blob.arrayBuffer()))),
+    ) as Record<string, unknown>;
+    expect(body.sequenceNumber).toBe(1);
+    expect(body.eventCount).toBe(1);
+  });
+
+  it('drops an unload residual still above the beacon cap after gzip', async () => {
     const sendBeaconMock = vi.fn(() => true);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     Object.defineProperty(navigator, 'sendBeacon', {
@@ -1679,10 +1723,10 @@ describe('unload transport', () => {
 
     const emit = await startWithBootstrap();
 
-    // ~120 KB residual: within the 512 KB fetch chunk cap but past the ~64 KiB
-    // sendBeacon limit, so pagehide must drop it rather than hand the browser a
-    // body it silently discards.
-    emit({ type: 3, timestamp: Date.now(), data: { html: 'x'.repeat(120_000) } });
+    // ~200 KB of pseudo-random noise gzip cannot bring under the ~64 KiB cap, so
+    // pagehide must drop it rather than hand the browser a body it silently
+    // discards.
+    emit({ type: 3, timestamp: Date.now(), data: { html: incompressibleText(200_000) } });
     window.dispatchEvent(new Event('pagehide'));
 
     expect(sendBeaconMock).not.toHaveBeenCalled();
@@ -1705,6 +1749,11 @@ describe('unload transport', () => {
     window.dispatchEvent(new Event('pagehide'));
 
     expect(sendBeaconMock).toHaveBeenCalledTimes(1);
+    // Even a sub-cap residual ships gzipped: the browser's in-flight budget is
+    // shared across the whole unload flush, so every body must stay small.
+    expect((sendBeaconMock.mock.calls[0] as unknown as [string, Blob])[0]).toContain(
+      'compression=gzip',
+    );
     const body = await parseBeaconBody(sendBeaconMock.mock.calls[0]);
     expect(body.sequenceNumber).toBe(1);
   });

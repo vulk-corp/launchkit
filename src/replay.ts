@@ -6,8 +6,8 @@
  * FullSnapshot or once the buffer passes FLUSH_SOFT_MAX_BYTES, and when the page
  * is hidden. A page-hidden flush uses a normal fetch (the compressed path, no
  * size cap) so heavy payloads leave while the page is still alive; the final
- * pagehide sends only the sub-beacon-cap residual via sendBeacon. Stops recording
- * on 429 (daily cap reached).
+ * pagehide sends the residual via sendBeacon, gzipped synchronously. Stops
+ * recording on 429 (daily cap reached).
  *
  * Session rotation: if no rrweb events fire for longer than IDLE_TIMEOUT_MS,
  * the SDK rotates to a fresh session id, flushes the tail of the old one under
@@ -16,6 +16,7 @@
  */
 
 import type { eventWithTime, record as rrwebRecord } from 'rrweb';
+import { gzipSync } from 'fflate';
 import { setReplaySessionId } from './session-state';
 import { sendTelemetry } from './telemetry-sender';
 import { getVisitorId } from './visitor-state';
@@ -30,17 +31,26 @@ const MAX_CHUNK_BYTES = 512_000; // 512 KB per chunk
 const GZIP_MIN_BYTES = 64 * 1024;
 // Flush the buffer on capture once it passes this size instead of waiting for the
 // periodic timer, so a heavy in-session batch leaves via the compressed fetch path
-// and never accumulates into the unload residual.
-const FLUSH_SOFT_MAX_BYTES = 900_000;
+// and never accumulates into the unload residual. Sized against the browser's
+// ~64 KiB in-flight budget shared by every sendBeacon and keepalive body of one
+// unload: 256 KB raw gzips to roughly 20-30 KB, so even a residual capped here
+// leaves room for its sibling chunks and the diagnostics flushed alongside it.
+const FLUSH_SOFT_MAX_BYTES = 262_144;
 // navigator.sendBeacon (and fetch keepalive) reject bodies above 64 KiB (65536).
 // Deliver a residual up to this ceiling — just under the hard limit to leave room
-// for the browser's own accounting — at pagehide; anything larger must have
-// already left on the page-hidden fetch.
+// for the browser's own accounting — at pagehide. The gate applies to the wire
+// body, gzipped by _beaconRequestBody; only a residual still above the cap after
+// compression is dropped.
 const BEACON_MAX_BYTES = 64_000;
 const REPLAY_EVENTS_PATH = '/api/telemetry/replay-events';
 const REPLAY_DIAGNOSTICS_PATH = '/api/telemetry/replay-diagnostics';
 const GZIP_ENCODING = 'gzip';
 const JSON_CONTENT_TYPE = 'application/json';
+// sendBeacon carries no headers, so a gzipped beacon body signals compression
+// through this query param and ships as text/plain — a CORS-safelisted content
+// type that keeps the unload beacon preflight-free.
+const BEACON_GZIP_QUERY = '?compression=gzip';
+const TEXT_PLAIN_CONTENT_TYPE = 'text/plain';
 // A session video is only replayable once its first chunk (the FullSnapshot) lands.
 // Retry that bootstrap chunk a bounded number of times, then keep collecting the
 // session as telemetry-only so the backend can still surface non-video data.
@@ -1288,16 +1298,56 @@ async function _flush(_isFinal = false): Promise<void> {
   }
 }
 
+type BeaconRequestBody = {
+  body: BlobPart;
+  bodyBytes: number;
+  contentType: string;
+  compressedBytes: number | null;
+};
+
+/**
+ * Every beacon body is gzipped synchronously — the page is unloading, so the
+ * async CompressionStream path can never complete. The browser shares one
+ * ~64 KiB in-flight budget across all sendBeacon and keepalive bodies, so even
+ * a chunk that fits the per-call cap raw must ship small or it starves the
+ * other residuals flushed in the same unload. The cap gate runs on the wire
+ * body; a raw body is kept only when gzip fails or does not shrink it.
+ */
+function _beaconRequestBody(serialized: SerializedChunk): BeaconRequestBody {
+  const raw: BeaconRequestBody = {
+    body: serialized.bytes,
+    bodyBytes: serialized.rawBytes,
+    contentType: JSON_CONTENT_TYPE,
+    compressedBytes: null,
+  };
+
+  try {
+    const compressed = gzipSync(serialized.bytes);
+    if (compressed.byteLength >= serialized.rawBytes) return raw;
+    return {
+      body: compressed as Uint8Array<ArrayBuffer>,
+      bodyBytes: compressed.byteLength,
+      contentType: TEXT_PLAIN_CONTENT_TYPE,
+      compressedBytes: compressed.byteLength,
+    };
+  } catch {
+    return raw;
+  }
+}
+
 function _beaconPostChunk(chunk: ReplayChunk): boolean {
   if (!_buildSlug || !_apiEndpoint || chunk.events.length === 0) return true;
 
-  const { bytes, rawBytes } = _serializeChunk(chunk, 'beacon');
-  const details = _replayChunkDiagnosticDetails(chunk, rawBytes, null, 'beacon');
-  // sendBeacon is synchronous, so the async gzip path cannot run on unload; the
-  // raw size gate is the correct one for the plain JSON body actually sent, and
-  // sendBeacon rejects bodies above ~64 KiB regardless of the per-chunk cap.
-  if (rawBytes > BEACON_MAX_BYTES) {
-    _logReplayChunkDropped(rawBytes, 'beacon');
+  const serialized = _serializeChunk(chunk, 'beacon');
+  const requestBody = _beaconRequestBody(serialized);
+  const details = _replayChunkDiagnosticDetails(
+    chunk,
+    serialized.rawBytes,
+    requestBody.compressedBytes,
+    'beacon',
+  );
+  if (requestBody.bodyBytes > BEACON_MAX_BYTES) {
+    _logReplayChunkDropped(requestBody.bodyBytes, 'beacon');
     _sendReplayChunkDiagnostic(
       chunk,
       _nextDiagnosticAttempt(chunk),
@@ -1307,9 +1357,10 @@ function _beaconPostChunk(chunk: ReplayChunk): boolean {
     return false;
   }
 
+  const gzipQuery = requestBody.compressedBytes === null ? '' : BEACON_GZIP_QUERY;
   const queued = navigator.sendBeacon(
-    `${_apiEndpoint}${REPLAY_EVENTS_PATH}`,
-    new Blob([bytes], { type: JSON_CONTENT_TYPE }),
+    `${_apiEndpoint}${REPLAY_EVENTS_PATH}${gzipQuery}`,
+    new Blob([requestBody.body], { type: requestBody.contentType }),
   );
   if (!queued) {
     _sendReplayDiagnostic('beacon_not_queued', chunk.sessionId, 'warning', {
@@ -1318,7 +1369,7 @@ function _beaconPostChunk(chunk: ReplayChunk): boolean {
       ...details,
     });
     console.warn(
-      `${SDK_TAG} Replay final upload was not queued by the browser (${_chunkSizeLabel(rawBytes)}). Recent replay events may be missing.`,
+      `${SDK_TAG} Replay final upload was not queued by the browser (${_chunkSizeLabel(requestBody.bodyBytes)}). Recent replay events may be missing.`,
     );
     _sendReplayChunkDiagnostic(
       chunk,
