@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.16.0] - 2026-07-02
+
+### Added
+
+- **Periodic FullSnapshot checkout**: while recording is active and the tab visible, the SDK re-checkouts a FullSnapshot every 5 minutes (skipped when no event fired since the previous checkout). A replay is only recoverable from its most recent FullSnapshot, so this bounds what any undelivered chunk can strand to one interval instead of the whole session.
+- **Unload loss report**: when the unload flush cannot deliver part of the residual (per-call beacon cap, shared in-flight budget, `sendBeacon` refusal), the SDK now declares the loss through a `unload_chunks_dropped` diagnostic carrying the dropped event count and raw bytes, so a hole in the delivered stream stays explainable server-side.
+
+### Fixed
+
+- **Diagnostics silently dropped on CDN bundle splits**: `telemetry-sender`'s config now lives on `globalThis` (mirroring session-state). CDN ESM providers such as esm.sh rebundle the package per entrypoint, handing the dynamically imported replay chunk its own unconfigured copy of the sender — every replay diagnostic no-oped there since the channel shipped. The error-capture queue moves to `globalThis` for the same reason, so `backstampQueuedErrors`/`unstampQueuedErrors` called from the replay chunk mutate the queue the capture paths actually fill.
+- **Residual loss at page hidden**: the page-hidden flush now drains through the synchronous `sendBeacon` path instead of an async fetch flush. `visibilitychange: hidden` is the last event a dying page reliably fires, and async work started there (gzip, fetch issuance) dies with the page while the buffer is already drained — the previous design's main chunk-loss window at navigation. On a tab switch the page survives and recording continues; the server deduplicates any double delivery by sequence number.
+- **Unload budget accounting**: unload beacons now spend against the browser's shared ~64 KiB in-flight budget, lowest sequence first — earlier footage is what playback needs. An oversized residual is split into beacon-sized chunks before sequence reservation (a split burns no extra numbers; a single event that can never fit is dropped without burning one). Chunks the budget or cap rejects are re-queued for the fetch path, delivered if the page survives.
+
 ## [1.15.0] - 2026-07-01
 
 ### Added
