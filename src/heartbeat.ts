@@ -1,6 +1,6 @@
 /**
- * Heartbeat module: sends periodic pings to the BWORLDS API
- * proving the app is alive and reachable.
+ * Uptime heartbeat module: sends periodic pings to the BWORLDS API
+ * proving the app is alive and reachable when uptime monitoring is enabled.
  *
  * Default interval: 5 minutes (300000ms).
  */

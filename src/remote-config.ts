@@ -25,7 +25,13 @@ import { fetchJsonWithTimeout } from './fetch-util';
 export interface SdkRemoteConfig {
   sessionReplay: boolean;
   monitoring: boolean;
+  uptimeMonitoring?: boolean;
+  errorCapture?: boolean;
   badge: boolean;
+  sdkHealth?: {
+    enabled?: boolean;
+    intervalSeconds?: number;
+  };
   /**
    * When false, the build has no paid pricing — the overlay can be skipped on cache hit.
    * Fail-safe: absent field is treated as true (overlay mounts).

@@ -1,6 +1,6 @@
 # LaunchKit SDK
 
-`@bworlds/launchkit` — client SDK embedded in BWORLDS builders. Heartbeat, error capture, session replay (rrweb), access gating, trust badge. Remote-toggled from dashboard via `/api/telemetry/sdk-config`.
+`@bworlds/launchkit` — client SDK embedded in BWORLDS builders. SDK health, uptime heartbeat, error capture, session replay (rrweb), access gating, trust badge. Remote-toggled from dashboard via `/api/telemetry/sdk-config`.
 
 **Repo**: `vulk-corp/launchkit` (separate from `vulk-corp/bworlds` monorepo).
 
@@ -8,7 +8,7 @@
 
 - **Never break the host app.** All features fail-open on backend outage. Telemetry drops silently.
 - **Skip in cross-origin iframes** (Lovable/Bolt editor previews): error capture, replay, gate, badge. Heartbeat still runs.
-- **No local feature flags.** Dashboard drives `monitoring`, `sessionReplay`, `badge`. `gate` stays local (behavioral).
+- **No local feature flags.** Dashboard drives `uptimeMonitoring`, `errorCapture`, `sessionReplay`, `badge`. `monitoring` is a legacy alias for uptime. SDK health is system-owned. `gate` stays local (behavioral).
 - **rrweb is external + lazy.** Dynamic `import('./replay')` only on first session. Main bundle ~6.5 kB.
 - **Replay owns the session id; error capture only reads it.** `replay.ts` publishes the active session id through `session-state.ts` (set on open/resume/rotation, cleared on stop, 429 cap stop, and failed start) — never export a getter from `replay.ts`, that defeats the dynamic-import boundary. `enqueueError` stamps `sessionId` + `capturedAt` at capture time, never at flush: a batch can span a session rotation. `backstampQueuedErrors` fills null-session entries only, preserves `capturedAt`, and is called only from `startReplay`'s success path.
 - **Telemetry strings are string-typed, capped, and well-formed.** `enqueueError` is the single enforcement chokepoint for `message` (≤ `MAX_MESSAGE_LENGTH`, 5000), `stack` (≤ `MAX_STACK_LENGTH`, 10000), and `url` (≤ `MAX_URL_LENGTH`, 2048): always strings, lone surrogates replaced with U+FFFD, never cut mid-surrogate-pair. The API rejects the entire `/api/telemetry/errors` batch when one item carries an invalid field. `normalizeThrown` never throws; unreadable values become `[error details could not be read]`.
@@ -76,6 +76,7 @@ SPA route changes are recorded as rrweb custom events so the backend distiller c
 | Path | Module | Method |
 |------|--------|--------|
 | `/api/telemetry/heartbeat` | heartbeat | POST |
+| `/api/telemetry/sdk-health` | sdk-health | POST |
 | `/api/telemetry/errors` | error-capture | POST |
 | `/api/telemetry/replay-events` | replay | POST + sendBeacon on unload |
 | `/api/telemetry/sdk-config` | remote-config | GET |

@@ -1,6 +1,7 @@
 import { init, stop } from '../src/index';
 import { configureSender } from '../src/telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from '../src/heartbeat';
+import { startSdkHealth, stopSdkHealth } from '../src/sdk-health';
 import { startErrorCapture, stopErrorCapture } from '../src/error-capture';
 import { check } from '../src/check';
 import type { CheckResult } from '../src/check';
@@ -18,6 +19,11 @@ vi.mock('../src/telemetry-sender', () => ({
 vi.mock('../src/heartbeat', () => ({
   startHeartbeat: vi.fn(),
   stopHeartbeat: vi.fn(),
+}));
+
+vi.mock('../src/sdk-health', () => ({
+  startSdkHealth: vi.fn(),
+  stopSdkHealth: vi.fn(),
 }));
 
 vi.mock('../src/error-capture', () => ({
@@ -105,6 +111,12 @@ describe('init()', () => {
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
   });
 
+  it('starts SDK health by default after config fetch resolves', async () => {
+    init({ buildSlug: 'test-app', gate: false });
+    await flushMicrotasks();
+    expect(startSdkHealth).toHaveBeenCalledWith('test-app', undefined);
+  });
+
   it('starts error capture by default after config fetch resolves', async () => {
     init({ buildSlug: 'test-app', gate: false });
     await flushMicrotasks();
@@ -112,6 +124,14 @@ describe('init()', () => {
   });
 
   it('passes the shared identity getter into replay', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: true,
+      sessionReplay: true,
+      badge: false,
+      gatingEnabled: false,
+      allowedOrigin: null,
+    });
+
     const instance = init({ buildSlug: 'test-app', gate: false });
     await flushMicrotasks();
 
@@ -133,6 +153,14 @@ describe('init()', () => {
   });
 
   it('starts replay diagnostics and console/network telemetry by default with replay', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: true,
+      sessionReplay: true,
+      badge: false,
+      gatingEnabled: false,
+      allowedOrigin: null,
+    });
+
     init({ buildSlug: 'test-app', gate: false });
     await flushMicrotasks();
 
@@ -148,6 +176,14 @@ describe('init()', () => {
   });
 
   it('passes local replay telemetry flags through activation', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: true,
+      sessionReplay: true,
+      badge: false,
+      gatingEnabled: false,
+      allowedOrigin: null,
+    });
+
     init({
       buildSlug: 'test-app',
       gate: false,
@@ -169,6 +205,14 @@ describe('init()', () => {
   });
 
   it('does not start replay telemetry when stop() runs during replay start', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: true,
+      sessionReplay: true,
+      badge: false,
+      gatingEnabled: false,
+      allowedOrigin: null,
+    });
+
     let releaseStart!: () => void;
     vi.mocked(startReplay).mockImplementationOnce(async () => {
       setReplaySessionId('replay-session-test');
@@ -188,6 +232,14 @@ describe('init()', () => {
   });
 
   it('does not start replay telemetry when replay fails to record', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: true,
+      sessionReplay: true,
+      badge: false,
+      gatingEnabled: false,
+      allowedOrigin: null,
+    });
+
     // rrweb load/record failure: startReplay returns without publishing a session
     // id, so the console/network wrappers must not be installed.
     vi.mocked(startReplay).mockImplementationOnce(async () => {
@@ -201,25 +253,82 @@ describe('init()', () => {
     expect(startReplayTelemetry).not.toHaveBeenCalled();
   });
 
-  it('stops heartbeat when remote config disables monitoring', async () => {
+  it('does not start uptime heartbeat when remote config disables monitoring', async () => {
     mockFetchRemoteConfig.mockResolvedValue({ monitoring: false, sessionReplay: true, badge: false, gatingEnabled: false, allowedOrigin: null });
 
     init({ buildSlug: 'test-app', gate: false });
-    await vi.waitFor(() => {
-      expect(stopHeartbeat).toHaveBeenCalled();
-    });
+    await flushMicrotasks();
+
+    expect(startHeartbeat).not.toHaveBeenCalled();
+    expect(stopHeartbeat).not.toHaveBeenCalled();
   });
 
-  it('stops error capture and replay when remote config disables sessionReplay', async () => {
+  it('uses uptimeMonitoring over the legacy monitoring field', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: false,
+      uptimeMonitoring: true,
+      sessionReplay: true,
+      badge: false,
+      gatingEnabled: false,
+      allowedOrigin: null,
+    });
+
+    init({ buildSlug: 'test-app', gate: false });
+    await flushMicrotasks();
+
+    expect(startHeartbeat).toHaveBeenCalledWith('test-app');
+  });
+
+  it('does not start error capture or replay when sessionReplay disables the legacy combined feature', async () => {
     mockFetchRemoteConfig.mockResolvedValue({ monitoring: true, sessionReplay: false, badge: false, gatingEnabled: false, allowedOrigin: null });
 
     init({ buildSlug: 'test-app', gate: false });
-    await vi.waitFor(() => {
-      expect(stopErrorCapture).toHaveBeenCalled();
-    });
+    await flushMicrotasks();
+
+    expect(startErrorCapture).not.toHaveBeenCalled();
+    expect(startReplay).not.toHaveBeenCalled();
+    expect(stopErrorCapture).not.toHaveBeenCalled();
   });
 
-  it('keeps everything running when remote config fetch fails', async () => {
+  it('starts error capture without replay when errorCapture is enabled and sessionReplay is disabled', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: true,
+      errorCapture: true,
+      sessionReplay: false,
+      badge: false,
+      gatingEnabled: false,
+      allowedOrigin: null,
+    });
+
+    init({ buildSlug: 'test-app', gate: false });
+    await flushMicrotasks();
+
+    expect(startErrorCapture).toHaveBeenCalledWith('test-app');
+    expect(startReplay).not.toHaveBeenCalled();
+  });
+
+  it('starts SDK health even when builder-controlled telemetry toggles are disabled', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: false,
+      uptimeMonitoring: false,
+      errorCapture: false,
+      sessionReplay: false,
+      badge: false,
+      gatingEnabled: false,
+      allowedOrigin: null,
+      sdkHealth: { enabled: true, intervalSeconds: 120 },
+    });
+
+    init({ buildSlug: 'test-app', gate: false });
+    await flushMicrotasks();
+
+    expect(startSdkHealth).toHaveBeenCalledWith('test-app', 120);
+    expect(startHeartbeat).not.toHaveBeenCalled();
+    expect(startErrorCapture).not.toHaveBeenCalled();
+    expect(startReplay).not.toHaveBeenCalled();
+  });
+
+  it('keeps lower-sensitivity telemetry running when remote config fetch fails', async () => {
     mockFetchRemoteConfig.mockResolvedValue(null);
 
     init({ buildSlug: 'test-app', gate: false });
@@ -227,8 +336,10 @@ describe('init()', () => {
     // Let promises settle
     await flushMicrotasks();
 
-    expect(stopHeartbeat).not.toHaveBeenCalled();
-    expect(stopErrorCapture).not.toHaveBeenCalled();
+    expect(startSdkHealth).toHaveBeenCalledWith('test-app', undefined);
+    expect(startHeartbeat).toHaveBeenCalledWith('test-app');
+    expect(startErrorCapture).toHaveBeenCalledWith('test-app');
+    expect(startReplay).not.toHaveBeenCalled();
   });
 
   it('starts the badge widget when remote config enables badge', async () => {
@@ -305,6 +416,7 @@ describe('LaunchKitInstance', () => {
     instance.stop();
 
     expect(stopHeartbeat).toHaveBeenCalled();
+    expect(stopSdkHealth).toHaveBeenCalled();
     expect(stopErrorCapture).toHaveBeenCalled();
   });
 });
@@ -316,6 +428,7 @@ describe('top-level stop()', () => {
     stop();
 
     expect(stopHeartbeat).toHaveBeenCalled();
+    expect(stopSdkHealth).toHaveBeenCalled();
     expect(stopErrorCapture).toHaveBeenCalled();
   });
 });
