@@ -28,10 +28,6 @@ export interface SdkRemoteConfig {
   uptimeMonitoring?: boolean;
   errorCapture?: boolean;
   badge: boolean;
-  sdkHealth?: {
-    enabled?: boolean;
-    intervalSeconds?: number;
-  };
   /**
    * When false, the build has no paid pricing — the overlay can be skipped on cache hit.
    * Fail-safe: absent field is treated as true (overlay mounts).
@@ -86,10 +82,7 @@ export async function fetchRemoteConfig(
   buildSlug: string
 ): Promise<SdkRemoteConfig | null> {
   // SWR: return cached value immediately, but always kick off a background fetch.
-  // The background fetch result is NOT returned here — callers use the return value
-  // for feature-flag decisions (monitoring, replay, badge) only. The gatingEnabled
-  // skip-overlay decision happens in index.ts via readCachedGatingEnabled(), which
-  // reads localStorage synchronously before this fetch's Promise resolves.
+  // Stale cache cannot enable replay.
   const cached = readCache(buildSlug);
 
   const fetchAndCache = fetchJsonWithTimeout<SdkRemoteConfig>(
@@ -99,10 +92,14 @@ export async function fetchRemoteConfig(
     return config;
   }).catch(() => null);
 
-  // Return cached value if available AND it contains the allowedOrigin field.
-  // Old cached configs (pre-origin-scope) lack allowedOrigin — wait for the
-  // network fetch so the origin guard in index.ts has data to work with.
-  if (cached && 'allowedOrigin' in cached) return cached;
+  // Without allowedOrigin, telemetry cannot be scoped to the registered Build URL.
+  if (cached && 'allowedOrigin' in cached) {
+    if (cached.sessionReplay === true) {
+      const fresh = await fetchAndCache;
+      return fresh ?? { ...cached, sessionReplay: false };
+    }
+    return cached;
+  }
   return fetchAndCache;
 }
 

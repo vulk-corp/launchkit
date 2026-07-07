@@ -7,7 +7,6 @@
 import { init, stop } from '../src/index';
 import { configureSender } from '../src/telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from '../src/heartbeat';
-import { startSdkHealth, stopSdkHealth } from '../src/sdk-health';
 import { startErrorCapture, stopErrorCapture } from '../src/error-capture';
 import { fetchRemoteConfig, readCachedGatingEnabled } from '../src/remote-config';
 import { startBadgeWidget, stopBadgeWidget } from '../src/badge-widget';
@@ -21,11 +20,6 @@ vi.mock('../src/telemetry-sender', () => ({
 vi.mock('../src/heartbeat', () => ({
   startHeartbeat: vi.fn(),
   stopHeartbeat: vi.fn(),
-}));
-
-vi.mock('../src/sdk-health', () => ({
-  startSdkHealth: vi.fn(),
-  stopSdkHealth: vi.fn(),
 }));
 
 vi.mock('../src/error-capture', () => ({
@@ -115,7 +109,6 @@ describe('F1 — origin guard comparison', () => {
     init({ buildSlug: 'test-app', gate: false });
     await flushMicrotasks();
 
-    expect(startSdkHealth).toHaveBeenCalledWith('test-app', undefined);
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
   });
 
@@ -130,7 +123,6 @@ describe('F1 — origin guard comparison', () => {
     init({ buildSlug: 'test-app', gate: false });
     await flushMicrotasks();
 
-    expect(startSdkHealth).not.toHaveBeenCalled();
     expect(startHeartbeat).not.toHaveBeenCalled();
     expect(startErrorCapture).not.toHaveBeenCalled();
   });

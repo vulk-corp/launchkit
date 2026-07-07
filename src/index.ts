@@ -1,6 +1,5 @@
 import { configureSender } from './telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from './heartbeat';
-import { startSdkHealth, stopSdkHealth } from './sdk-health';
 import { startErrorCapture, stopErrorCapture } from './error-capture';
 import { startNetworkCapture, stopNetworkCapture } from './network-capture';
 import { startReplayTelemetry, stopReplayTelemetry } from './replay-telemetry';
@@ -150,10 +149,8 @@ function originMatches(allowedOrigin: string | null, dev: boolean): boolean {
  *
  *   const launchkit = init({ buildSlug: 'my-app' })
  *
- * SDK health, uptime monitoring, and error capture start enabled by default.
- * Session replay starts only when remote config explicitly enables it. If the
- * backend is unreachable, replay stays off while lower-sensitivity telemetry
- * remains on.
+ * Heartbeat and error capture start enabled by default. Session replay starts
+ * only when remote config explicitly enables it.
  *
  * Origin guard: subsystems are deferred until after the sdk-config fetch
  * resolves. If the current page's origin doesn't match the build's registered
@@ -183,8 +180,6 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
     // configureSender is needed for the config fetch itself.
     configureSender({ buildSlug: _buildSlug, apiEndpoint: _apiEndpoint });
 
-    // Fetch remote config, then check origin before activating any subsystem.
-    // This replaces the previous eager-start approach.
     fetchRemoteConfig(_apiEndpoint, _buildSlug)
       .then((remote) => {
         try {
@@ -227,23 +222,12 @@ function activateSubsystems(
   const buildSlug = _buildSlug!;
   const apiEndpoint = _apiEndpoint;
 
-  const sdkHealthConfig = remote?.sdkHealth;
-  const sdkHealthEnabled = sdkHealthConfig?.enabled !== false;
-  const uptimeMonitoringEnabled = remote
-    ? (remote.uptimeMonitoring ?? remote.monitoring) !== false
-    : true;
   const errorCaptureEnabled = remote
     ? (remote.errorCapture ?? remote.sessionReplay) !== false
     : true;
   const sessionReplayEnabled = remote?.sessionReplay === true;
 
-  if (sdkHealthEnabled) {
-    startSdkHealth(buildSlug, sdkHealthConfig?.intervalSeconds);
-  }
-
-  if (uptimeMonitoringEnabled) {
-    startHeartbeat(buildSlug);
-  }
+  startHeartbeat(buildSlug);
 
   // Error capture and replay only run in top-level window.
   // Sandboxed iframes (e.g. Lovable/Bolt editor) are skipped.
@@ -254,9 +238,6 @@ function activateSubsystems(
     }
     if (sessionReplayEnabled) {
       startSupabaseIdentityBridge();
-      // A remote toggle set to false is a kill switch: it forces the feature off
-      // even when the host opted in locally. Both sides must allow it, defaulting
-      // on when neither is set.
       startReplayModule(buildSlug, apiEndpoint, {
         activation: ++_replayActivation,
         enableReplayDiagnostics:
@@ -388,7 +369,6 @@ export function stop(): void {
   // Invalidate any replay activation still waiting on the ./replay import so it
   // does not start recording/telemetry after this stop.
   _replayActivation++;
-  stopSdkHealth();
   stopHeartbeat();
   stopReplayTelemetry();
   stopErrorCapture();

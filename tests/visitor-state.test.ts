@@ -5,18 +5,49 @@ const STORAGE_KEY = 'bworlds-visitor-id';
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+class MemoryStorage implements Storage {
+  private data = new Map<string, string>();
+
+  get length(): number {
+    return this.data.size;
+  }
+
+  clear(): void {
+    this.data.clear();
+  }
+
+  getItem(key: string): string | null {
+    return this.data.get(key) ?? null;
+  }
+
+  key(index: number): string | null {
+    return Array.from(this.data.keys())[index] ?? null;
+  }
+
+  removeItem(key: string): void {
+    this.data.delete(key);
+  }
+
+  setItem(key: string, value: string): void {
+    this.data.set(key, value);
+  }
+}
+
 /** Forget the in-memory id so the next read goes back to localStorage. */
 function forgetInMemoryId(): void {
   delete (globalThis as Record<string, unknown>)[VISITOR_STATE_KEY];
 }
 
 beforeEach(() => {
+  vi.stubGlobal('Storage', MemoryStorage);
+  vi.stubGlobal('localStorage', new MemoryStorage());
   localStorage.clear();
   forgetInMemoryId();
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe('visitor identity', () => {

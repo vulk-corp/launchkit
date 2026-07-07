@@ -1,7 +1,6 @@
 import { init, stop } from '../src/index';
 import { configureSender } from '../src/telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from '../src/heartbeat';
-import { startSdkHealth, stopSdkHealth } from '../src/sdk-health';
 import { startErrorCapture, stopErrorCapture } from '../src/error-capture';
 import { check } from '../src/check';
 import type { CheckResult } from '../src/check';
@@ -19,11 +18,6 @@ vi.mock('../src/telemetry-sender', () => ({
 vi.mock('../src/heartbeat', () => ({
   startHeartbeat: vi.fn(),
   stopHeartbeat: vi.fn(),
-}));
-
-vi.mock('../src/sdk-health', () => ({
-  startSdkHealth: vi.fn(),
-  stopSdkHealth: vi.fn(),
 }));
 
 vi.mock('../src/error-capture', () => ({
@@ -109,12 +103,6 @@ describe('init()', () => {
     init({ buildSlug: 'test-app', gate: false });
     await flushMicrotasks();
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
-  });
-
-  it('starts SDK health by default after config fetch resolves', async () => {
-    init({ buildSlug: 'test-app', gate: false });
-    await flushMicrotasks();
-    expect(startSdkHealth).toHaveBeenCalledWith('test-app', undefined);
   });
 
   it('starts error capture by default after config fetch resolves', async () => {
@@ -253,20 +241,20 @@ describe('init()', () => {
     expect(startReplayTelemetry).not.toHaveBeenCalled();
   });
 
-  it('does not start uptime heartbeat when remote config disables monitoring', async () => {
+  it('starts heartbeat even when remote config disables monitoring', async () => {
     mockFetchRemoteConfig.mockResolvedValue({ monitoring: false, sessionReplay: true, badge: false, gatingEnabled: false, allowedOrigin: null });
 
     init({ buildSlug: 'test-app', gate: false });
     await flushMicrotasks();
 
-    expect(startHeartbeat).not.toHaveBeenCalled();
+    expect(startHeartbeat).toHaveBeenCalledWith('test-app');
     expect(stopHeartbeat).not.toHaveBeenCalled();
   });
 
-  it('uses uptimeMonitoring over the legacy monitoring field', async () => {
+  it('ignores remote uptime fields when starting heartbeat', async () => {
     mockFetchRemoteConfig.mockResolvedValue({
       monitoring: false,
-      uptimeMonitoring: true,
+      uptimeMonitoring: false,
       sessionReplay: true,
       badge: false,
       gatingEnabled: false,
@@ -307,7 +295,7 @@ describe('init()', () => {
     expect(startReplay).not.toHaveBeenCalled();
   });
 
-  it('starts SDK health even when builder-controlled telemetry toggles are disabled', async () => {
+  it('keeps heartbeat running when builder-controlled telemetry toggles are disabled', async () => {
     mockFetchRemoteConfig.mockResolvedValue({
       monitoring: false,
       uptimeMonitoring: false,
@@ -316,14 +304,12 @@ describe('init()', () => {
       badge: false,
       gatingEnabled: false,
       allowedOrigin: null,
-      sdkHealth: { enabled: true, intervalSeconds: 120 },
     });
 
     init({ buildSlug: 'test-app', gate: false });
     await flushMicrotasks();
 
-    expect(startSdkHealth).toHaveBeenCalledWith('test-app', 120);
-    expect(startHeartbeat).not.toHaveBeenCalled();
+    expect(startHeartbeat).toHaveBeenCalledWith('test-app');
     expect(startErrorCapture).not.toHaveBeenCalled();
     expect(startReplay).not.toHaveBeenCalled();
   });
@@ -336,7 +322,6 @@ describe('init()', () => {
     // Let promises settle
     await flushMicrotasks();
 
-    expect(startSdkHealth).toHaveBeenCalledWith('test-app', undefined);
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
     expect(startErrorCapture).toHaveBeenCalledWith('test-app');
     expect(startReplay).not.toHaveBeenCalled();
@@ -416,7 +401,6 @@ describe('LaunchKitInstance', () => {
     instance.stop();
 
     expect(stopHeartbeat).toHaveBeenCalled();
-    expect(stopSdkHealth).toHaveBeenCalled();
     expect(stopErrorCapture).toHaveBeenCalled();
   });
 });
@@ -428,7 +412,6 @@ describe('top-level stop()', () => {
     stop();
 
     expect(stopHeartbeat).toHaveBeenCalled();
-    expect(stopSdkHealth).toHaveBeenCalled();
     expect(stopErrorCapture).toHaveBeenCalled();
   });
 });

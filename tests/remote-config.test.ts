@@ -59,13 +59,15 @@ beforeEach(() => {
 // Mock factory: SdkRemoteConfig shapes
 // ---------------------------------------------------------------------------
 
-function createMockSdkRemoteConfig(overrides: Partial<{
+type MockSdkRemoteConfigOverrides = Partial<{
   sessionReplay: boolean;
   monitoring: boolean;
   badge: boolean;
   gatingEnabled: boolean;
   allowedOrigin: string | null;
-}> = {}) {
+}>;
+
+function createMockSdkRemoteConfig(overrides: MockSdkRemoteConfigOverrides = {}) {
   return {
     sessionReplay: false,
     monitoring: true,
@@ -80,8 +82,8 @@ function createMockGatedConfig() {
   return createMockSdkRemoteConfig({ gatingEnabled: true });
 }
 
-function createMockUngatedConfig() {
-  return createMockSdkRemoteConfig({ gatingEnabled: false });
+function createMockUngatedConfig(overrides: MockSdkRemoteConfigOverrides = {}) {
+  return createMockSdkRemoteConfig({ gatingEnabled: false, ...overrides });
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +110,28 @@ describe('localstorage_swr_contract', () => {
     const result = await fetchRemoteConfig('https://api.test', 'my-app');
 
     expect(result).toEqual(config);
+  });
+
+  it('cached replay-on requires fresh config to enable replay', async () => {
+    const cachedConfig = createMockUngatedConfig({ sessionReplay: true });
+    const freshConfig = createMockUngatedConfig({ sessionReplay: true });
+    localStorageMock.getItem.mockReturnValue(JSON.stringify(cachedConfig));
+    mockFetchJsonWithTimeout.mockResolvedValueOnce(freshConfig);
+
+    const result = await fetchRemoteConfig('https://api.test', 'my-app');
+
+    expect(mockFetchJsonWithTimeout).toHaveBeenCalledTimes(1);
+    expect(result).toEqual(freshConfig);
+  });
+
+  it('cached replay-on falls back to replay off when fresh config is unavailable', async () => {
+    const cachedConfig = createMockUngatedConfig({ sessionReplay: true });
+    localStorageMock.getItem.mockReturnValue(JSON.stringify(cachedConfig));
+    mockFetchJsonWithTimeout.mockRejectedValueOnce(new Error('Network error'));
+
+    const result = await fetchRemoteConfig('https://api.test', 'my-app');
+
+    expect(result).toEqual({ ...cachedConfig, sessionReplay: false });
   });
 
   it('missing cache key returns null (and fetch is called)', async () => {

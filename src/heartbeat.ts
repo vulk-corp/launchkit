@@ -1,15 +1,8 @@
-/**
- * Uptime heartbeat module: sends periodic pings to the BWORLDS API
- * proving the app is alive and reachable when uptime monitoring is enabled.
- *
- * Default interval: 5 minutes (300000ms).
- */
-
 import { sendTelemetry } from './telemetry-sender';
 
 declare const __SDK_VERSION__: string;
 
-const DEFAULT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
 
 let _intervalId: ReturnType<typeof setInterval> | null = null;
 let _buildSlug: string | null = null;

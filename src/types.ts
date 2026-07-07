@@ -1,9 +1,8 @@
 /**
  * Configuration for LaunchKit monitoring.
- * Feature toggles (SDK health, uptime, error capture, session replay) are managed
- * remotely from the BWORLDS dashboard. If the backend is unreachable,
- * SDK health, uptime, and error capture default to enabled; session replay
- * stays disabled until remote config explicitly enables it.
+ * Feature toggles for error capture and session replay are managed remotely
+ * from the BWORLDS dashboard. If the backend is unreachable, error capture
+ * defaults to enabled and session replay stays disabled.
  */
 export interface LaunchKitConfig {
   /** Your build slug from the BWORLDS dashboard */
