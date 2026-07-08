@@ -54,4 +54,4 @@ jobs:
         if: steps.check.outputs.already == 'false'
         env:
           NPM_TAG: ${{ steps.version.outputs.npm_tag }}
-        run: npm publish --provenance --access public --tag "$NPM_TAG"
+        run: npx -y npm@11.4.2 publish --provenance --access public --tag "$NPM_TAG"
