@@ -1,7 +1,7 @@
 {
   "name": "@bworlds/launchkit",
-  "version": "1.16.0",
-  "description": "Monitoring, error capture, and access gating SDK for AI-built apps",
+  "version": "1.17.0",
+  "description": "Splits browser error capture from session replay so apps can collect client errors without recording sessions",
   "type": "module",
   "main": "./dist/launchkit.js",
   "module": "./dist/launchkit.js",
