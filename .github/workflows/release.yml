@@ -50,8 +50,16 @@ jobs:
             echo "already=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Prepare trusted publishing
+        if: steps.check.outputs.already == 'false'
+        run: |
+          npm install -g npm@11.5.2
+          npmrc="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
+          sed -i.bak '/_authToken/d' "$npmrc"
+          npm --version
+
       - name: Publish
         if: steps.check.outputs.already == 'false'
         env:
           NPM_TAG: ${{ steps.version.outputs.npm_tag }}
-        run: npx -y npm@11.4.2 publish --provenance --access public --tag "$NPM_TAG"
+        run: npm publish --access public --tag "$NPM_TAG"
