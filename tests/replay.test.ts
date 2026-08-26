@@ -59,6 +59,7 @@ vi.mock('rrweb', () => {
 // ---------------------------------------------------------------------------
 
 const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+const MAX_SESSION_MS = 60 * 60 * 1000;
 const STORAGE_KEY = 'bworlds-replay-session';
 const BOOTSTRAP_STORAGE_KEY = 'bworlds-replay-bootstrap-chunk';
 const BUILD_SLUG = 'test-build';
@@ -607,6 +608,26 @@ describe('session rotation', () => {
     expect(readStoredSession().id).toBe(firstSessionId);
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rotates an active session when its total age reaches the hard limit', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
+    const firstSessionId = readStoredSession().id;
+
+    for (const elapsedMs of [14, 28, 42, 56].map((minutes) => minutes * 60 * 1000)) {
+      setNow(START_NOW + elapsedMs);
+      emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
+      expect(readStoredSession().id).toBe(firstSessionId);
+    }
+
+    setNow(START_NOW + MAX_SESSION_MS);
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
+
+    expect(readStoredSession().id).not.toBe(firstSessionId);
+    expect(hoisted.takeFullSnapshot).toHaveBeenCalledWith(true);
   });
 
   it('does not rotate on the very first event of a fresh session', async () => {

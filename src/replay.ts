@@ -10,10 +10,10 @@
  * survives it. A periodic FullSnapshot checkout bounds how much footage any
  * undelivered chunk can strand. Stops recording on 429 (daily cap reached).
  *
- * Session rotation: if no rrweb events fire for longer than IDLE_TIMEOUT_MS,
- * the SDK rotates to a fresh session id, flushes the tail of the old one under
- * its original identity, and forces a new FullSnapshot so the new session is
- * independently replayable.
+ * Session rotation: if no rrweb events fire for longer than IDLE_TIMEOUT_MS or
+ * the active session reaches MAX_SESSION_MS, the SDK rotates to a fresh session
+ * id, flushes the tail of the old one under its original identity, and forces a
+ * new FullSnapshot so the new session is independently replayable.
  */
 
 import type { eventWithTime, record as rrwebRecord } from 'rrweb';
@@ -1564,8 +1564,9 @@ function _beaconFlush(): void {
 
 /**
  * Close the current session and open a fresh one when the emit gap exceeds
- * IDLE_TIMEOUT_MS. The next event starts from a FullSnapshot so replay assembly
- * can resume with an independently replayable session.
+ * IDLE_TIMEOUT_MS or its total age reaches MAX_SESSION_MS. The next event starts
+ * from a FullSnapshot so replay assembly can resume with an independently
+ * replayable session.
  *
  * Sequence:
  *   1. capture the old identity + buffered events
@@ -1964,8 +1965,11 @@ export async function startReplay(
     const stop = record({
       emit(event: eventWithTime) {
         const now = Date.now();
+        const hasReachedMaxAge =
+          _sessionStartedAt > 0 && now - _sessionStartedAt >= MAX_SESSION_MS;
         const shouldRotate =
-          _lastEventAt > 0 && now - _lastEventAt > IDLE_TIMEOUT_MS;
+          _lastEventAt > 0 &&
+          (now - _lastEventAt > IDLE_TIMEOUT_MS || hasReachedMaxAge);
         _lastEventAt = now;
         if (shouldRotate) {
           // Rotation synchronously calls takeFullSnapshot, which re-enters this
