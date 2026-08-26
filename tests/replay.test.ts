@@ -630,6 +630,41 @@ describe('session rotation', () => {
     expect(hoisted.takeFullSnapshot).toHaveBeenCalledWith(true);
   });
 
+  it('reuses a periodic FullSnapshot that triggers the hard-limit rotation', async () => {
+    stubIntervalCapture();
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    await flushMicrotasks();
+    const firstSessionId = readStoredSession().id;
+
+    for (const elapsedMs of [14, 28, 42, 56].map((minutes) => minutes * 60 * 1000)) {
+      setNow(START_NOW + elapsedMs);
+      emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
+    }
+
+    hoisted.takeFullSnapshot.mockClear();
+    setNow(START_NOW + MAX_SESSION_MS);
+    snapshotTick();
+
+    const secondSessionId = readStoredSession().id;
+    expect(secondSessionId).not.toBe(firstSessionId);
+    expect(hoisted.takeFullSnapshot).toHaveBeenCalledTimes(1);
+    expect(hoisted.takeFullSnapshot).toHaveBeenCalledWith(true);
+
+    await vi.waitFor(() => {
+      const bootstrap = fetchMock.mock.calls
+        .map(parseFetchBody)
+        .find((body) => body.sessionId === secondSessionId);
+      expect(bootstrap).toMatchObject({
+        sessionId: secondSessionId,
+        sequenceNumber: 0,
+        events: [{ type: 2 }],
+      });
+    });
+  });
+
   it('does not rotate on the very first event of a fresh session', async () => {
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();
