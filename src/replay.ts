@@ -10,10 +10,10 @@
  * survives it. A periodic FullSnapshot checkout bounds how much footage any
  * undelivered chunk can strand. Stops recording on 429 (daily cap reached).
  *
- * Session rotation: if no rrweb events fire for longer than IDLE_TIMEOUT_MS,
- * the SDK rotates to a fresh session id, flushes the tail of the old one under
- * its original identity, and forces a new FullSnapshot so the new session is
- * independently replayable.
+ * Session rotation: if no rrweb events fire for longer than IDLE_TIMEOUT_MS or
+ * the active session reaches MAX_SESSION_MS, the SDK rotates to a fresh session
+ * id, flushes the tail of the old one under its original identity, and forces a
+ * new FullSnapshot so the new session is independently replayable.
  */
 
 import type { eventWithTime, record as rrwebRecord } from 'rrweb';
@@ -1181,14 +1181,20 @@ function _markFirstChunkAcked(chunk: ReplayChunk): void {
 }
 
 /**
- * Open a fresh session and force a FullSnapshot so it is independently
- * replayable. Clears the navigation dedup baseline so the new session re-emits
- * its entry URL on the next route change instead of swallowing it as a duplicate
- * of the previous session's last URL.
+ * Open a fresh session and optionally force a FullSnapshot so it is independently
+ * replayable. When the event that triggered rotation is already a FullSnapshot,
+ * the caller reuses it instead of re-entering rrweb's snapshot capture. Clears
+ * the navigation dedup baseline so the new session re-emits its entry URL on the
+ * next route change instead of swallowing it as a duplicate of the previous
+ * session's last URL.
  */
-function _beginFreshSession(): void {
+function _beginFreshSession(forceFullSnapshot = true): void {
   _openNewSession(Date.now());
   _lastNavigationUrl = null;
+  if (!forceFullSnapshot) {
+    _lastPeriodicSnapshotAt = Date.now();
+    return;
+  }
   try {
     _record?.takeFullSnapshot(true);
     _lastPeriodicSnapshotAt = Date.now();
@@ -1564,23 +1570,24 @@ function _beaconFlush(): void {
 
 /**
  * Close the current session and open a fresh one when the emit gap exceeds
- * IDLE_TIMEOUT_MS. The next event starts from a FullSnapshot so replay assembly
- * can resume with an independently replayable session.
+ * IDLE_TIMEOUT_MS or its total age reaches MAX_SESSION_MS. The next event starts
+ * from a FullSnapshot so replay assembly can resume with an independently
+ * replayable session.
  *
  * Sequence:
  *   1. capture the old identity + buffered events
- *   2. open a fresh session (new id, reset seq, persist) and force a FullSnapshot
- *      so the new session is independently replayable
+ *   2. open a fresh session (new id, reset seq, persist) and ensure it starts
+ *      from a FullSnapshot, reusing the incoming event when it is already one
  *   3. fire-and-forget flush of the old tail under the old identity
  */
-function _rotateSession(): void {
+function _rotateSession(incomingEventIsFullSnapshot = false): void {
   if (!_record || !_sessionId) return;
 
   const oldEvents = _drainEventBuffer();
   const oldSessionId = _sessionId;
   const oldSeq = _sequenceNumber;
 
-  _beginFreshSession();
+  _beginFreshSession(!incomingEventIsFullSnapshot);
 
   if (oldEvents.length > 0) {
     const oldChunks =
@@ -1964,14 +1971,17 @@ export async function startReplay(
     const stop = record({
       emit(event: eventWithTime) {
         const now = Date.now();
+        const hasReachedMaxAge =
+          _sessionStartedAt > 0 && now - _sessionStartedAt >= MAX_SESSION_MS;
         const shouldRotate =
-          _lastEventAt > 0 && now - _lastEventAt > IDLE_TIMEOUT_MS;
+          _lastEventAt > 0 &&
+          (now - _lastEventAt > IDLE_TIMEOUT_MS || hasReachedMaxAge);
         _lastEventAt = now;
         if (shouldRotate) {
-          // Rotation synchronously calls takeFullSnapshot, which re-enters this
-          // emit callback with a type-2 event. Updating _lastEventAt first
+          // Rotation may synchronously call takeFullSnapshot, which re-enters
+          // this emit callback with a type-2 event. Updating _lastEventAt first
           // prevents that nested call from re-triggering rotation.
-          _rotateSession();
+          _rotateSession(_isFullSnapshotEvent(event));
         }
         if (!_shouldBufferReplayEvent(event)) return;
         _bufferEvent(event);
