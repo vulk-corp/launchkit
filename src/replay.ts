@@ -100,10 +100,8 @@ const MAX_SESSION_MS = 60 * 60 * 1000; // 60 min — rotate session after this d
 const STORAGE_KEY = 'bworlds-replay-session';
 const BOOTSTRAP_STORAGE_KEY = 'bworlds-replay-bootstrap-chunk';
 const TOKEN_COOKIE = 'bworlds_token';
-// Stable wire contract — the backend distiller will match on this tag to append
-// SPA route changes to a session's pages_visited. Backend wiring is in progress
-// (#889 workstream 3); until it ships the distiller still reads page from the
-// type-4 Meta event only. Do not rename.
+// Wire contract with the backend distiller: it matches this custom event tag to
+// append SPA route changes to a session's pages_visited. Do not rename.
 const NAVIGATION_TAG = 'navigation';
 const LINK_ACTIVATION_TAG = 'link_activation';
 const GLOBAL_REPLAY_STATE_KEY = '__bworldsLaunchKitReplayState__';
