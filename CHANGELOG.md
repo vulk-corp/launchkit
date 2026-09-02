@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.18.0] - 2026-09-02
+
+### Changed
+
+- **Inline data scrub**: a `data:` attribute value above 32 KB (`src`, `srcset`, `poster`, `href`, `xlink:href`, and `url(data:...)` tokens in `style` or an inlined stylesheet) is replaced by a small grey placeholder in the recorded event before it enters the buffer. Photos rendered as base64 (`FileReader.readAsDataURL`, AI `b64_json`) produced single mutation events of tens of megabytes that no chunk could carry; the element now keeps its place in the tree and the rest of the page records normally. One console warning and one `inline_data_scrubbed` diagnostic (replaced value count and bytes) per session.
+- **Capture ceiling**: an event still above four chunk caps (2 MB raw) after the scrub is dropped at capture: no buffering, no sequence number, one `event_dropped_at_capture` diagnostic (`event_too_large`) per drop and one console warning per session. A FullSnapshot is never dropped this way; it stays on the chunk path and is logged.
+- **Eager flush off the mutation callback**: a FullSnapshot or a buffer past the soft cap schedules the flush on the next macrotask instead of running chunk planning, serialization and gzip inside rrweb's mutation observer callback, which fires inside the host app's own DOM commit. Emits from one task share a single flush. The page-hidden and pagehide beacon path stays synchronous.
+- **Chunk planning without re-serialization**: every buffered event carries the byte estimate measured at capture; flush planning picks split points from a prefix sum with one envelope measurement per flush, and each chunk is serialized exactly once, at upload (`rawBytes` is patched into that single serialization instead of re-serializing until it converges). Chunk boundaries are unchanged.
+
 ## [1.16.0] - 2026-07-02
 
 ### Added
