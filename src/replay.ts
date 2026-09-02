@@ -23,6 +23,7 @@ import { sendTelemetry } from './telemetry-sender';
 import { getVisitorId } from './visitor-state';
 import { generateUuid } from './uuid';
 import { backstampQueuedErrors, unstampQueuedErrors } from './error-capture';
+import { scrubInlineData } from './replay-inline-data';
 
 declare const __SDK_VERSION__: string;
 
@@ -108,6 +109,8 @@ let _eventBuffer: eventWithTime[] = [];
 let _bufferedBytes = 0;
 let _pendingChunks: ReplayChunk[] = [];
 let _flushTimer: ReturnType<typeof setInterval> | null = null;
+// Builder-facing notices that fire once per session: `${kind}:${sessionId}`.
+const _sessionNotices = new Set<string>();
 let _snapshotTimer: ReturnType<typeof setInterval> | null = null;
 let _lastPeriodicSnapshotAt = 0;
 let _stopRecording: (() => void) | null = null;
@@ -402,6 +405,47 @@ function _requeueEvents(events: eventWithTime[]): void {
  */
 function _shouldFlushEagerly(event: eventWithTime): boolean {
   return _isFullSnapshotEvent(event) || _bufferedBytes >= FLUSH_SOFT_MAX_BYTES;
+}
+
+function _isFirstSessionNotice(kind: string): boolean {
+  const key = `${kind}:${_sessionId}`;
+  if (_sessionNotices.has(key)) return false;
+  _sessionNotices.add(key);
+  return true;
+}
+
+function _sizeLabel(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / 1024).toFixed(0)} KB`;
+}
+
+/**
+ * Replace oversized inline data in the event before it is measured or buffered.
+ * The builder hears about it once per session, on the console and through the
+ * diagnostics channel; the replaced bytes explain the placeholders in the
+ * replay. Never throws into the host app.
+ */
+function _scrubEventInlineData(event: eventWithTime): void {
+  let replacedCount = 0;
+  let replacedBytes = 0;
+  try {
+    ({ replacedCount, replacedBytes } = scrubInlineData(event));
+  } catch {
+    return;
+  }
+  if (replacedCount === 0 || !_sessionId) return;
+  if (!_isFirstSessionNotice('inline_data')) return;
+
+  const size = _sizeLabel(replacedBytes);
+  console.warn(
+    replacedCount === 1
+      ? `${SDK_TAG} Replay: an inline base64 image (${size}) was replaced by a placeholder in the recording. Serve images by URL to see them in session replays.`
+      : `${SDK_TAG} Replay: ${replacedCount} inline base64 images (${size}) were replaced by placeholders in the recording. Serve images by URL to see them in session replays.`,
+  );
+  _sendReplayDiagnostic('inline_data_scrubbed', _sessionId, 'warning', {
+    eventCount: replacedCount,
+    rawBytes: replacedBytes,
+  });
 }
 
 function _loadSession(): StoredSession | null {
@@ -841,6 +885,7 @@ type ReplayLifecycleDiagnosticType =
   | 'beacon_queued'
   | 'beacon_not_queued'
   | 'unload_chunks_dropped'
+  | 'inline_data_scrubbed'
   | 'stored_bootstrap_restored'
   | 'stored_bootstrap_missing'
   | 'recorder_stopped';
@@ -1899,6 +1944,7 @@ export function stopReplay(): void {
   _firstChunkAttempts = 0;
   _firstChunkRetryAfter = 0;
   _chunkFailureAttempts.clear();
+  _sessionNotices.clear();
   _viteDevCssFullSnapshotSeen = false;
   _viteDevCssSnapshotRetryScheduled = false;
   _releaseReplayLock();
@@ -1984,6 +2030,7 @@ export async function startReplay(
           _rotateSession(_isFullSnapshotEvent(event));
         }
         if (!_shouldBufferReplayEvent(event)) return;
+        _scrubEventInlineData(event);
         _bufferEvent(event);
         if (_shouldFlushEagerly(event)) {
           _flush().catch(() => {});
