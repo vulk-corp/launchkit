@@ -58,6 +58,7 @@ const API_ENDPOINT = 'https://api.test';
 const STORAGE_KEY = 'bworlds-replay-session';
 const MAX_CHUNK_BYTES = 512_000;
 const CAPTURE_CEILING_BYTES = 4 * MAX_CHUNK_BYTES;
+const DROP_RESYNC_MIN_INTERVAL_MS = 30_000;
 const KB = 1024;
 const MB = 1024 * 1024;
 
@@ -117,6 +118,16 @@ function mutationEvent(data: Record<string, unknown>) {
 
 function addedImage(id: number, src: string) {
   return { parentId: 4, nextId: null, node: element(id, 'img', { src, alt: `image ${id}` }) };
+}
+
+/** A mutation just above the capture ceiling, dropped at emit. */
+function oversizedMutationEvent() {
+  return mutationEvent({ texts: [{ id: 4, value: 'x'.repeat(CAPTURE_CEILING_BYTES + 1) }] });
+}
+
+/** Mirror rrweb: takeFullSnapshot re-enters emit synchronously with a FullSnapshot. */
+function snapshotThroughEmit(emit: (event: unknown) => void): void {
+  hoisted.takeFullSnapshot.mockImplementation(() => emit(fullSnapshotEvent([])));
 }
 
 function countNodes(node: SnapshotNode): number {
@@ -559,6 +570,74 @@ describe('capture ceiling', () => {
     expect(replayDiagnostics('event_dropped_at_capture')).toEqual([]);
     expect(readStoredSession().seq).toBe(1);
     expect(warningsMatching(warn, 'page snapshot')).toBe(1);
+  });
+});
+
+describe('resync after a dropped event', () => {
+  it('takes one FullSnapshot on a later macrotask and uploads it at the next sequence number', async () => {
+    const emit = await startWithBootstrap();
+    snapshotThroughEmit(emit);
+
+    emit(oversizedMutationEvent());
+    expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
+
+    await flushMacrotask();
+    expect(hoisted.takeFullSnapshot).toHaveBeenCalledTimes(1);
+    expect(hoisted.takeFullSnapshot).toHaveBeenCalledWith(true);
+
+    await flushMacrotask();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(parseUploadBody(fetchMock.mock.calls[1])).toMatchObject({
+      sequenceNumber: 1,
+      eventCount: 1,
+      hasFullSnapshot: true,
+    });
+  });
+
+  it('coalesces the drops of one task into a single snapshot', async () => {
+    const emit = await startWithBootstrap();
+    snapshotThroughEmit(emit);
+
+    emit(oversizedMutationEvent());
+    emit(oversizedMutationEvent());
+    emit(oversizedMutationEvent());
+    await flushMacrotask();
+
+    expect(hoisted.takeFullSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it('defers a drop inside the cooldown to the end of the cooldown', async () => {
+    const emit = await startWithBootstrap();
+    snapshotThroughEmit(emit);
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    try {
+      emit(oversizedMutationEvent());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(hoisted.takeFullSnapshot).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      emit(oversizedMutationEvent());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(hoisted.takeFullSnapshot).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(DROP_RESYNC_MIN_INTERVAL_MS - 5_000 - 1);
+      expect(hoisted.takeFullSnapshot).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(hoisted.takeFullSnapshot).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels a pending resync when recording stops', async () => {
+    const emit = await startWithBootstrap();
+    emit(oversizedMutationEvent());
+    stopReplay();
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    await flushMacrotask();
+
+    expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
   });
 });
 

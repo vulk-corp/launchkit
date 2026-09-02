@@ -2,6 +2,10 @@
 
 ## [1.18.0] - 2026-09-02
 
+### Added
+
+- **Resync after a dropped event**: an event dropped at the capture ceiling leaves the player's mirror stale until the next periodic checkout, up to five minutes away. The SDK now requests a FullSnapshot on the next macrotask after a drop, so playback repairs at the next chunk. Drops within 30 seconds of a resync share one snapshot, taken when that cooldown ends; the snapshot runs through the inline data scrub like any event. A session rotation's own FullSnapshot cancels a pending resync.
+
 ### Changed
 
 - **Inline data scrub**: a `data:` attribute value above 32 KB (`src`, `srcset`, `poster`, `href`, `xlink:href`, and `url(data:...)` tokens in `style`, an inlined stylesheet, or a rule inserted through `CSSStyleSheet.insertRule` as CSS-in-JS libraries do) is replaced by a small grey placeholder in the recorded event before it enters the buffer. Photos rendered as base64 (`FileReader.readAsDataURL`, AI `b64_json`) produced single mutation events of tens of megabytes that no chunk could carry; the element now keeps its place in the tree and the rest of the page records normally. One console warning and one `inline_data_scrubbed` diagnostic (replaced value count and bytes) per session.

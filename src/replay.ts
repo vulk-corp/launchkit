@@ -10,7 +10,9 @@
  * residual through the synchronous sendBeacon path: hidden is the last event
  * a dying page reliably fires, and only a body already handed to the browser
  * survives it. A periodic FullSnapshot checkout bounds how much footage any
- * undelivered chunk can strand. Stops recording on 429 (daily cap reached).
+ * undelivered chunk can strand, and a dropped event requests a resync
+ * FullSnapshot so playback does not wait for that checkout. Stops recording on
+ * 429 (daily cap reached).
  *
  * Session rotation: if no rrweb events fire for longer than IDLE_TIMEOUT_MS or
  * the active session reaches MAX_SESSION_MS, the SDK rotates to a fresh session
@@ -64,6 +66,11 @@ const BEACON_UNLOAD_BUDGET_BYTES = 57_000;
 // while the tab is hidden or no event fired since the previous checkout — a
 // snapshot of an unchanged DOM adds bytes without adding a recovery point.
 const FULL_SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
+// A resync FullSnapshot repairs the player's mirror after a dropped mutation.
+// The interval bounds the snapshot traffic a page that keeps producing
+// oversized events can generate; each snapshot runs through the inline data
+// scrub, so it stays small.
+const DROP_RESYNC_MIN_INTERVAL_MS = 30_000;
 const REPLAY_EVENTS_PATH = '/api/telemetry/replay-events';
 const REPLAY_DIAGNOSTICS_PATH = '/api/telemetry/replay-diagnostics';
 const GZIP_ENCODING = 'gzip';
@@ -124,6 +131,8 @@ const _sessionNotices = new Set<string>();
 let _droppedAtCeilingCount = 0;
 let _snapshotTimer: ReturnType<typeof setInterval> | null = null;
 let _lastPeriodicSnapshotAt = 0;
+let _resyncSnapshotTimer: ReturnType<typeof setTimeout> | null = null;
+let _lastResyncSnapshotAt = 0;
 let _stopRecording: (() => void) | null = null;
 let _record: typeof rrwebRecord | null = null;
 let _capReached = false;
@@ -455,6 +464,38 @@ function _cancelEagerFlush(): void {
 }
 
 /**
+ * Request a FullSnapshot after a dropped event so the player's mirror stops
+ * being stale at the next chunk instead of at the periodic checkout. The
+ * snapshot serializes the whole DOM, so it runs on a later macrotask, never
+ * inside the rrweb callback that dropped the event. Drops inside the cooldown
+ * share one snapshot, taken when the cooldown ends: a resync is coalesced,
+ * never lost.
+ */
+function _scheduleResyncSnapshot(): void {
+  if (_resyncSnapshotTimer !== null) return;
+  const delay = Math.max(0, _lastResyncSnapshotAt + DROP_RESYNC_MIN_INTERVAL_MS - Date.now());
+  _resyncSnapshotTimer = setTimeout(() => {
+    _resyncSnapshotTimer = null;
+    if (!_record || !_stopRecording) return;
+    try {
+      // Re-enters emit synchronously with a FullSnapshot event.
+      _record.takeFullSnapshot(true);
+      const now = Date.now();
+      _lastResyncSnapshotAt = now;
+      _lastPeriodicSnapshotAt = now;
+    } catch {
+      // rrweb throws outside an active recording.
+    }
+  }, delay);
+}
+
+function _cancelResyncSnapshot(): void {
+  if (_resyncSnapshotTimer === null) return;
+  clearTimeout(_resyncSnapshotTimer);
+  _resyncSnapshotTimer = null;
+}
+
+/**
  * Register a once-per-session notice. True when it is the first of its kind
  * for the active session.
  */
@@ -519,10 +560,10 @@ function _scrubEventInlineData(event: eventWithTime): void {
  * Gate an event against the capture ceiling. A FullSnapshot always passes: the
  * session is not replayable without it, so the chunk path gets to try. Any
  * other event above the ceiling is dropped here, before it reserves a sequence
- * number, and the session records on without it. The builder hears about the
- * first drop on the console; the diagnostics channel follows the report
- * cadence, carrying the session's cumulative drop count and the size of the
- * event at hand.
+ * number, and the session records on without it; a resync FullSnapshot follows
+ * on a later macrotask. The builder hears about the first drop on the console;
+ * the diagnostics channel follows the report cadence, carrying the session's
+ * cumulative drop count and the size of the event at hand.
  */
 function _admitEventUnderCeiling(event: eventWithTime, bytes: number): boolean {
   if (bytes <= CAPTURE_CEILING_BYTES || !_sessionId) return true;
@@ -551,6 +592,7 @@ function _admitEventUnderCeiling(event: eventWithTime, bytes: number): boolean {
       hasFullSnapshot: false,
     });
   }
+  _scheduleResyncSnapshot();
   return false;
 }
 
@@ -1344,6 +1386,10 @@ function _markFirstChunkAcked(chunk: ReplayChunk): void {
 function _beginFreshSession(forceFullSnapshot = true): void {
   _openNewSession(Date.now());
   _lastNavigationUrl = null;
+  // The fresh session starts from a FullSnapshot either way, so a resync
+  // requested by the previous session has nothing left to repair.
+  _cancelResyncSnapshot();
+  _lastResyncSnapshotAt = Date.now();
   if (!forceFullSnapshot) {
     _lastPeriodicSnapshotAt = Date.now();
     return;
@@ -2017,6 +2063,8 @@ export function stopReplay(): void {
     clearInterval(_snapshotTimer);
     _snapshotTimer = null;
   }
+  _cancelResyncSnapshot();
+  _lastResyncSnapshotAt = 0;
   if (_stopRecording) {
     _stopRecording();
     _stopRecording = null;
