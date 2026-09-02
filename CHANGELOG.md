@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.18.0] - 2026-09-02
+
+### Added
+
+- **Resync after a dropped event**: an event dropped at the capture ceiling leaves the player's mirror stale until the next periodic checkout, up to five minutes away. The SDK now requests a FullSnapshot on the next macrotask after a drop, so playback repairs at the next chunk. Drops within 30 seconds of a resync share one snapshot, taken when that cooldown ends; the snapshot runs through the inline data scrub like any event. A session rotation's own FullSnapshot cancels a pending resync.
+- **Degradation marker in the recording**: every inline data scrub and every capture-ceiling drop is marked inside the recording as a `recording_degraded` custom event (`{ reason: 'inline_data_scrubbed', replacedCount, replacedBytes }` or `{ reason: 'event_dropped', eventCount, rawBytes }`), so the player can explain grey placeholders and missing footage to the viewer. Markers are accumulated per reason and emitted on a macrotask, at most one per reason per second with the totals summed in between. On a drop the marker precedes the resync FullSnapshot.
+
+### Changed
+
+- **Inline data scrub**: a `data:` attribute value above 32 KB (`src`, `srcset`, `poster`, `href`, `xlink:href`, and `url(data:...)` tokens in `style`, an inlined stylesheet, or a rule inserted through `CSSStyleSheet.insertRule` as CSS-in-JS libraries do) is replaced by a small grey placeholder in the recorded event before it enters the buffer. Photos rendered as base64 (`FileReader.readAsDataURL`, AI `b64_json`) produced single mutation events of tens of megabytes that no chunk could carry; the element now keeps its place in the tree and the rest of the page records normally. One console warning and one `inline_data_scrubbed` diagnostic (replaced value count and bytes) per session.
+- **Capture ceiling**: an event still above four chunk caps (2 MB raw) after the scrub is dropped at capture: no buffering, no sequence number, one console warning per session, and an `event_dropped_at_capture` diagnostic (`event_too_large`) for the first five drops of a session, the tenth, then every hundredth, each carrying the session's cumulative drop count in `eventCount` and the dropped event's size in `rawBytes`. A FullSnapshot is never dropped this way; it stays on the chunk path and is logged.
+- **Eager flush off the mutation callback**: a FullSnapshot or a buffer past the soft cap schedules the flush on the next macrotask instead of running chunk planning, serialization and gzip inside rrweb's mutation observer callback, which fires inside the host app's own DOM commit. Emits from one task share a single flush. The page-hidden and pagehide beacon path stays synchronous.
+- **Chunk planning without re-serialization**: every buffered event carries the byte estimate measured at capture; flush planning picks split points from a prefix sum with one envelope measurement per flush, and each chunk is serialized exactly once, at upload (`rawBytes` is patched into that single serialization instead of re-serializing until it converges). Chunk boundaries are unchanged for ASCII content; non-ASCII text is estimated in UTF-16 units and can under-count, which the gzip gate at upload absorbs.
+
 ## [1.16.0] - 2026-07-02
 
 ### Added

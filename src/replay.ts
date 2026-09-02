@@ -2,13 +2,19 @@
  * Session replay module — rrweb recording + chunked upload.
  *
  * Dynamically imports rrweb so the bundle is not included until replay is
- * enabled. Buffers events and flushes on a periodic timer via fetch (the
- * compressed path, no size cap), eagerly on any FullSnapshot or once the
- * buffer passes FLUSH_SOFT_MAX_BYTES. Page hidden and pagehide both drain the
+ * enabled. Every captured event is scrubbed of oversized inline data, gated
+ * against the capture ceiling, then buffered with its byte estimate. The
+ * buffer flushes on a periodic timer via fetch (the compressed path, no size
+ * cap), and on the next macrotask after any FullSnapshot or once the buffer
+ * passes FLUSH_SOFT_MAX_BYTES. Page hidden and pagehide both drain the
  * residual through the synchronous sendBeacon path: hidden is the last event
  * a dying page reliably fires, and only a body already handed to the browser
  * survives it. A periodic FullSnapshot checkout bounds how much footage any
- * undelivered chunk can strand. Stops recording on 429 (daily cap reached).
+ * undelivered chunk can strand, and a dropped event requests a resync
+ * FullSnapshot so playback does not wait for that checkout. Scrubbed and
+ * dropped footage is marked inside the recording with a custom event, so the
+ * player can explain it to the viewer. Stops recording on 429 (daily cap
+ * reached).
  *
  * Session rotation: if no rrweb events fire for longer than IDLE_TIMEOUT_MS or
  * the active session reaches MAX_SESSION_MS, the SDK rotates to a fresh session
@@ -23,12 +29,21 @@ import { sendTelemetry } from './telemetry-sender';
 import { getVisitorId } from './visitor-state';
 import { generateUuid } from './uuid';
 import { backstampQueuedErrors, unstampQueuedErrors } from './error-capture';
+import { scrubInlineData } from './replay-inline-data';
+import { planChunkRanges } from './replay-chunk-plan';
 
 declare const __SDK_VERSION__: string;
 
 const SDK_TAG = '[@bworlds/launchkit]';
 const FLUSH_INTERVAL_MS = 10_000;
 const MAX_CHUNK_BYTES = 512_000; // 512 KB per chunk
+// Capture ceiling: the largest single event the buffer admits, measured on its
+// JSON form after the inline data scrub. Markup and text gzip four to eight
+// times, so an event under four raw chunks still fits one compressed chunk.
+// Anything above is dropped at capture, before it costs a sequence number or a
+// serialization pass; a FullSnapshot is exempt because the session cannot be
+// replayed without it.
+const CAPTURE_CEILING_BYTES = 4 * MAX_CHUNK_BYTES;
 const GZIP_MIN_BYTES = 64 * 1024;
 // Flush the buffer on capture once it passes this size instead of waiting for the
 // periodic timer, so a heavy in-session batch leaves via the compressed fetch path
@@ -53,6 +68,11 @@ const BEACON_UNLOAD_BUDGET_BYTES = 57_000;
 // while the tab is hidden or no event fired since the previous checkout — a
 // snapshot of an unchanged DOM adds bytes without adding a recovery point.
 const FULL_SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
+// A resync FullSnapshot repairs the player's mirror after a dropped mutation.
+// The interval bounds the snapshot traffic a page that keeps producing
+// oversized events can generate; each snapshot runs through the inline data
+// scrub, so it stays small.
+const DROP_RESYNC_MIN_INTERVAL_MS = 30_000;
 const REPLAY_EVENTS_PATH = '/api/telemetry/replay-events';
 const REPLAY_DIAGNOSTICS_PATH = '/api/telemetry/replay-diagnostics';
 const GZIP_ENCODING = 'gzip';
@@ -89,11 +109,17 @@ const MAX_SESSION_MS = 60 * 60 * 1000; // 60 min — rotate session after this d
 const STORAGE_KEY = 'bworlds-replay-session';
 const BOOTSTRAP_STORAGE_KEY = 'bworlds-replay-bootstrap-chunk';
 const TOKEN_COOKIE = 'bworlds_token';
-// Stable wire contract — the backend distiller will match on this tag to append
-// SPA route changes to a session's pages_visited. Backend wiring is in progress
-// (#889 workstream 3); until it ships the distiller still reads page from the
-// type-4 Meta event only. Do not rename.
+// Wire contract with the backend distiller: it matches this custom event tag to
+// append SPA route changes to a session's pages_visited. Do not rename.
 const NAVIGATION_TAG = 'navigation';
+// Wire contract with the backend distiller and the player: they match this
+// custom event tag to explain scrubbed placeholders and dropped footage to the
+// viewer. Do not rename.
+const RECORDING_DEGRADED_TAG = 'recording_degraded';
+// Degradation markers are accumulated per reason and emitted at most once per
+// reason per interval, totals summed while waiting, so a page that scrubs on
+// every mutation cannot flood the recording with markers.
+const DEGRADATION_MARKER_MIN_INTERVAL_MS = 1_000;
 const LINK_ACTIVATION_TAG = 'link_activation';
 const GLOBAL_REPLAY_STATE_KEY = '__bworldsLaunchKitReplayState__';
 const VITE_DEV_CLIENT_SCRIPT_SELECTOR = 'script[src*="/@vite/client"]';
@@ -104,12 +130,23 @@ let _sessionId: string | null = null;
 let _sequenceNumber = 0;
 let _sessionStartedAt = 0;
 let _lastEventAt = 0;
-let _eventBuffer: eventWithTime[] = [];
+let _eventBuffer: BufferedEvent[] = [];
 let _bufferedBytes = 0;
 let _pendingChunks: ReplayChunk[] = [];
 let _flushTimer: ReturnType<typeof setInterval> | null = null;
+let _eagerFlushTimer: ReturnType<typeof setTimeout> | null = null;
+// Builder-facing notices that fire once per session: `${kind}:${sessionId}`.
+const _sessionNotices = new Set<string>();
+// Events the active session has dropped at the capture ceiling.
+let _droppedAtCeilingCount = 0;
+// Degradation totals waiting for the next marker, keyed by reason.
+const _pendingDegradation = new Map<RecordingDegradedReason, DegradationTotals>();
+let _degradationMarkerTimer: ReturnType<typeof setTimeout> | null = null;
+let _lastDegradationMarkerAt = 0;
 let _snapshotTimer: ReturnType<typeof setInterval> | null = null;
 let _lastPeriodicSnapshotAt = 0;
+let _resyncSnapshotTimer: ReturnType<typeof setTimeout> | null = null;
+let _lastResyncSnapshotAt = 0;
 let _stopRecording: (() => void) | null = null;
 let _record: typeof rrwebRecord | null = null;
 let _capReached = false;
@@ -175,6 +212,13 @@ interface ReplayChunk {
   events: eventWithTime[];
 }
 
+// An event waits in the buffer with the size its JSON form had at capture;
+// flush planning reads that size and never serializes the event itself.
+interface BufferedEvent {
+  event: eventWithTime;
+  bytes: number;
+}
+
 interface StoredBootstrapChunk {
   buildSlug: string;
   apiEndpoint: string;
@@ -194,6 +238,20 @@ interface SnapshotNodeLike {
   tagName?: unknown;
   attributes?: Record<string, unknown>;
   childNodes?: SnapshotNodeLike[];
+}
+
+// Payload of a RECORDING_DEGRADED_TAG custom event. Counts and bytes are the
+// totals accumulated since the previous marker of the same reason.
+type RecordingDegradedPayload =
+  | { reason: 'inline_data_scrubbed'; replacedCount: number; replacedBytes: number }
+  | { reason: 'event_dropped'; eventCount: number; rawBytes: number };
+
+type RecordingDegradedReason = RecordingDegradedPayload['reason'];
+
+// Values replaced or events dropped, and the bytes they held.
+interface DegradationTotals {
+  count: number;
+  bytes: number;
 }
 
 type LinkActivationElement = HTMLAnchorElement | HTMLAreaElement;
@@ -362,8 +420,9 @@ function _shouldBufferReplayEvent(event: eventWithTime): boolean {
 }
 
 function _approxEventBytes(event: eventWithTime): number {
-  // UTF-16 length, not exact UTF-8 bytes: enough for a soft flush threshold and
-  // O(1) per emit instead of re-serializing the whole buffer on every event.
+  // UTF-16 length, not exact UTF-8 bytes: enough for the flush thresholds and
+  // the capture ceiling. Measured once per event, at capture; the buffer keeps
+  // the number for chunk planning.
   try {
     return JSON.stringify(event).length;
   } catch {
@@ -371,37 +430,273 @@ function _approxEventBytes(event: eventWithTime): number {
   }
 }
 
-function _sumEventBytes(events: eventWithTime[]): number {
+function _sumEventBytes(entries: BufferedEvent[]): number {
   let total = 0;
-  for (const event of events) total += _approxEventBytes(event);
+  for (const entry of entries) total += entry.bytes;
   return total;
 }
 
-function _bufferEvent(event: eventWithTime): void {
-  _eventBuffer.push(event);
-  _bufferedBytes += _approxEventBytes(event);
+function _bufferEvent(event: eventWithTime, bytes: number): void {
+  _eventBuffer.push({ event, bytes });
+  _bufferedBytes += bytes;
 }
 
-function _drainEventBuffer(): eventWithTime[] {
-  const events = _eventBuffer.splice(0);
+function _drainEventBuffer(): BufferedEvent[] {
+  const entries = _eventBuffer.splice(0);
   _bufferedBytes = 0;
-  return events;
+  return entries;
 }
 
-function _requeueEvents(events: eventWithTime[]): void {
-  _eventBuffer.unshift(...events);
+function _requeueEvents(entries: BufferedEvent[]): void {
+  _eventBuffer.unshift(...entries);
   _bufferedBytes = _sumEventBytes(_eventBuffer);
+}
+
+function _findFullSnapshotIndex(entries: BufferedEvent[]): number {
+  return entries.findIndex((entry) => _isFullSnapshotEvent(entry.event));
 }
 
 /**
  * Flush on capture, ahead of the periodic timer, when the buffer holds a heavy
- * payload. A FullSnapshot is rrweb's largest single event (~200-480 KB) and rrweb
- * re-checkouts one when the page is hidden; routing it through the compressed
- * fetch path here keeps it out of the unload beacon, which caps near 64 KiB. The
- * byte gate does the same for a burst of heavy mutations.
+ * payload: a FullSnapshot (rrweb's largest single event, ~200-480 KB, and the
+ * one rrweb re-checkouts when the page is hidden) or a burst of mutations past
+ * the byte gate. Either leaves through the compressed fetch path on the next
+ * macrotask instead of waiting for the periodic timer. A page hidden before
+ * that macrotask drains the buffer through the beacon path, which declares any
+ * loss through its diagnostics.
  */
 function _shouldFlushEagerly(event: eventWithTime): boolean {
   return _isFullSnapshotEvent(event) || _bufferedBytes >= FLUSH_SOFT_MAX_BYTES;
+}
+
+/**
+ * An eager flush runs on the next macrotask, never inside the rrweb callback
+ * that asked for it. That callback fires from a mutation observer, inside the
+ * host app's own DOM commit: chunk planning, serialization, and gzip all wait
+ * until the commit has returned. Emits within one task share a single flush.
+ * The page-hidden and pagehide beacon path stays synchronous; it is the only
+ * flush that may run inside an unload.
+ */
+function _scheduleEagerFlush(): void {
+  if (_eagerFlushTimer !== null) return;
+  _eagerFlushTimer = setTimeout(() => {
+    _eagerFlushTimer = null;
+    _flush().catch(() => {});
+  }, 0);
+}
+
+function _cancelEagerFlush(): void {
+  if (_eagerFlushTimer === null) return;
+  clearTimeout(_eagerFlushTimer);
+  _eagerFlushTimer = null;
+}
+
+/**
+ * Request a FullSnapshot after a dropped event so the player's mirror stops
+ * being stale at the next chunk instead of at the periodic checkout. The
+ * snapshot serializes the whole DOM, so it runs on a later macrotask, never
+ * inside the rrweb callback that dropped the event. Drops inside the cooldown
+ * share one snapshot, taken when the cooldown ends: a resync is coalesced,
+ * never lost.
+ */
+function _scheduleResyncSnapshot(): void {
+  if (_resyncSnapshotTimer !== null) return;
+  const delay = Math.max(0, _lastResyncSnapshotAt + DROP_RESYNC_MIN_INTERVAL_MS - Date.now());
+  _resyncSnapshotTimer = setTimeout(() => {
+    _resyncSnapshotTimer = null;
+    if (!_record || !_stopRecording) return;
+    try {
+      // Re-enters emit synchronously with a FullSnapshot event.
+      _record.takeFullSnapshot(true);
+      const now = Date.now();
+      _lastResyncSnapshotAt = now;
+      _lastPeriodicSnapshotAt = now;
+    } catch {
+      // rrweb throws outside an active recording.
+    }
+  }, delay);
+}
+
+function _cancelResyncSnapshot(): void {
+  if (_resyncSnapshotTimer === null) return;
+  clearTimeout(_resyncSnapshotTimer);
+  _resyncSnapshotTimer = null;
+}
+
+/**
+ * Add a degradation to the totals waiting for the next marker and make sure a
+ * marker is scheduled. Never throws into the host app.
+ */
+function _recordDegradation(reason: RecordingDegradedReason, count: number, bytes: number): void {
+  try {
+    const totals = _pendingDegradation.get(reason);
+    if (totals) {
+      totals.count += count;
+      totals.bytes += bytes;
+    } else {
+      _pendingDegradation.set(reason, { count, bytes });
+    }
+    _scheduleDegradationMarker();
+  } catch {
+    // The marker is best-effort.
+  }
+}
+
+function _degradationMarkerPayload(
+  reason: RecordingDegradedReason,
+  totals: DegradationTotals,
+): RecordingDegradedPayload {
+  return reason === 'inline_data_scrubbed'
+    ? { reason, replacedCount: totals.count, replacedBytes: totals.bytes }
+    : { reason, eventCount: totals.count, rawBytes: totals.bytes };
+}
+
+/**
+ * Emit the pending markers on a later macrotask, at most once per reason per
+ * DEGRADATION_MARKER_MIN_INTERVAL_MS. rrweb refuses addCustomEvent until its
+ * own recording flag is set, which happens after the initial FullSnapshot is
+ * emitted, so a marker raised while that snapshot is scrubbed must wait for a
+ * later macrotask; the deferral also keeps the marker out of the
+ * mutation-observer callback.
+ */
+function _scheduleDegradationMarker(): void {
+  if (_degradationMarkerTimer !== null) return;
+  const delay = Math.max(
+    0,
+    _lastDegradationMarkerAt + DEGRADATION_MARKER_MIN_INTERVAL_MS - Date.now(),
+  );
+  _degradationMarkerTimer = setTimeout(_emitDegradationMarkers, delay);
+}
+
+function _emitDegradationMarkers(): void {
+  _degradationMarkerTimer = null;
+  const pending = Array.from(_pendingDegradation);
+  _pendingDegradation.clear();
+  _lastDegradationMarkerAt = Date.now();
+  if (!_record || !_stopRecording) return;
+  for (const [reason, totals] of pending) {
+    try {
+      // Routes through emit like any rrweb event: scrubbed, measured, buffered.
+      _record.addCustomEvent(RECORDING_DEGRADED_TAG, _degradationMarkerPayload(reason, totals));
+    } catch {
+      // rrweb refuses a custom event outside an active recording.
+    }
+  }
+}
+
+function _cancelDegradationMarker(): void {
+  if (_degradationMarkerTimer !== null) {
+    clearTimeout(_degradationMarkerTimer);
+    _degradationMarkerTimer = null;
+  }
+  _pendingDegradation.clear();
+}
+
+/**
+ * Register a once-per-session notice. True when it is the first of its kind
+ * for the active session.
+ */
+function _claimSessionNotice(kind: string): boolean {
+  const key = `${kind}:${_sessionId}`;
+  if (_sessionNotices.has(key)) return false;
+  _sessionNotices.add(key);
+  return true;
+}
+
+// A host that wraps console and throws must not break the recording callback.
+function _warnBuilder(message: string): void {
+  try {
+    console.warn(message);
+  } catch {
+    // The notice is best-effort.
+  }
+}
+
+// Diagnostics for events dropped at the capture ceiling thin out as a session
+// accumulates them: the first five, the tenth, then every hundredth. Each one
+// carries the cumulative count, so the latest report holds the session total.
+function _shouldReportDroppedEvent(droppedCount: number): boolean {
+  return droppedCount <= 5 || droppedCount === 10 || droppedCount % 100 === 0;
+}
+
+function _sizeLabel(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / 1024).toFixed(0)} KB`;
+}
+
+/**
+ * Replace oversized inline data in the event before it is measured or buffered.
+ * Every scrub feeds the degradation marker inside the recording; the builder
+ * hears about it once per session, on the console and through the diagnostics
+ * channel. The replaced bytes explain the placeholders in the replay. Never
+ * throws into the host app.
+ */
+function _scrubEventInlineData(event: eventWithTime): void {
+  let replacedCount = 0;
+  let replacedBytes = 0;
+  try {
+    ({ replacedCount, replacedBytes } = scrubInlineData(event));
+  } catch {
+    return;
+  }
+  if (replacedCount === 0 || !_sessionId) return;
+  _recordDegradation('inline_data_scrubbed', replacedCount, replacedBytes);
+  if (!_claimSessionNotice('inline_data')) return;
+
+  const size = _sizeLabel(replacedBytes);
+  _warnBuilder(
+    replacedCount === 1
+      ? `${SDK_TAG} Replay: an inline base64 image (${size}) was replaced by a placeholder in the recording. Serve images by URL to see them in session replays.`
+      : `${SDK_TAG} Replay: ${replacedCount} inline base64 images (${size}) were replaced by placeholders in the recording. Serve images by URL to see them in session replays.`,
+  );
+  _sendReplayDiagnostic('inline_data_scrubbed', _sessionId, 'warning', {
+    eventCount: replacedCount,
+    rawBytes: replacedBytes,
+  });
+}
+
+/**
+ * Gate an event against the capture ceiling. A FullSnapshot always passes: the
+ * session is not replayable without it, so the chunk path gets to try. Any
+ * other event above the ceiling is dropped here, before it reserves a sequence
+ * number, and the session records on without it; a degradation marker and then
+ * a resync FullSnapshot follow on later macrotasks. The builder hears about the
+ * first drop on the console; the diagnostics channel follows the report
+ * cadence, carrying the session's cumulative drop count and the size of the
+ * event at hand.
+ */
+function _admitEventUnderCeiling(event: eventWithTime, bytes: number): boolean {
+  if (bytes <= CAPTURE_CEILING_BYTES || !_sessionId) return true;
+  const ceiling = _sizeLabel(CAPTURE_CEILING_BYTES);
+
+  if (_isFullSnapshotEvent(event)) {
+    if (_claimSessionNotice('snapshot_over_ceiling')) {
+      _warnBuilder(
+        `${SDK_TAG} Replay: a page snapshot (${_sizeLabel(bytes)}) exceeds the capture ceiling (${ceiling}). It is kept, but its upload may fail.`,
+      );
+    }
+    return true;
+  }
+
+  _droppedAtCeilingCount += 1;
+  if (_claimSessionNotice('event_dropped')) {
+    _warnBuilder(
+      `${SDK_TAG} Replay: a recording event (${_sizeLabel(bytes)}) exceeded the capture ceiling (${ceiling}) and was dropped. Recording continues.`,
+    );
+  }
+  if (_shouldReportDroppedEvent(_droppedAtCeilingCount)) {
+    _sendReplayDiagnostic('event_dropped_at_capture', _sessionId, 'warning', {
+      reason: 'event_too_large',
+      rawBytes: bytes,
+      eventCount: _droppedAtCeilingCount,
+      hasFullSnapshot: false,
+    });
+  }
+  // The marker is scheduled first so it precedes the repaired snapshot in the
+  // recording.
+  _recordDegradation('event_dropped', 1, bytes);
+  _scheduleResyncSnapshot();
+  return false;
 }
 
 function _loadSession(): StoredSession | null {
@@ -528,6 +823,7 @@ function _openNewSession(now: number): void {
   _firstChunkAcked = false;
   _firstChunkAttempts = 0;
   _firstChunkRetryAfter = 0;
+  _droppedAtCeilingCount = 0;
   setReplaySessionId(_sessionId);
   _saveSession();
   _sendReplayDiagnostic('session_started', _sessionId, 'info');
@@ -648,18 +944,15 @@ function _hasFullSnapshot(events: eventWithTime[]): boolean {
   return events.some((event) => event.type === fullSnapshotType);
 }
 
-function _dropInitialIncrementalPreamble(events: eventWithTime[]): eventWithTime[] {
-  const fullSnapshotType = _EventType?.FullSnapshot ?? 2;
+function _dropInitialIncrementalPreamble(entries: BufferedEvent[]): BufferedEvent[] {
   const incrementalType = _EventType?.IncrementalSnapshot ?? 3;
-  const fullSnapshotIndex = events.findIndex(
-    (event) => event.type === fullSnapshotType,
-  );
-  if (fullSnapshotIndex <= 0) return events;
+  const fullSnapshotIndex = _findFullSnapshotIndex(entries);
+  if (fullSnapshotIndex <= 0) return entries;
 
-  const filtered = events.filter(
-    (event, index) => index >= fullSnapshotIndex || event.type !== incrementalType,
+  const filtered = entries.filter(
+    (entry, index) => index >= fullSnapshotIndex || entry.event.type !== incrementalType,
   );
-  return filtered.length === events.length ? events : filtered;
+  return filtered.length === entries.length ? entries : filtered;
 }
 
 function _buildPayload(
@@ -706,23 +999,24 @@ function _buildPayload(
   };
 }
 
-function _payloadBytes(
-  events: eventWithTime[],
+/**
+ * Bytes of the upload body around an empty events array, as an upper bound for
+ * every chunk the plan can produce: the first-chunk fields (user agent) are
+ * included whenever the plan starts at sequence 0, the sequence number and event
+ * count take their widest digit counts, 'beacon' is the longest transport label,
+ * and MAX_CHUNK_BYTES over-reserves the rawBytes digits. Measured once per plan.
+ */
+function _envelopeBytes(
   sessionId: string,
-  sequenceNumber: number,
+  firstSequenceNumber: number,
+  eventCount: number,
 ): number {
-  const isFirst = sequenceNumber === 0;
-  // Measure the payload with the upload metadata _serializeChunk adds later
-  // (transport + rawBytes), otherwise a chunk just under the cap here grows past
-  // it during serialization and _postChunk drops it as too large. rawBytes is not
-  // yet known; MAX_CHUNK_BYTES over-reserves its digit count, and 'beacon' is the
-  // longest transport label, keeping this an upper bound on the sent size.
   const body = JSON.stringify(
-    _buildPayload(events, sessionId, sequenceNumber, isFirst, {
+    _buildPayload([], sessionId, firstSequenceNumber + eventCount, firstSequenceNumber === 0, {
       transport: 'beacon',
       rawBytes: MAX_CHUNK_BYTES,
-      eventCount: events.length,
-      hasFullSnapshot: _hasFullSnapshot(events),
+      eventCount,
+      hasFullSnapshot: false,
     }),
   );
   return new TextEncoder().encode(body).byteLength;
@@ -741,49 +1035,30 @@ function _splitPoint(events: eventWithTime[], sequenceNumber: number): number {
   return Math.max(1, Math.min(mid, events.length - 1));
 }
 
+/**
+ * Group buffered events into chunks sized against MAX_CHUNK_BYTES using the
+ * byte estimates captured with them: one envelope measurement per plan, no
+ * serialization per event. The exact size is measured once, when the chunk is
+ * serialized for upload.
+ */
 function _planChunks(
-  events: eventWithTime[],
+  entries: BufferedEvent[],
   sessionId: string,
   firstSequenceNumber: number,
 ): ReplayChunk[] {
-  if (
-    _payloadBytes(events, sessionId, firstSequenceNumber) <= MAX_CHUNK_BYTES ||
-    events.length <= 1
-  ) {
-    return [{ sessionId, sequenceNumber: firstSequenceNumber, events }];
-  }
-
-  if (firstSequenceNumber === 0) {
-    const fullSnapshotIndex = events.findIndex(
-      (event) => event.type === (_EventType?.FullSnapshot ?? 2),
-    );
-    if (fullSnapshotIndex >= 0) {
-      const bootstrapEnd = fullSnapshotIndex + 1;
-      const bootstrapChunk = {
-        sessionId,
-        sequenceNumber: firstSequenceNumber,
-        events: events.slice(0, bootstrapEnd),
-      };
-      if (bootstrapEnd >= events.length) return [bootstrapChunk];
-      return [
-        bootstrapChunk,
-        ..._planChunks(events.slice(bootstrapEnd), sessionId, firstSequenceNumber + 1),
-      ];
-    }
-  }
-
-  const mid = _splitPoint(events, firstSequenceNumber);
-  const left = _planChunks(
-    events.slice(0, mid),
-    sessionId,
+  if (entries.length === 0) return [];
+  const ranges = planChunkRanges({
+    sizes: entries.map((entry) => entry.bytes),
+    envelopeBytes: _envelopeBytes(sessionId, firstSequenceNumber, entries.length),
+    budgetBytes: MAX_CHUNK_BYTES,
     firstSequenceNumber,
-  );
-  const right = _planChunks(
-    events.slice(mid),
+    fullSnapshotIndex: _findFullSnapshotIndex(entries),
+  });
+  return ranges.map((range, index) => ({
     sessionId,
-    firstSequenceNumber + left.length,
-  );
-  return [...left, ...right];
+    sequenceNumber: firstSequenceNumber + index,
+    events: entries.slice(range.start, range.end).map((entry) => entry.event),
+  }));
 }
 
 function _reserveSequenceRange(sessionId: string, count: number): number | null {
@@ -795,22 +1070,22 @@ function _reserveSequenceRange(sessionId: string, count: number): number | null 
 }
 
 function _reserveChunksForEvents(
-  events: eventWithTime[],
+  entries: BufferedEvent[],
   sessionId: string,
 ): ReplayChunk[] | null {
-  if (events.length === 0) return [];
-  if (_sequenceNumber === 0 && !_hasFullSnapshot(events)) return null;
+  if (entries.length === 0) return [];
+  if (_sequenceNumber === 0 && _findFullSnapshotIndex(entries) < 0) return null;
 
-  const normalizedEvents =
-    _sequenceNumber === 0 ? _dropInitialIncrementalPreamble(events) : events;
-  const planned = _planChunks(normalizedEvents, sessionId, _sequenceNumber);
+  const normalizedEntries =
+    _sequenceNumber === 0 ? _dropInitialIncrementalPreamble(entries) : entries;
+  const planned = _planChunks(normalizedEntries, sessionId, _sequenceNumber);
   const firstSequenceNumber = _reserveSequenceRange(sessionId, planned.length);
   if (firstSequenceNumber === null) return null;
 
   const chunks =
     firstSequenceNumber === planned[0]?.sequenceNumber
       ? planned
-      : _planChunks(normalizedEvents, sessionId, firstSequenceNumber);
+      : _planChunks(normalizedEntries, sessionId, firstSequenceNumber);
   if (chunks[0]?.sequenceNumber === 0) {
     _saveStoredBootstrapChunk(chunks[0]);
   }
@@ -825,7 +1100,8 @@ type ReplayChunkDiagnosticReason =
   | 'beacon_not_queued'
   | 'unload_budget_exhausted'
   | 'retry_budget_exhausted'
-  | 'missing_stored_bootstrap';
+  | 'missing_stored_bootstrap'
+  | 'event_too_large';
 
 type ReplayLifecycleDiagnosticType =
   | 'session_started'
@@ -841,6 +1117,8 @@ type ReplayLifecycleDiagnosticType =
   | 'beacon_queued'
   | 'beacon_not_queued'
   | 'unload_chunks_dropped'
+  | 'inline_data_scrubbed'
+  | 'event_dropped_at_capture'
   | 'stored_bootstrap_restored'
   | 'stored_bootstrap_missing'
   | 'recorder_stopped';
@@ -881,31 +1159,51 @@ type SerializedChunk = {
   rawBytes: number;
 };
 
+// The payload's rawBytes field reports the UTF-8 size of the very text that
+// carries it. The text is serialized once with this sentinel and the sentinel is
+// patched with the size the patched text will have. A negative value is never a
+// genuine size, and the field precedes `events` in the payload, so the first
+// occurrence is always the metadata field, never host content.
+const RAW_BYTES_SENTINEL = -1;
+const RAW_BYTES_SENTINEL_FIELD = `"rawBytes":${RAW_BYTES_SENTINEL}`;
+
+/**
+ * Size of the payload once the sentinel is swapped for that size's own digits:
+ * the only value whose digit count matches the length it produces.
+ */
+function _rawBytesAfterPatch(templateBytes: number): number {
+  const base = templateBytes - String(RAW_BYTES_SENTINEL).length;
+  for (let digits = 1; digits <= 16; digits += 1) {
+    const candidate = base + digits;
+    if (String(candidate).length === digits) return candidate;
+  }
+  return base;
+}
+
+/**
+ * One serialization per chunk. The payload reports transport + rawBytes but
+ * never compressedBytes: gzip runs on this JSON after it is built, so the
+ * compressed size cannot be embedded in it. The backend derives it from the
+ * gzipped request's own byte length, and the diagnostics channel reports it out
+ * of band.
+ */
 function _serializeChunk(
   chunk: ReplayChunk,
   transport: ReplayTransport,
 ): SerializedChunk {
   const isFirst = chunk.sequenceNumber === 0;
-  let rawBytes: number | null = null;
-  let payload = '';
-  let bytes = new Uint8Array() as Uint8Array<ArrayBuffer>;
-  // The payload reports transport + rawBytes but never compressedBytes: gzip runs
-  // on this JSON after it is built, so the compressed size cannot be embedded in
-  // it. The backend derives it from the gzipped request's own byte length, and
-  // the diagnostics channel reports it out of band.
-  for (let i = 0; i < 3; i += 1) {
-    payload = JSON.stringify(
-      _buildPayload(chunk.events, chunk.sessionId, chunk.sequenceNumber, isFirst, {
-        transport,
-        rawBytes,
-        eventCount: chunk.events.length,
-        hasFullSnapshot: _hasFullSnapshot(chunk.events),
-      }),
-    );
-    bytes = new TextEncoder().encode(payload) as Uint8Array<ArrayBuffer>;
-    if (rawBytes === bytes.byteLength) break;
-    rawBytes = bytes.byteLength;
-  }
+  const encoder = new TextEncoder();
+  const template = JSON.stringify(
+    _buildPayload(chunk.events, chunk.sessionId, chunk.sequenceNumber, isFirst, {
+      transport,
+      rawBytes: RAW_BYTES_SENTINEL,
+      eventCount: chunk.events.length,
+      hasFullSnapshot: _hasFullSnapshot(chunk.events),
+    }),
+  );
+  const rawBytes = _rawBytesAfterPatch(encoder.encode(template).byteLength);
+  const payload = template.replace(RAW_BYTES_SENTINEL_FIELD, `"rawBytes":${rawBytes}`);
+  const bytes = encoder.encode(payload) as Uint8Array<ArrayBuffer>;
   return { payload, bytes, rawBytes: bytes.byteLength };
 }
 
@@ -1191,6 +1489,10 @@ function _markFirstChunkAcked(chunk: ReplayChunk): void {
 function _beginFreshSession(forceFullSnapshot = true): void {
   _openNewSession(Date.now());
   _lastNavigationUrl = null;
+  // The fresh session starts from a FullSnapshot either way, so a resync
+  // requested by the previous session has nothing left to repair.
+  _cancelResyncSnapshot();
+  _lastResyncSnapshotAt = Date.now();
   if (!forceFullSnapshot) {
     _lastPeriodicSnapshotAt = Date.now();
     return;
@@ -1301,11 +1603,11 @@ async function _flush(): Promise<void> {
       }
     }
 
-    const events = _drainEventBuffer();
-    const chunks = _reserveChunksForEvents(events, sessionId);
+    const entries = _drainEventBuffer();
+    const chunks = _reserveChunksForEvents(entries, sessionId);
     if (!chunks) {
       if (_sessionId === sessionId) {
-        _requeueEvents(events);
+        _requeueEvents(entries);
         _pendingChunks.unshift(...deferredPendingChunks);
       }
       return;
@@ -1470,16 +1772,16 @@ function _fitEventsToBeaconBodies(
  * events cannot be attributed.
  */
 function _reserveBeaconChunks(
-  events: eventWithTime[],
+  entries: BufferedEvent[],
   sessionId: string,
 ): { chunks: ReplayChunk[]; droppedEvents: eventWithTime[] } | null {
-  if (events.length === 0) return { chunks: [], droppedEvents: [] };
-  if (_sequenceNumber === 0 && !_hasFullSnapshot(events)) return null;
+  if (entries.length === 0) return { chunks: [], droppedEvents: [] };
+  if (_sequenceNumber === 0 && _findFullSnapshotIndex(entries) < 0) return null;
 
-  const normalizedEvents =
-    _sequenceNumber === 0 ? _dropInitialIncrementalPreamble(events) : events;
+  const normalizedEntries =
+    _sequenceNumber === 0 ? _dropInitialIncrementalPreamble(entries) : entries;
   const { fitted, droppedEvents } = _fitEventsToBeaconBodies(
-    normalizedEvents,
+    normalizedEntries.map((entry) => entry.event),
     sessionId,
     _sequenceNumber,
   );
@@ -1527,8 +1829,8 @@ function _beaconFlush(): void {
   let droppedRawBytes = 0;
 
   if (_eventBuffer.length > 0) {
-    const events = _drainEventBuffer();
-    const reserved = _reserveBeaconChunks(events, sessionId);
+    const entries = _drainEventBuffer();
+    const reserved = _reserveBeaconChunks(entries, sessionId);
     if (reserved) {
       chunks.push(...reserved.chunks);
       droppedEventCount += reserved.droppedEvents.length;
@@ -1583,17 +1885,17 @@ function _beaconFlush(): void {
 function _rotateSession(incomingEventIsFullSnapshot = false): void {
   if (!_record || !_sessionId) return;
 
-  const oldEvents = _drainEventBuffer();
+  const oldEntries = _drainEventBuffer();
   const oldSessionId = _sessionId;
   const oldSeq = _sequenceNumber;
 
   _beginFreshSession(!incomingEventIsFullSnapshot);
 
-  if (oldEvents.length > 0) {
+  if (oldEntries.length > 0) {
     const oldChunks =
-      oldSeq === 0 && !_hasFullSnapshot(oldEvents)
+      oldSeq === 0 && _findFullSnapshotIndex(oldEntries) < 0
         ? []
-        : _planChunks(oldEvents, oldSessionId, oldSeq);
+        : _planChunks(oldEntries, oldSessionId, oldSeq);
     void _uploadReservedChunks(oldChunks)
       .then((failed) => {
         if (failed.length > 0) _pendingChunks.unshift(...failed);
@@ -1859,10 +2161,15 @@ export function stopReplay(): void {
     clearInterval(_flushTimer);
     _flushTimer = null;
   }
+  _cancelEagerFlush();
   if (_snapshotTimer) {
     clearInterval(_snapshotTimer);
     _snapshotTimer = null;
   }
+  _cancelResyncSnapshot();
+  _lastResyncSnapshotAt = 0;
+  _cancelDegradationMarker();
+  _lastDegradationMarkerAt = 0;
   if (_stopRecording) {
     _stopRecording();
     _stopRecording = null;
@@ -1899,6 +2206,8 @@ export function stopReplay(): void {
   _firstChunkAttempts = 0;
   _firstChunkRetryAfter = 0;
   _chunkFailureAttempts.clear();
+  _sessionNotices.clear();
+  _droppedAtCeilingCount = 0;
   _viteDevCssFullSnapshotSeen = false;
   _viteDevCssSnapshotRetryScheduled = false;
   _releaseReplayLock();
@@ -1931,6 +2240,7 @@ export async function startReplay(
     _pendingChunks = [];
     _capReached = false;
     _lastEventAt = 0;
+    _droppedAtCeilingCount = 0;
     _viteDevCssFullSnapshotSeen = false;
     _viteDevCssSnapshotRetryScheduled = false;
     let shouldFlushStoredBootstrap = false;
@@ -1984,9 +2294,12 @@ export async function startReplay(
           _rotateSession(_isFullSnapshotEvent(event));
         }
         if (!_shouldBufferReplayEvent(event)) return;
-        _bufferEvent(event);
+        _scrubEventInlineData(event);
+        const bytes = _approxEventBytes(event);
+        if (!_admitEventUnderCeiling(event, bytes)) return;
+        _bufferEvent(event, bytes);
         if (_shouldFlushEagerly(event)) {
-          _flush().catch(() => {});
+          _scheduleEagerFlush();
         }
       },
       maskInputOptions: {
