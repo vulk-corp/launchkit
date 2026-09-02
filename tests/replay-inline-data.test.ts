@@ -356,6 +356,64 @@ describe('inline data at capture', () => {
   });
 });
 
+describe('capture ceiling', () => {
+  it('drops an oversized event before buffering, without reserving a sequence number', async () => {
+    const emit = await startWithBootstrap();
+    const sessionId = readStoredSession().id;
+    expect(readStoredSession().seq).toBe(1);
+
+    const oversized = mutationEvent({
+      texts: [{ id: 4, value: 'x'.repeat(CAPTURE_CEILING_BYTES + 1) }],
+    });
+    emit(oversized);
+    emit(oversized);
+    await flushMacrotask();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(readStoredSession().seq).toBe(1);
+    expect(replayDiagnostics('event_dropped_at_capture')).toEqual([
+      expect.objectContaining({
+        sessionId,
+        severity: 'warning',
+        reason: 'event_too_large',
+        rawBytes: expect.any(Number),
+        eventCount: 1,
+        hasFullSnapshot: false,
+      }),
+      expect.objectContaining({ sessionId, reason: 'event_too_large' }),
+    ]);
+    expect(replayDiagnostics('event_dropped_at_capture')[0].rawBytes as number).toBeGreaterThan(
+      CAPTURE_CEILING_BYTES,
+    );
+    expect(warningsMatching(warn, 'exceeded the capture ceiling')).toBe(1);
+
+    // Recording continues: the next event still lands on the chunk path.
+    emit(fullSnapshotEvent([]));
+    await flushMacrotask();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(parseUploadBody(fetchMock.mock.calls[1])).toMatchObject({
+      sequenceNumber: 1,
+      eventCount: 1,
+    });
+  });
+
+  it('keeps a FullSnapshot above the ceiling on the chunk path', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit()!;
+
+    emit({
+      type: 2,
+      timestamp: Date.now(),
+      data: { html: 'x'.repeat(CAPTURE_CEILING_BYTES + 1) },
+    });
+    await flushMacrotask();
+
+    expect(replayDiagnostics('event_dropped_at_capture')).toEqual([]);
+    expect(readStoredSession().seq).toBe(1);
+    expect(warningsMatching(warn, 'page snapshot')).toBe(1);
+  });
+});
+
 describe('capture cost', () => {
   it('passes a 20 MB inline image event through emit in under 50 ms', async () => {
     const emit = await startWithBootstrap();

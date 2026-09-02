@@ -30,6 +30,13 @@ declare const __SDK_VERSION__: string;
 const SDK_TAG = '[@bworlds/launchkit]';
 const FLUSH_INTERVAL_MS = 10_000;
 const MAX_CHUNK_BYTES = 512_000; // 512 KB per chunk
+// Capture ceiling: the largest single event the buffer admits, measured on its
+// JSON form after the inline data scrub. Markup and text gzip four to eight
+// times, so an event under four raw chunks still fits one compressed chunk.
+// Anything above is dropped at capture, before it costs a sequence number or a
+// serialization pass; a FullSnapshot is exempt because the session cannot be
+// replayed without it.
+const CAPTURE_CEILING_BYTES = 4 * MAX_CHUNK_BYTES;
 const GZIP_MIN_BYTES = 64 * 1024;
 // Flush the buffer on capture once it passes this size instead of waiting for the
 // periodic timer, so a heavy in-session batch leaves via the compressed fetch path
@@ -380,9 +387,9 @@ function _sumEventBytes(events: eventWithTime[]): number {
   return total;
 }
 
-function _bufferEvent(event: eventWithTime): void {
+function _bufferEvent(event: eventWithTime, bytes: number): void {
   _eventBuffer.push(event);
-  _bufferedBytes += _approxEventBytes(event);
+  _bufferedBytes += bytes;
 }
 
 function _drainEventBuffer(): eventWithTime[] {
@@ -692,6 +699,39 @@ function _hasFullSnapshot(events: eventWithTime[]): boolean {
   return events.some((event) => event.type === fullSnapshotType);
 }
 
+/**
+ * Gate an event against the capture ceiling. A FullSnapshot always passes: the
+ * session is not replayable without it, so the chunk path gets to try. Any
+ * other event above the ceiling is dropped here, before it reserves a sequence
+ * number, and the session records on without it.
+ */
+function _admitEventUnderCeiling(event: eventWithTime, bytes: number): boolean {
+  if (bytes <= CAPTURE_CEILING_BYTES || !_sessionId) return true;
+  const ceiling = _sizeLabel(CAPTURE_CEILING_BYTES);
+
+  if (_isFullSnapshotEvent(event)) {
+    if (_isFirstSessionNotice('snapshot_over_ceiling')) {
+      console.warn(
+        `${SDK_TAG} Replay: a page snapshot (${_sizeLabel(bytes)}) exceeds the capture ceiling (${ceiling}). It is kept, but its upload may fail.`,
+      );
+    }
+    return true;
+  }
+
+  if (_isFirstSessionNotice('event_dropped')) {
+    console.warn(
+      `${SDK_TAG} Replay: a recording event (${_sizeLabel(bytes)}) exceeded the capture ceiling (${ceiling}) and was dropped. Recording continues.`,
+    );
+  }
+  _sendReplayDiagnostic('event_dropped_at_capture', _sessionId, 'warning', {
+    reason: 'event_too_large',
+    rawBytes: bytes,
+    eventCount: 1,
+    hasFullSnapshot: false,
+  });
+  return false;
+}
+
 function _dropInitialIncrementalPreamble(events: eventWithTime[]): eventWithTime[] {
   const fullSnapshotType = _EventType?.FullSnapshot ?? 2;
   const incrementalType = _EventType?.IncrementalSnapshot ?? 3;
@@ -869,7 +909,8 @@ type ReplayChunkDiagnosticReason =
   | 'beacon_not_queued'
   | 'unload_budget_exhausted'
   | 'retry_budget_exhausted'
-  | 'missing_stored_bootstrap';
+  | 'missing_stored_bootstrap'
+  | 'event_too_large';
 
 type ReplayLifecycleDiagnosticType =
   | 'session_started'
@@ -886,6 +927,7 @@ type ReplayLifecycleDiagnosticType =
   | 'beacon_not_queued'
   | 'unload_chunks_dropped'
   | 'inline_data_scrubbed'
+  | 'event_dropped_at_capture'
   | 'stored_bootstrap_restored'
   | 'stored_bootstrap_missing'
   | 'recorder_stopped';
@@ -2031,7 +2073,9 @@ export async function startReplay(
         }
         if (!_shouldBufferReplayEvent(event)) return;
         _scrubEventInlineData(event);
-        _bufferEvent(event);
+        const bytes = _approxEventBytes(event);
+        if (!_admitEventUnderCeiling(event, bytes)) return;
+        _bufferEvent(event, bytes);
         if (_shouldFlushEagerly(event)) {
           _flush().catch(() => {});
         }
