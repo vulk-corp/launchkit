@@ -534,11 +534,16 @@ describe('session rotation', () => {
     emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
     await flushMicrotasks();
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const body = parseFetchBody(fetchMock.mock.calls[1]);
-    expect(body.sessionId).toBe(oldSessionId);
-    expect(body.sequenceNumber).toBe(1);
-    expect((body.events as unknown[]).length).toBe(1);
+    // The old tail leaves during rotation itself; the new session's forced
+    // FullSnapshot follows on the eager flush macrotask.
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const oldTail = parseFetchBody(fetchMock.mock.calls[1]);
+    expect(oldTail.sessionId).toBe(oldSessionId);
+    expect(oldTail.sequenceNumber).toBe(1);
+    expect((oldTail.events as unknown[]).length).toBe(1);
+    const newBootstrap = parseFetchBody(fetchMock.mock.calls[2]);
+    expect(newBootstrap.sessionId).toBe(readStoredSession().id);
+    expect(newBootstrap.sequenceNumber).toBe(0);
   });
 
   it('starts the new session at sequenceNumber 0 and emits subsequent chunks under it', async () => {
@@ -693,9 +698,12 @@ describe('session rotation', () => {
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();
 
-    // First chunk queued under session A.
+    // First chunk queued under session A; its eager flush fires on the next
+    // macrotask and leaves the fetch pending.
     emit!({ type: 2, timestamp: Date.now(), data: {} });
+    await flushMicrotasks();
     const sessionA = readStoredSession().id;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
 
     // Trigger a visibility flush; fetch is pending.
     const visibilityFlush = new Promise<void>((resolve) => {
@@ -714,13 +722,19 @@ describe('session rotation', () => {
     expect(readStoredSession().seq).toBe(0);
 
     // Release the pending session-A flush — it must not bump session B's seq.
+    // The only session-B reservation allowed afterwards is its own bootstrap.
     fetchMock.mockResolvedValue(okResponse());
     releaseFetch(okResponse());
     await flushMicrotasks();
     await flushMicrotasks();
 
     expect(readStoredSession().id).toBe(sessionB);
-    expect(readStoredSession().seq).toBe(0);
+    const sessionBSequenceNumbers = fetchMock.mock.calls
+      .map(parseFetchBody)
+      .filter((body) => body.sessionId === sessionB)
+      .map((body) => body.sequenceNumber);
+    expect(sessionBSequenceNumbers).toEqual([0]);
+    expect(readStoredSession().seq).toBe(1);
   });
 });
 
@@ -934,6 +948,7 @@ describe('sequence reservation', () => {
     const emit = hoisted.getEmit();
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    await flushMicrotasks();
 
     expect(parseFetchBody(fetchMock.mock.calls[0]).sequenceNumber).toBe(0);
     expect(readStoredSession().seq).toBe(1);
@@ -973,6 +988,7 @@ describe('sequence reservation', () => {
     const emit = hoisted.getEmit();
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
+    await flushMicrotasks();
     document.dispatchEvent(new Event('visibilitychange'));
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'unload' } });
 

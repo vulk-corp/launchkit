@@ -7,6 +7,7 @@ import {
   MAX_INLINE_DATA_ATTRIBUTE_BYTES,
   scrubInlineData,
 } from '../src/replay-inline-data';
+import { planChunkRanges, type ChunkRange } from '../src/replay-chunk-plan';
 
 vi.mock('../src/telemetry-sender', () => ({
   sendTelemetry: vi.fn(),
@@ -310,6 +311,110 @@ describe('scrubInlineData', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Chunk planning
+// ---------------------------------------------------------------------------
+
+describe('planChunkRanges', () => {
+  const ENVELOPE_BYTES = 900;
+
+  /**
+   * Oracle: a planner that bisects on a full measurement of every candidate
+   * range. The estimate-based planner must reproduce its boundaries.
+   */
+  function referencePlan(
+    sizes: number[],
+    firstSequenceNumber: number,
+    fullSnapshotIndex: number,
+  ): ChunkRange[] {
+    const measure = (start: number, end: number) =>
+      ENVELOPE_BYTES +
+      sizes.slice(start, end).reduce((total, size) => total + size, 0) +
+      Math.max(0, end - start - 1);
+    const split = (start: number, end: number, sequenceNumber: number): number => {
+      let mid = start + Math.floor((end - start) / 2);
+      if (sequenceNumber === 0 && fullSnapshotIndex >= mid && fullSnapshotIndex < end) {
+        mid = fullSnapshotIndex + 1;
+      }
+      return Math.max(start + 1, Math.min(mid, end - 1));
+    };
+    const plan = (start: number, end: number, sequenceNumber: number): ChunkRange[] => {
+      if (measure(start, end) <= MAX_CHUNK_BYTES || end - start <= 1) return [{ start, end }];
+      if (sequenceNumber === 0 && fullSnapshotIndex >= start && fullSnapshotIndex < end) {
+        const bootstrapEnd = fullSnapshotIndex + 1;
+        if (bootstrapEnd >= end) return [{ start, end }];
+        return [{ start, end: bootstrapEnd }, ...plan(bootstrapEnd, end, sequenceNumber + 1)];
+      }
+      const mid = split(start, end, sequenceNumber);
+      const left = plan(start, mid, sequenceNumber);
+      return [...left, ...plan(mid, end, sequenceNumber + left.length)];
+    };
+    return plan(0, sizes.length, firstSequenceNumber);
+  }
+
+  it('reproduces the exact planner boundaries for a mixed batch without serializing', () => {
+    const sizes = [200_000, 100_000, 300_000, 50_000, 250_000, 10_000, 511_000, 600_000, 1_000];
+    const stringify = vi.spyOn(JSON, 'stringify');
+
+    const ranges = planChunkRanges({
+      sizes,
+      envelopeBytes: ENVELOPE_BYTES,
+      budgetBytes: MAX_CHUNK_BYTES,
+      firstSequenceNumber: 4,
+      fullSnapshotIndex: -1,
+    });
+
+    expect(stringify).not.toHaveBeenCalled();
+    expect(ranges).toEqual(referencePlan(sizes, 4, -1));
+    expect(ranges).toEqual([
+      { start: 0, end: 2 },
+      { start: 2, end: 4 },
+      { start: 4, end: 6 },
+      { start: 6, end: 7 },
+      { start: 7, end: 8 },
+      { start: 8, end: 9 },
+    ]);
+  });
+
+  it('ends the bootstrap chunk at the FullSnapshot and bisects the rest', () => {
+    const sizes = [300, 400_000, 200_000, 300_000, 50_000];
+    const ranges = planChunkRanges({
+      sizes,
+      envelopeBytes: ENVELOPE_BYTES,
+      budgetBytes: MAX_CHUNK_BYTES,
+      firstSequenceNumber: 0,
+      fullSnapshotIndex: 1,
+    });
+    expect(ranges).toEqual(referencePlan(sizes, 0, 1));
+    expect(ranges).toEqual([
+      { start: 0, end: 2 },
+      { start: 2, end: 3 },
+      { start: 3, end: 5 },
+    ]);
+  });
+
+  it('never splits a single event and returns nothing for an empty batch', () => {
+    expect(
+      planChunkRanges({
+        sizes: [5_000_000],
+        envelopeBytes: ENVELOPE_BYTES,
+        budgetBytes: MAX_CHUNK_BYTES,
+        firstSequenceNumber: 3,
+        fullSnapshotIndex: -1,
+      }),
+    ).toEqual([{ start: 0, end: 1 }]);
+    expect(
+      planChunkRanges({
+        sizes: [],
+        envelopeBytes: ENVELOPE_BYTES,
+        budgetBytes: MAX_CHUNK_BYTES,
+        firstSequenceNumber: 0,
+        fullSnapshotIndex: -1,
+      }),
+    ).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Capture path
 // ---------------------------------------------------------------------------
 
@@ -411,6 +516,74 @@ describe('capture ceiling', () => {
     expect(replayDiagnostics('event_dropped_at_capture')).toEqual([]);
     expect(readStoredSession().seq).toBe(1);
     expect(warningsMatching(warn, 'page snapshot')).toBe(1);
+  });
+});
+
+describe('eager flush scheduling', () => {
+  it('never flushes synchronously inside emit and coalesces emits from one task', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit()!;
+
+    emit(fullSnapshotEvent([]));
+    emit(fullSnapshotEvent([element(9, 'p')]));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(readStoredSession().seq).toBe(0);
+
+    await flushMacrotask();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(parseUploadBody(fetchMock.mock.calls[0])).toMatchObject({
+      sequenceNumber: 0,
+      eventCount: 2,
+      hasFullSnapshot: true,
+    });
+  });
+
+  it('cancels a scheduled flush when recording stops', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    hoisted.getEmit()!(fullSnapshotEvent([]));
+    stopReplay();
+    await flushMacrotask();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('chunk planning at flush', () => {
+  it('splits a mixed batch on capture estimates and serializes each chunk once', async () => {
+    const emit = await startWithBootstrap();
+    const sizes = [200_000, 100_000, 300_000, 50_000, 250_000, 10_000];
+    sizes.forEach((size, index) => {
+      emit(mutationEvent({ texts: [{ id: 4, value: `${index}:${'x'.repeat(size)}` }] }));
+    });
+    const stringify = vi.spyOn(JSON, 'stringify');
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    const chunkCount = 3;
+    // One envelope measurement and one session persist per flush; every chunk
+    // is serialized exactly once, when it is uploaded.
+    expect(stringify.mock.calls.length).toBeLessThanOrEqual(chunkCount + 2);
+
+    const chunks = fetchMock.mock.calls.slice(1).map(parseUploadBody);
+    const markers = chunks.map((chunk) =>
+      (chunk.events as Array<{ data: { texts: Array<{ value: string }> } }>).map(
+        (event) => event.data.texts[0].value.split(':')[0],
+      ),
+    );
+    expect(markers).toEqual([['0'], ['1', '2'], ['3', '4', '5']]);
+    expect(chunks.map((chunk) => chunk.sequenceNumber)).toEqual([1, 2, 3]);
+    for (const chunk of chunks) {
+      expect(chunk.rawBytes as number).toBeLessThanOrEqual(MAX_CHUNK_BYTES);
+    }
+  });
+
+  it('reports the exact serialized size in rawBytes', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    hoisted.getEmit()!(fullSnapshotEvent([element(5, 'p', { title: 'héllo €' })]));
+    await flushMacrotask();
+
+    const init = fetchMock.mock.calls[0][1] as { body: string };
+    const body = JSON.parse(init.body) as { rawBytes: number };
+    expect(body.rawBytes).toBe(new TextEncoder().encode(init.body).byteLength);
   });
 });
 
