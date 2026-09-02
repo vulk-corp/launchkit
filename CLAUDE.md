@@ -65,7 +65,7 @@ Design rationale for `normalize-thrown.ts` and the capture paths — keep it her
 
 ## Navigation event contract
 
-SPA route changes are recorded as rrweb custom events so the backend distiller can segment a single-page session into pages. The contract is **stable** — the distiller (`bworlds-api`, #889 workstream 3) will match on it and append to `pages_visited` once that wiring ships. Do not rename the tag or reshape the payload without coordinating that change.
+SPA route changes are recorded as rrweb custom events so the backend distiller can segment a single-page session into pages. The contract is **stable**: the distiller (`bworlds-api`) matches on this tag and appends each route change to `pages_visited`. Do not rename the tag or reshape the payload without coordinating that change.
 
 - **tag**: `"navigation"`
 - **payload**: `{ href: string, title?: string }` — `href` is `location.href` (full URL, recorded exactly as rrweb already records META URLs; no new masking, query-param PII is a separate decision), `title` is `document.title` when non-empty.
