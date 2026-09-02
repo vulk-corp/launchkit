@@ -76,8 +76,8 @@ interface StoredSession {
 
 const fetchMock = vi.fn();
 
-/** Resolve pending microtasks (fetch promises inside _flushChunk). */
-const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
+/** Let the eager flush macrotask, and the fetch promises it spawns, settle. */
+const flushMacrotask = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 /**
  * Captures replay's interval callbacks so fetch-retry tests can fire the
@@ -454,7 +454,7 @@ describe('Vite dev CSS readiness', () => {
     appendViteClientScript();
 
     const start = startReplay(BUILD_SLUG, API_ENDPOINT);
-    await flushMicrotasks();
+    await flushMacrotask();
 
     expect(hoisted.recordFactory).not.toHaveBeenCalled();
 
@@ -532,7 +532,7 @@ describe('session rotation', () => {
 
     setNow(START_NOW + IDLE_TIMEOUT_MS + 1_000);
     emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
-    await flushMicrotasks();
+    await flushMacrotask();
 
     // The old tail leaves during rotation itself; the new session's forced
     // FullSnapshot follows on the eager flush macrotask.
@@ -556,7 +556,7 @@ describe('session rotation', () => {
 
     setNow(START_NOW + IDLE_TIMEOUT_MS + 1_000);
     emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
-    await flushMicrotasks();
+    await flushMacrotask();
 
     const newSessionId = readStoredSession().id;
     await vi.waitFor(() => expect(readStoredSession().seq).toBe(1));
@@ -575,7 +575,7 @@ describe('session rotation', () => {
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'old-bootstrap' } });
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    await flushMicrotasks();
+    await flushMacrotask();
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'old-tail' } });
 
     hoisted.takeFullSnapshot.mockImplementation(() => {});
@@ -585,7 +585,7 @@ describe('session rotation', () => {
 
     setNow(START_NOW + IDLE_TIMEOUT_MS + 1_000);
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'new-before-snapshot' } });
-    await flushMicrotasks();
+    await flushMacrotask();
 
     const newSessionId = readStoredSession().id;
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'new-bootstrap' } });
@@ -608,7 +608,7 @@ describe('session rotation', () => {
 
     setNow(START_NOW + IDLE_TIMEOUT_MS - 1);
     emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
-    await flushMicrotasks();
+    await flushMacrotask();
 
     expect(readStoredSession().id).toBe(firstSessionId);
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
@@ -641,7 +641,7 @@ describe('session rotation', () => {
     const emit = hoisted.getEmit();
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
-    await flushMicrotasks();
+    await flushMacrotask();
     const firstSessionId = readStoredSession().id;
 
     for (const elapsedMs of [14, 28, 42, 56].map((minutes) => minutes * 60 * 1000)) {
@@ -701,7 +701,7 @@ describe('session rotation', () => {
     // First chunk queued under session A; its eager flush fires on the next
     // macrotask and leaves the fetch pending.
     emit!({ type: 2, timestamp: Date.now(), data: {} });
-    await flushMicrotasks();
+    await flushMacrotask();
     const sessionA = readStoredSession().id;
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
@@ -725,8 +725,8 @@ describe('session rotation', () => {
     // The only session-B reservation allowed afterwards is its own bootstrap.
     fetchMock.mockResolvedValue(okResponse());
     releaseFetch(okResponse());
-    await flushMicrotasks();
-    await flushMicrotasks();
+    await flushMacrotask();
+    await flushMacrotask();
 
     expect(readStoredSession().id).toBe(sessionB);
     const sessionBSequenceNumbers = fetchMock.mock.calls
@@ -834,7 +834,7 @@ describe('error–session stamping', () => {
     fetchMock.mockResolvedValue({ ok: false, status: 429 } as Response);
     emit!({ type: 2, timestamp: Date.now(), data: {} });
     document.dispatchEvent(new Event('visibilitychange'));
-    await flushMicrotasks();
+    await flushMacrotask();
     expect(hoisted.stopRecording).toHaveBeenCalled();
 
     startErrorCapture(BUILD_SLUG);
@@ -948,7 +948,7 @@ describe('sequence reservation', () => {
     const emit = hoisted.getEmit();
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
-    await flushMicrotasks();
+    await flushMacrotask();
 
     expect(parseFetchBody(fetchMock.mock.calls[0]).sequenceNumber).toBe(0);
     expect(readStoredSession().seq).toBe(1);
@@ -958,7 +958,7 @@ describe('sequence reservation', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     releaseFetch(okResponse());
-    await flushMicrotasks();
+    await flushMacrotask();
     flushTick();
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
@@ -988,7 +988,7 @@ describe('sequence reservation', () => {
     const emit = hoisted.getEmit();
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
-    await flushMicrotasks();
+    await flushMacrotask();
     document.dispatchEvent(new Event('visibilitychange'));
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'unload' } });
 
@@ -1001,7 +1001,7 @@ describe('sequence reservation', () => {
     ).toBe(1);
 
     releaseFetch(okResponse());
-    await flushMicrotasks();
+    await flushMacrotask();
   });
 
   it('retries a failed chunk with the same sequenceNumber and payload', async () => {
@@ -1016,7 +1016,7 @@ describe('sequence reservation', () => {
     const stored = readStoredSession();
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
-    await flushMicrotasks();
+    await flushMacrotask();
 
     const failedBody = parseFetchBody(fetchMock.mock.calls[0]);
     expect(failedBody.sequenceNumber).toBe(0);
@@ -1033,7 +1033,7 @@ describe('sequence reservation', () => {
     expect(readStoredSession().id).toBe(stored.id);
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
 
-    await flushMicrotasks();
+    await flushMacrotask();
     flushTick();
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
     expect(parseFetchBody(fetchMock.mock.calls[2]).sequenceNumber).toBe(1);
@@ -1055,7 +1055,7 @@ describe('sequence reservation', () => {
     const emit = hoisted.getEmit();
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
-    await flushMicrotasks();
+    await flushMacrotask();
 
     // The rejected bootstrap sits in exponential backoff for the fetch path;
     // the page-hidden beacon flush delivers it anyway — backoff protects the
@@ -1087,13 +1087,13 @@ describe('sequence reservation', () => {
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    await flushMicrotasks();
+    await flushMacrotask();
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'later' } });
 
     for (let attempt = 1; attempt <= 5; attempt += 1) {
       flushTick();
       await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(attempt + 1));
-      await flushMicrotasks();
+      await flushMacrotask();
     }
 
     expect(replayDiagnostics()).toMatchObject([
@@ -1145,7 +1145,7 @@ describe('sequence reservation', () => {
       timestamp: Date.now(),
       data: { html: 'x'.repeat(520_000) },
     });
-    await flushMicrotasks();
+    await flushMacrotask();
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
@@ -1349,7 +1349,7 @@ describe('sequence reservation', () => {
     ]);
 
     releaseFetch(okResponse());
-    await flushMicrotasks();
+    await flushMacrotask();
     expect(sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY)).toBeNull();
   });
 
@@ -1418,7 +1418,7 @@ describe('sequence reservation', () => {
 
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    await flushMicrotasks();
+    await flushMacrotask();
     const emit = hoisted.getEmit();
 
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'after-restore' } });
@@ -1545,7 +1545,7 @@ describe('sequence reservation', () => {
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    await flushMicrotasks();
+    await flushMacrotask();
     emit!({ type: 3, timestamp: Date.now(), data: { marker: 'before-unload' } });
     window.dispatchEvent(new Event('pagehide'));
 
@@ -1560,7 +1560,7 @@ describe('sequence reservation', () => {
     // beacon-dropped chunk is not re-queued. A later flush finds nothing to send.
     visibilityState = 'hidden';
     document.dispatchEvent(new Event('visibilitychange'));
-    await flushMicrotasks();
+    await flushMacrotask();
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     warnSpy.mockRestore();
@@ -1625,7 +1625,7 @@ describe('sequence reservation', () => {
 
     // Attempt 1 is the eager flush the FullSnapshot capture triggers itself.
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
-    await flushMicrotasks();
+    await flushMacrotask();
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     // Each rejected first chunk schedules exponential backoff; advance past it
@@ -1634,7 +1634,7 @@ describe('sequence reservation', () => {
     for (let attempt = 2; attempt <= 5; attempt += 1) {
       setNow(START_NOW + retryTimes[attempt - 2]);
       flushTick();
-      await flushMicrotasks();
+      await flushMacrotask();
       expect(fetchMock).toHaveBeenCalledTimes(attempt);
     }
     expect(sessionStorage.getItem(BOOTSTRAP_STORAGE_KEY)).toBeNull();
@@ -1708,7 +1708,7 @@ describe('sequence reservation', () => {
       data: { html: 'x'.repeat(310_000) },
     });
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    await flushMicrotasks();
+    await flushMacrotask();
     emit!({
       type: 3,
       timestamp: Date.now(),
@@ -1756,7 +1756,7 @@ describe('unload transport', () => {
     const emit = hoisted.getEmit()!;
     emit({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    await flushMicrotasks();
+    await flushMacrotask();
     return emit;
   }
 
@@ -1923,7 +1923,7 @@ describe('unload transport', () => {
     const emit = hoisted.getEmit();
 
     emit!({ type: 2, timestamp: Date.now(), data: { marker: 'initial' } });
-    await flushMicrotasks();
+    await flushMacrotask();
     hoisted.takeFullSnapshot.mockClear();
 
     // Activity since the previous checkout: the tick re-snapshots so a lost

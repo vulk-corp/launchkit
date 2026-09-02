@@ -120,6 +120,8 @@ let _flushTimer: ReturnType<typeof setInterval> | null = null;
 let _eagerFlushTimer: ReturnType<typeof setTimeout> | null = null;
 // Builder-facing notices that fire once per session: `${kind}:${sessionId}`.
 const _sessionNotices = new Set<string>();
+// Events the active session has dropped at the capture ceiling.
+let _droppedAtCeilingCount = 0;
 let _snapshotTimer: ReturnType<typeof setInterval> | null = null;
 let _lastPeriodicSnapshotAt = 0;
 let _stopRecording: (() => void) | null = null;
@@ -419,10 +421,12 @@ function _findFullSnapshotIndex(entries: BufferedEvent[]): number {
 
 /**
  * Flush on capture, ahead of the periodic timer, when the buffer holds a heavy
- * payload. A FullSnapshot is rrweb's largest single event (~200-480 KB) and rrweb
- * re-checkouts one when the page is hidden; routing it through the compressed
- * fetch path here keeps it out of the unload beacon, which caps near 64 KiB. The
- * byte gate does the same for a burst of heavy mutations.
+ * payload: a FullSnapshot (rrweb's largest single event, ~200-480 KB, and the
+ * one rrweb re-checkouts when the page is hidden) or a burst of mutations past
+ * the byte gate. Either leaves through the compressed fetch path on the next
+ * macrotask instead of waiting for the periodic timer. A page hidden before
+ * that macrotask drains the buffer through the beacon path, which declares any
+ * loss through its diagnostics.
  */
 function _shouldFlushEagerly(event: eventWithTime): boolean {
   return _isFullSnapshotEvent(event) || _bufferedBytes >= FLUSH_SOFT_MAX_BYTES;
@@ -450,11 +454,31 @@ function _cancelEagerFlush(): void {
   _eagerFlushTimer = null;
 }
 
-function _isFirstSessionNotice(kind: string): boolean {
+/**
+ * Register a once-per-session notice. True when it is the first of its kind
+ * for the active session.
+ */
+function _claimSessionNotice(kind: string): boolean {
   const key = `${kind}:${_sessionId}`;
   if (_sessionNotices.has(key)) return false;
   _sessionNotices.add(key);
   return true;
+}
+
+// A host that wraps console and throws must not break the recording callback.
+function _warnBuilder(message: string): void {
+  try {
+    console.warn(message);
+  } catch {
+    // The notice is best-effort.
+  }
+}
+
+// Diagnostics for events dropped at the capture ceiling thin out as a session
+// accumulates them: the first five, the tenth, then every hundredth. Each one
+// carries the cumulative count, so the latest report holds the session total.
+function _shouldReportDroppedEvent(droppedCount: number): boolean {
+  return droppedCount <= 5 || droppedCount === 10 || droppedCount % 100 === 0;
 }
 
 function _sizeLabel(bytes: number): string {
@@ -477,10 +501,10 @@ function _scrubEventInlineData(event: eventWithTime): void {
     return;
   }
   if (replacedCount === 0 || !_sessionId) return;
-  if (!_isFirstSessionNotice('inline_data')) return;
+  if (!_claimSessionNotice('inline_data')) return;
 
   const size = _sizeLabel(replacedBytes);
-  console.warn(
+  _warnBuilder(
     replacedCount === 1
       ? `${SDK_TAG} Replay: an inline base64 image (${size}) was replaced by a placeholder in the recording. Serve images by URL to see them in session replays.`
       : `${SDK_TAG} Replay: ${replacedCount} inline base64 images (${size}) were replaced by placeholders in the recording. Serve images by URL to see them in session replays.`,
@@ -495,32 +519,38 @@ function _scrubEventInlineData(event: eventWithTime): void {
  * Gate an event against the capture ceiling. A FullSnapshot always passes: the
  * session is not replayable without it, so the chunk path gets to try. Any
  * other event above the ceiling is dropped here, before it reserves a sequence
- * number, and the session records on without it.
+ * number, and the session records on without it. The builder hears about the
+ * first drop on the console; the diagnostics channel follows the report
+ * cadence, carrying the session's cumulative drop count and the size of the
+ * event at hand.
  */
 function _admitEventUnderCeiling(event: eventWithTime, bytes: number): boolean {
   if (bytes <= CAPTURE_CEILING_BYTES || !_sessionId) return true;
   const ceiling = _sizeLabel(CAPTURE_CEILING_BYTES);
 
   if (_isFullSnapshotEvent(event)) {
-    if (_isFirstSessionNotice('snapshot_over_ceiling')) {
-      console.warn(
+    if (_claimSessionNotice('snapshot_over_ceiling')) {
+      _warnBuilder(
         `${SDK_TAG} Replay: a page snapshot (${_sizeLabel(bytes)}) exceeds the capture ceiling (${ceiling}). It is kept, but its upload may fail.`,
       );
     }
     return true;
   }
 
-  if (_isFirstSessionNotice('event_dropped')) {
-    console.warn(
+  _droppedAtCeilingCount += 1;
+  if (_claimSessionNotice('event_dropped')) {
+    _warnBuilder(
       `${SDK_TAG} Replay: a recording event (${_sizeLabel(bytes)}) exceeded the capture ceiling (${ceiling}) and was dropped. Recording continues.`,
     );
   }
-  _sendReplayDiagnostic('event_dropped_at_capture', _sessionId, 'warning', {
-    reason: 'event_too_large',
-    rawBytes: bytes,
-    eventCount: 1,
-    hasFullSnapshot: false,
-  });
+  if (_shouldReportDroppedEvent(_droppedAtCeilingCount)) {
+    _sendReplayDiagnostic('event_dropped_at_capture', _sessionId, 'warning', {
+      reason: 'event_too_large',
+      rawBytes: bytes,
+      eventCount: _droppedAtCeilingCount,
+      hasFullSnapshot: false,
+    });
+  }
   return false;
 }
 
@@ -648,6 +678,7 @@ function _openNewSession(now: number): void {
   _firstChunkAcked = false;
   _firstChunkAttempts = 0;
   _firstChunkRetryAfter = 0;
+  _droppedAtCeilingCount = 0;
   setReplaySessionId(_sessionId);
   _saveSession();
   _sendReplayDiagnostic('session_started', _sessionId, 'info');
@@ -2023,6 +2054,7 @@ export function stopReplay(): void {
   _firstChunkRetryAfter = 0;
   _chunkFailureAttempts.clear();
   _sessionNotices.clear();
+  _droppedAtCeilingCount = 0;
   _viteDevCssFullSnapshotSeen = false;
   _viteDevCssSnapshotRetryScheduled = false;
   _releaseReplayLock();
@@ -2055,6 +2087,7 @@ export async function startReplay(
     _pendingChunks = [];
     _capReached = false;
     _lastEventAt = 0;
+    _droppedAtCeilingCount = 0;
     _viteDevCssFullSnapshotSeen = false;
     _viteDevCssSnapshotRetryScheduled = false;
     let shouldFlushStoredBootstrap = false;

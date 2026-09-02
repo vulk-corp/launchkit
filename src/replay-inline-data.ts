@@ -13,7 +13,9 @@
  */
 
 // Real photos are hundreds of kilobytes; icons and tiny sprites stay under a
-// few kilobytes. Everything below this size ships untouched.
+// few kilobytes. Everything below this size ships untouched. The threshold is
+// compared against the string length in UTF-16 units, which equals bytes for
+// inline data because data URLs are ASCII.
 export const MAX_INLINE_DATA_ATTRIBUTE_BYTES = 32 * 1024;
 
 // A 1x1 grey SVG that stretches to whatever box the element has, so the
@@ -27,6 +29,8 @@ export const INLINE_DATA_PLACEHOLDER =
 const FULL_SNAPSHOT_EVENT_TYPE = 2;
 const INCREMENTAL_SNAPSHOT_EVENT_TYPE = 3;
 const MUTATION_SOURCE = 0;
+// `CSSStyleSheet.insertRule`, the path CSS-in-JS libraries inject styles through.
+const STYLESHEET_RULE_SOURCE = 8;
 
 const INLINE_DATA_URL_PREFIX = /^data:/i;
 // Attributes whose whole value is a URL.
@@ -63,7 +67,9 @@ export function scrubInlineData(event: unknown): InlineDataScrubResult {
     return result;
   }
 
-  if (event.type === INCREMENTAL_SNAPSHOT_EVENT_TYPE && data.source === MUTATION_SOURCE) {
+  if (event.type !== INCREMENTAL_SNAPSHOT_EVENT_TYPE) return result;
+
+  if (data.source === MUTATION_SOURCE) {
     if (Array.isArray(data.adds)) {
       for (const added of data.adds) {
         if (isRecord(added)) scrubNodeTree(added.node, result);
@@ -74,8 +80,25 @@ export function scrubInlineData(event: unknown): InlineDataScrubResult {
         if (isRecord(mutation)) scrubAttributes(mutation.attributes, result);
       }
     }
+  } else if (data.source === STYLESHEET_RULE_SOURCE) {
+    scrubStyleSheetRules(data.adds, result);
   }
   return result;
+}
+
+/**
+ * An inserted stylesheet rule is recorded as `{ rule, index? }`; the rule text
+ * is CSS, so inline data hides in its url() tokens.
+ */
+function scrubStyleSheetRules(adds: unknown, result: InlineDataScrubResult): void {
+  if (!Array.isArray(adds)) return;
+  for (const added of adds) {
+    if (!isRecord(added)) continue;
+    const rule = added.rule;
+    if (typeof rule === 'string' && rule.length > MAX_INLINE_DATA_ATTRIBUTE_BYTES) {
+      added.rule = scrubCssText(rule, result);
+    }
+  }
 }
 
 function scrubNodeTree(root: unknown, result: InlineDataScrubResult): void {
