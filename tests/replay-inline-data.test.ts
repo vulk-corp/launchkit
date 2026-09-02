@@ -59,6 +59,8 @@ const STORAGE_KEY = 'bworlds-replay-session';
 const MAX_CHUNK_BYTES = 512_000;
 const CAPTURE_CEILING_BYTES = 4 * MAX_CHUNK_BYTES;
 const DROP_RESYNC_MIN_INTERVAL_MS = 30_000;
+const DEGRADATION_MARKER_MIN_INTERVAL_MS = 1_000;
+const RECORDING_DEGRADED_TAG = 'recording_degraded';
 const KB = 1024;
 const MB = 1024 * 1024;
 
@@ -638,6 +640,99 @@ describe('resync after a dropped event', () => {
     await flushMacrotask();
 
     expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
+  });
+});
+
+describe('degradation marker', () => {
+  it('sums the scrubs of one task into a single marker on a later macrotask', async () => {
+    const emit = await startWithBootstrap();
+
+    for (let i = 0; i < 10; i += 1) {
+      emit(mutationEvent({ adds: [addedImage(100 + i, inlineImage(100 * KB))] }));
+    }
+    expect(hoisted.addCustomEvent).not.toHaveBeenCalled();
+
+    await flushMacrotask();
+    expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+    expect(hoisted.addCustomEvent).toHaveBeenCalledWith(RECORDING_DEGRADED_TAG, {
+      reason: 'inline_data_scrubbed',
+      replacedCount: 10,
+      replacedBytes: 10 * 100 * KB,
+    });
+  });
+
+  it('marks a dropped event before the resync snapshot', async () => {
+    const emit = await startWithBootstrap();
+    snapshotThroughEmit(emit);
+
+    emit(oversizedMutationEvent());
+    await flushMacrotask();
+
+    expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+    expect(hoisted.addCustomEvent).toHaveBeenCalledWith(RECORDING_DEGRADED_TAG, {
+      reason: 'event_dropped',
+      eventCount: 1,
+      rawBytes: expect.any(Number),
+    });
+    expect(hoisted.takeFullSnapshot).toHaveBeenCalledTimes(1);
+    expect(hoisted.addCustomEvent.mock.invocationCallOrder[0]).toBeLessThan(
+      hoisted.takeFullSnapshot.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('holds a second batch until the cooldown elapses', async () => {
+    const emit = await startWithBootstrap();
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    try {
+      emit(mutationEvent({ adds: [addedImage(200, inlineImage(100 * KB))] }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(200);
+      emit(mutationEvent({ adds: [addedImage(201, inlineImage(64 * KB))] }));
+      emit(mutationEvent({ adds: [addedImage(202, inlineImage(64 * KB))] }));
+      await vi.advanceTimersByTimeAsync(DEGRADATION_MARKER_MIN_INTERVAL_MS - 200 - 1);
+      expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(2);
+      expect(hoisted.addCustomEvent).toHaveBeenLastCalledWith(RECORDING_DEGRADED_TAG, {
+        reason: 'inline_data_scrubbed',
+        replacedCount: 2,
+        replacedBytes: 2 * 64 * KB,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('survives addCustomEvent throwing and keeps recording', async () => {
+    const emit = await startWithBootstrap();
+    hoisted.addCustomEvent.mockImplementationOnce(() => {
+      throw new Error('please add custom event after start recording');
+    });
+
+    emit(mutationEvent({ adds: [addedImage(300, inlineImage(100 * KB))] }));
+    await flushMacrotask();
+    expect(hoisted.addCustomEvent).toHaveBeenCalledTimes(1);
+
+    emit(fullSnapshotEvent([]));
+    await flushMacrotask();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(parseUploadBody(fetchMock.mock.calls[1])).toMatchObject({
+      sequenceNumber: 1,
+      hasFullSnapshot: true,
+    });
+  });
+
+  it('cancels a pending marker when recording stops', async () => {
+    const emit = await startWithBootstrap();
+    emit(mutationEvent({ adds: [addedImage(400, inlineImage(100 * KB))] }));
+    stopReplay();
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    await flushMacrotask();
+
+    expect(hoisted.addCustomEvent).not.toHaveBeenCalled();
   });
 });
 

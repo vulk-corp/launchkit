@@ -36,7 +36,7 @@ CI: Node 22, runs on main/next push + PRs (type-check, build, test).
 | `src/error-capture.ts` | `window.onerror` + `unhandledrejection` + `console.error` wrapper. Batches 5 errors OR 10s, flushes on page hidden. Stamps `sessionId` (from session-state) + `capturedAt` at enqueue |
 | `src/network-capture.ts` | `window.fetch` wrapper. Enqueues HTTP ≥ 400 responses and rejected fetches with `Network error - {method} {url}` prefix. Skips `apiEndpoint` URLs (no self-capture) |
 | `src/normalize-thrown.ts` | Any thrown value → `{message, stack}`: Error as-is, string/primitive verbatim, object → `message` field → `error` field → safe JSON → `[error details could not be read]`. Depth-capped, never throws. Exports `truncateMessage`, `sanitizeAndTruncate` + the `MAX_*_LENGTH` server caps |
-| `src/replay.ts` | rrweb record, 10s flush, 512 KB chunks, sessionStorage persistence. Scrubs inline data and gates the capture ceiling at emit, buffers events with their byte estimate, schedules eager flushes on a macrotask. Publishes session id to session-state, back-stamps queued errors on start. Watches SPA navigation (history patch + popstate) and emits a `navigation` custom event per route change |
+| `src/replay.ts` | rrweb record, 10s flush, 512 KB chunks, sessionStorage persistence. Scrubs inline data and gates the capture ceiling at emit, buffers events with their byte estimate, schedules eager flushes on a macrotask. Marks scrubbed and dropped footage with a `recording_degraded` custom event and requests a resync FullSnapshot after a drop, both on later macrotasks. Publishes session id to session-state, back-stamps queued errors on start. Watches SPA navigation (history patch + popstate) and emits a `navigation` custom event per route change |
 | `src/replay-inline-data.ts` | Pure scrub of an rrweb event: replaces oversized `data:` attribute values (`src`, `srcset`, `poster`, `href`, `xlink:href`, `url(data:...)` in `style` / `_cssText` / inserted stylesheet rules, IncrementalSource 8) with a grey placeholder. Zero imports, lives in the replay chunk |
 | `src/replay-chunk-plan.ts` | Pure chunk planner over per-event byte estimates (prefix sum, bootstrap split at the FullSnapshot, bisection). Zero imports, lives in the replay chunk |
 | `src/session-state.ts` | Shared replay-session id holder. replay writes, error-capture reads at enqueue. Zero imports |
@@ -73,6 +73,18 @@ SPA route changes are recorded as rrweb custom events so the backend distiller c
 - **Deduped**: an emission whose resolved `href` equals the last emitted one is dropped. The baseline is seeded to `location.href` at install, so the initial full-load META is not double-counted and `replaceState` query-param churn is silenced.
 - **Across rotation**: the watcher survives an idle session rotation (the patch is intentionally not torn down on rotate). `_rotateSession` clears the dedup baseline so each rotated session re-emits its entry URL instead of swallowing it as a duplicate.
 - Capture only. The initial page is already represented by rrweb's full-load META (type 4); no synthetic navigation event is emitted for it.
+
+## Recording degradation marker contract
+
+Footage the SDK alters at capture is marked inside the recording as an rrweb custom event, so the player can explain grey placeholders and missing mutations to the viewer without DevTools. The contract is **stable**. Do not rename the tag or reshape the payloads without coordinating that change.
+
+- **tag**: `"recording_degraded"`
+- **payloads**, one shape per reason:
+  - `{ reason: 'inline_data_scrubbed', replacedCount: number, replacedBytes: number }`: inline data values replaced by the placeholder and the characters they held.
+  - `{ reason: 'event_dropped', eventCount: number, rawBytes: number }`: events dropped at the capture ceiling and their combined JSON size.
+- **Cadence**: accumulated per reason and emitted on a macrotask after the degradation, at most one custom event per reason per second; totals are summed while a marker waits, so nothing is lost. The first occurrence flushes on the next macrotask. The marker is deferred because rrweb refuses `addCustomEvent` until its recording flag is set, which happens after the initial FullSnapshot is emitted.
+- **Ordering**: on a dropped event the marker is scheduled before the resync FullSnapshot, so it precedes the repaired snapshot in the recording.
+- **Consumers**: the distiller and player wiring lives in the monorepo and matches on this tag. `hasErrors` on the upload payload matches the `error` tag only and is unaffected.
 
 ## API endpoints
 

@@ -5,6 +5,7 @@
 ### Added
 
 - **Resync after a dropped event**: an event dropped at the capture ceiling leaves the player's mirror stale until the next periodic checkout, up to five minutes away. The SDK now requests a FullSnapshot on the next macrotask after a drop, so playback repairs at the next chunk. Drops within 30 seconds of a resync share one snapshot, taken when that cooldown ends; the snapshot runs through the inline data scrub like any event. A session rotation's own FullSnapshot cancels a pending resync.
+- **Degradation marker in the recording**: every inline data scrub and every capture-ceiling drop is marked inside the recording as a `recording_degraded` custom event (`{ reason: 'inline_data_scrubbed', replacedCount, replacedBytes }` or `{ reason: 'event_dropped', eventCount, rawBytes }`), so the player can explain grey placeholders and missing footage to the viewer. Markers are accumulated per reason and emitted on a macrotask, at most one per reason per second with the totals summed in between. On a drop the marker precedes the resync FullSnapshot.
 
 ### Changed
 

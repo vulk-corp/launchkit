@@ -11,8 +11,10 @@
  * a dying page reliably fires, and only a body already handed to the browser
  * survives it. A periodic FullSnapshot checkout bounds how much footage any
  * undelivered chunk can strand, and a dropped event requests a resync
- * FullSnapshot so playback does not wait for that checkout. Stops recording on
- * 429 (daily cap reached).
+ * FullSnapshot so playback does not wait for that checkout. Scrubbed and
+ * dropped footage is marked inside the recording with a custom event, so the
+ * player can explain it to the viewer. Stops recording on 429 (daily cap
+ * reached).
  *
  * Session rotation: if no rrweb events fire for longer than IDLE_TIMEOUT_MS or
  * the active session reaches MAX_SESSION_MS, the SDK rotates to a fresh session
@@ -110,6 +112,14 @@ const TOKEN_COOKIE = 'bworlds_token';
 // Wire contract with the backend distiller: it matches this custom event tag to
 // append SPA route changes to a session's pages_visited. Do not rename.
 const NAVIGATION_TAG = 'navigation';
+// Wire contract with the backend distiller and the player: they match this
+// custom event tag to explain scrubbed placeholders and dropped footage to the
+// viewer. Do not rename.
+const RECORDING_DEGRADED_TAG = 'recording_degraded';
+// Degradation markers are accumulated per reason and emitted at most once per
+// reason per interval, totals summed while waiting, so a page that scrubs on
+// every mutation cannot flood the recording with markers.
+const DEGRADATION_MARKER_MIN_INTERVAL_MS = 1_000;
 const LINK_ACTIVATION_TAG = 'link_activation';
 const GLOBAL_REPLAY_STATE_KEY = '__bworldsLaunchKitReplayState__';
 const VITE_DEV_CLIENT_SCRIPT_SELECTOR = 'script[src*="/@vite/client"]';
@@ -129,6 +139,10 @@ let _eagerFlushTimer: ReturnType<typeof setTimeout> | null = null;
 const _sessionNotices = new Set<string>();
 // Events the active session has dropped at the capture ceiling.
 let _droppedAtCeilingCount = 0;
+// Degradation totals waiting for the next marker, keyed by reason.
+const _pendingDegradation = new Map<RecordingDegradedReason, DegradationTotals>();
+let _degradationMarkerTimer: ReturnType<typeof setTimeout> | null = null;
+let _lastDegradationMarkerAt = 0;
 let _snapshotTimer: ReturnType<typeof setInterval> | null = null;
 let _lastPeriodicSnapshotAt = 0;
 let _resyncSnapshotTimer: ReturnType<typeof setTimeout> | null = null;
@@ -224,6 +238,20 @@ interface SnapshotNodeLike {
   tagName?: unknown;
   attributes?: Record<string, unknown>;
   childNodes?: SnapshotNodeLike[];
+}
+
+// Payload of a RECORDING_DEGRADED_TAG custom event. Counts and bytes are the
+// totals accumulated since the previous marker of the same reason.
+type RecordingDegradedPayload =
+  | { reason: 'inline_data_scrubbed'; replacedCount: number; replacedBytes: number }
+  | { reason: 'event_dropped'; eventCount: number; rawBytes: number };
+
+type RecordingDegradedReason = RecordingDegradedPayload['reason'];
+
+// Values replaced or events dropped, and the bytes they held.
+interface DegradationTotals {
+  count: number;
+  bytes: number;
 }
 
 type LinkActivationElement = HTMLAnchorElement | HTMLAreaElement;
@@ -496,6 +524,75 @@ function _cancelResyncSnapshot(): void {
 }
 
 /**
+ * Add a degradation to the totals waiting for the next marker and make sure a
+ * marker is scheduled. Never throws into the host app.
+ */
+function _recordDegradation(reason: RecordingDegradedReason, count: number, bytes: number): void {
+  try {
+    const totals = _pendingDegradation.get(reason);
+    if (totals) {
+      totals.count += count;
+      totals.bytes += bytes;
+    } else {
+      _pendingDegradation.set(reason, { count, bytes });
+    }
+    _scheduleDegradationMarker();
+  } catch {
+    // The marker is best-effort.
+  }
+}
+
+function _degradationMarkerPayload(
+  reason: RecordingDegradedReason,
+  totals: DegradationTotals,
+): RecordingDegradedPayload {
+  return reason === 'inline_data_scrubbed'
+    ? { reason, replacedCount: totals.count, replacedBytes: totals.bytes }
+    : { reason, eventCount: totals.count, rawBytes: totals.bytes };
+}
+
+/**
+ * Emit the pending markers on a later macrotask, at most once per reason per
+ * DEGRADATION_MARKER_MIN_INTERVAL_MS. rrweb refuses addCustomEvent until its
+ * own recording flag is set, which happens after the initial FullSnapshot is
+ * emitted, so a marker raised while that snapshot is scrubbed must wait for a
+ * later macrotask; the deferral also keeps the marker out of the
+ * mutation-observer callback.
+ */
+function _scheduleDegradationMarker(): void {
+  if (_degradationMarkerTimer !== null) return;
+  const delay = Math.max(
+    0,
+    _lastDegradationMarkerAt + DEGRADATION_MARKER_MIN_INTERVAL_MS - Date.now(),
+  );
+  _degradationMarkerTimer = setTimeout(_emitDegradationMarkers, delay);
+}
+
+function _emitDegradationMarkers(): void {
+  _degradationMarkerTimer = null;
+  const pending = Array.from(_pendingDegradation);
+  _pendingDegradation.clear();
+  _lastDegradationMarkerAt = Date.now();
+  if (!_record || !_stopRecording) return;
+  for (const [reason, totals] of pending) {
+    try {
+      // Routes through emit like any rrweb event: scrubbed, measured, buffered.
+      _record.addCustomEvent(RECORDING_DEGRADED_TAG, _degradationMarkerPayload(reason, totals));
+    } catch {
+      // rrweb refuses a custom event outside an active recording.
+    }
+  }
+}
+
+function _cancelDegradationMarker(): void {
+  if (_degradationMarkerTimer !== null) {
+    clearTimeout(_degradationMarkerTimer);
+    _degradationMarkerTimer = null;
+  }
+  _pendingDegradation.clear();
+}
+
+/**
  * Register a once-per-session notice. True when it is the first of its kind
  * for the active session.
  */
@@ -529,9 +626,10 @@ function _sizeLabel(bytes: number): string {
 
 /**
  * Replace oversized inline data in the event before it is measured or buffered.
- * The builder hears about it once per session, on the console and through the
- * diagnostics channel; the replaced bytes explain the placeholders in the
- * replay. Never throws into the host app.
+ * Every scrub feeds the degradation marker inside the recording; the builder
+ * hears about it once per session, on the console and through the diagnostics
+ * channel. The replaced bytes explain the placeholders in the replay. Never
+ * throws into the host app.
  */
 function _scrubEventInlineData(event: eventWithTime): void {
   let replacedCount = 0;
@@ -542,6 +640,7 @@ function _scrubEventInlineData(event: eventWithTime): void {
     return;
   }
   if (replacedCount === 0 || !_sessionId) return;
+  _recordDegradation('inline_data_scrubbed', replacedCount, replacedBytes);
   if (!_claimSessionNotice('inline_data')) return;
 
   const size = _sizeLabel(replacedBytes);
@@ -560,10 +659,11 @@ function _scrubEventInlineData(event: eventWithTime): void {
  * Gate an event against the capture ceiling. A FullSnapshot always passes: the
  * session is not replayable without it, so the chunk path gets to try. Any
  * other event above the ceiling is dropped here, before it reserves a sequence
- * number, and the session records on without it; a resync FullSnapshot follows
- * on a later macrotask. The builder hears about the first drop on the console;
- * the diagnostics channel follows the report cadence, carrying the session's
- * cumulative drop count and the size of the event at hand.
+ * number, and the session records on without it; a degradation marker and then
+ * a resync FullSnapshot follow on later macrotasks. The builder hears about the
+ * first drop on the console; the diagnostics channel follows the report
+ * cadence, carrying the session's cumulative drop count and the size of the
+ * event at hand.
  */
 function _admitEventUnderCeiling(event: eventWithTime, bytes: number): boolean {
   if (bytes <= CAPTURE_CEILING_BYTES || !_sessionId) return true;
@@ -592,6 +692,9 @@ function _admitEventUnderCeiling(event: eventWithTime, bytes: number): boolean {
       hasFullSnapshot: false,
     });
   }
+  // The marker is scheduled first so it precedes the repaired snapshot in the
+  // recording.
+  _recordDegradation('event_dropped', 1, bytes);
   _scheduleResyncSnapshot();
   return false;
 }
@@ -2065,6 +2168,8 @@ export function stopReplay(): void {
   }
   _cancelResyncSnapshot();
   _lastResyncSnapshotAt = 0;
+  _cancelDegradationMarker();
+  _lastDegradationMarkerAt = 0;
   if (_stopRecording) {
     _stopRecording();
     _stopRecording = null;
