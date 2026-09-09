@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.18.1] - 2026-09-09
+
+### Fixed
+
+- **Supabase identity with custom storage keys**: replay identity discovery now recognizes sessions stored under names such as `cbs_auth`, in both localStorage and readable cookies. Standard Supabase names retain priority and their existing reader. Custom candidates pass size, session-shape and local JWT checks; expired candidates are excluded and the most recently issued candidate wins. Legacy wrappers, double-encoded JSON, percent-encoded cookies and chunked base64url cookies are supported.
+- **Identity polling cost and logout**: discovery continues until a session is found, then the bridge follows only that storage key or cookie and reuses the decoded identity while the value is unchanged. Logout clears the automatic identity without adopting stale sessions elsewhere; a login at the same location restores it. Expiration is checked only during discovery, leaving session refresh to Supabase.
+- **Supabase cookie precedence**: duplicate cookie names use their first visible value, matching Supabase; an empty unchunked cookie does not hide valid fragments. A literal custom name ending in `.0` stays attached to the same session when its value grows into multiple cookies or shrinks back to one.
+
+### Privacy
+
+- Custom-key recognition locally inspects the JWT's `iss`, `sub`, `exp`, `iat` and `role` claims. No network or signature verification is performed. Replay identity still contains only the user's email and id; Supabase tokens, JWT claims and user metadata are never transmitted by the bridge. Public APIs and replay payload fields are unchanged.
+
 ## [1.18.0] - 2026-09-02
 
 ### Added
