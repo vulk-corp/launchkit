@@ -418,6 +418,100 @@ it('supports a literal custom cookie name ending in a number', () => {
   expect(getIdentity().userId).toBe(USER_ID);
 });
 
+describe('cookie name and chunk precedence', () => {
+  it.each([SUPABASE_STORAGE_KEY, CUSTOM_KEY])(
+    'uses the first visible %s cookie when paths overlap', (key) => {
+      const originalUrl = window.location.href;
+      window.history.replaceState(null, '', '/account');
+      document.cookie = `${key}=${base64UrlAuthCookie(customSession())}; path=/`;
+      document.cookie = `${key}=${base64UrlAuthCookie(customSession({ id: OTHER_USER_ID }))}; path=/account`;
+      try {
+        startSupabaseIdentityBridge();
+        expect(getIdentity().userId).toBe(OTHER_USER_ID);
+      } finally {
+        document.cookie = `${key}=; max-age=0; path=/account`;
+        window.history.replaceState(null, '', originalUrl);
+      }
+    },
+  );
+
+  it.each([SUPABASE_STORAGE_KEY, CUSTOM_KEY])(
+    'uses the first occurrence of each %s chunk when paths overlap', (key) => {
+      const originalUrl = window.location.href;
+      window.history.replaceState(null, '', '/account');
+      for (const [path, id] of [['/', USER_ID], ['/account', OTHER_USER_ID]]) {
+        const full = base64UrlAuthCookie(customSession({ id }));
+        const mid = Math.floor(full.length / 2);
+        document.cookie = `${key}.0=${full.slice(0, mid)}; path=${path}`;
+        document.cookie = `${key}.1=${full.slice(mid)}; path=${path}`;
+      }
+      try {
+        startSupabaseIdentityBridge();
+        expect(getIdentity().userId).toBe(OTHER_USER_ID);
+      } finally {
+        for (const index of [0, 1]) {
+          document.cookie = `${key}.${index}=; max-age=0; path=/account`;
+        }
+        window.history.replaceState(null, '', originalUrl);
+      }
+    },
+  );
+
+  it.each([SUPABASE_STORAGE_KEY, CUSTOM_KEY])(
+    'reads %s chunks when the unchunked cookie is empty', (key) => {
+      const full = base64UrlAuthCookie(customSession());
+      const mid = Math.floor(full.length / 2);
+      document.cookie = `${key}=; path=/`;
+      document.cookie = `${key}.0=${full.slice(0, mid)}; path=/`;
+      document.cookie = `${key}.1=${full.slice(mid)}; path=/`;
+
+      startSupabaseIdentityBridge();
+
+      expect(getIdentity().userId).toBe(USER_ID);
+    },
+  );
+
+  it('prefers a nonempty unchunked cookie over its fragments', () => {
+    const full = base64UrlAuthCookie(customSession());
+    const mid = Math.floor(full.length / 2);
+    document.cookie = `${CUSTOM_KEY}.0=${full.slice(0, mid)}; path=/`;
+    document.cookie = `${CUSTOM_KEY}.1=${full.slice(mid)}; path=/`;
+    document.cookie = `${CUSTOM_KEY}=${base64UrlAuthCookie(customSession({ id: OTHER_USER_ID }))}; path=/`;
+
+    startSupabaseIdentityBridge();
+
+    expect(getIdentity().userId).toBe(OTHER_USER_ID);
+  });
+
+  it('follows a literal custom.0 cookie when its session grows into chunks and shrinks', () => {
+    vi.useFakeTimers();
+    document.cookie = `custom.0=${base64UrlAuthCookie(customSession())}; path=/`;
+    startSupabaseIdentityBridge();
+    expect(getIdentity().userId).toBe(USER_ID);
+
+    const updated = customSession({ id: OTHER_USER_ID });
+    updated.user.user_metadata.full_name = 'x'.repeat(4000);
+    const full = base64UrlAuthCookie(updated);
+    const mid = Math.floor(full.length / 2);
+    document.cookie = 'custom.0=; max-age=0; path=/';
+    document.cookie = `custom.0.0=${full.slice(0, mid)}; path=/`;
+    document.cookie = `custom.0.1=${full.slice(mid)}; path=/`;
+    vi.advanceTimersByTime(2_000);
+    expect(getIdentity().userId).toBe(OTHER_USER_ID);
+
+    clearCookies();
+    document.cookie = `custom.0=${base64UrlAuthCookie(customSession())}; path=/`;
+    vi.advanceTimersByTime(2_000);
+    expect(getIdentity().userId).toBe(USER_ID);
+  });
+
+  it('keeps supporting a known Supabase key stored in a single .0 chunk', () => {
+    document.cookie = `${SUPABASE_STORAGE_KEY}.0=${base64UrlAuthCookie(storedSession())}; path=/`;
+    startSupabaseIdentityBridge();
+    expect(getIdentity().userId).toBe('user_123');
+  });
+});
+
 it('does not reparse a selected cookie when an unrelated cookie changes', () => {
   vi.useFakeTimers();
   document.cookie = `${CUSTOM_KEY}=${base64UrlAuthCookie(customSession())}; path=/`;

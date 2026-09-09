@@ -330,6 +330,8 @@ function _collectAuthCookieValues(
 
     const chunk = /^(.+)\.(\d+)$/.exec(name);
     if (selectedKey !== undefined && name !== selectedKey && chunk?.[1] !== selectedKey) continue;
+    // Match Supabase's cookie parser when paths or domains expose the same name.
+    if (singles.has(name)) continue;
     singles.set(name, value);
     if (chunk) {
       const group = chunkGroups.get(chunk[1]) ?? [];
@@ -340,7 +342,10 @@ function _collectAuthCookieValues(
 
   const values = new Map<string, string>();
   for (const [name, group] of chunkGroups) {
-    if (singles.has(name)) continue;
+    if (singles.get(name)) continue;
+    // A lone custom `.0` may be a literal cookie name. Infer a new custom base
+    // only from multiple parts; known or already selected bases stay readable.
+    if (group.length === 1 && name !== selectedKey && !_looksLikeSupabaseAuthKey(name)) continue;
     group.sort((a, b) => a.index - b.index);
     if (group.some((entry, index) => entry.index !== index)) continue;
     if (!_looksLikeSupabaseAuthKey(name) &&
@@ -349,7 +354,9 @@ function _collectAuthCookieValues(
   }
   // Prefer reconstructed groups to their individual parts, while still allowing
   // a literal custom cookie name ending in `.N` when it holds a whole session.
-  for (const [name, value] of singles) values.set(name, value);
+  for (const [name, value] of singles) {
+    if (!values.has(name)) values.set(name, value);
+  }
   return values;
 }
 
