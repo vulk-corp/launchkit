@@ -111,7 +111,11 @@ Paste the snippet above directly into your AI builder as a prompt. The AI will h
 
 All behavior is configured remotely from the [BWORLDS dashboard](https://app.bworlds.co). The SDK fetches its configuration at startup, no client-side options needed beyond `buildSlug`.
 
-For Supabase Auth apps, LaunchKit automatically attempts to attach the signed-in user's email and id to session replays. The public install snippet stays the same. The SDK reads only `session.user.email` and `session.user.id`; it does not send Supabase access tokens, refresh tokens, user metadata, or application table data.
+For Supabase Auth apps, LaunchKit automatically attempts to attach the signed-in user's email and id to session replays. The public install snippet stays the same. Detection supports the standard auth keys and custom `storageKey` names in localStorage and readable Supabase cookies, including chunked and base64url-encoded cookies.
+
+During discovery, readable cookies take priority over localStorage, and standard Supabase key names take priority within each source. For custom names, the SDK bounds candidate sizes and locally inspects the session shape and JWT claims (`iss`, `sub`, `exp`, `iat`, `role`). It selects the most recently issued unexpired candidate without network calls or signature verification. Only `session.user.email` and `session.user.id` are attached to replays; Supabase access tokens, refresh tokens, JWT claims, user metadata, and application table data are not sent to BWORLDS.
+
+Discovery retries every two seconds until a session is found. The bridge then follows that same storage key or cookie, decoding only when its value changes. Removal clears the automatic identity; logging in again at the same location restores it. Token expiration does not clear an identity after discovery: Supabase owns token refresh and logout. Changing the storage location requires restarting the bridge or reloading the page. HttpOnly cookies, server-only sessions, and sessions that store the user separately from the token are outside this heuristic; apps can use `identify()` or `connectSupabase()` explicitly.
 
 | Feature | Description |
 |---------|-------------|

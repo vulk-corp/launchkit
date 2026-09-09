@@ -44,10 +44,28 @@ export type SupabaseClientLike = {
 const AUTO_SOURCE: IdentitySource = 'supabase-auto';
 const CONNECTED_SOURCE: IdentitySource = 'supabase';
 const POLL_INTERVAL_MS = 2_000;
+// String-length limits, checked before parsing app-owned values. Using code
+// units avoids allocating an encoded copy of large image/data blobs.
+const MIN_SESSION_LENGTH = 200;
+const MAX_SESSION_LENGTH = 100 * 1024;
+const MAX_ENCODED_COOKIE_LENGTH = MAX_SESSION_LENGTH * 4;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+type AutoIdentity = { email: string | null; userId: string };
+type SessionCandidate = { identity: AutoIdentity; issuedAt: number };
+type SessionLocation = {
+  source: 'localStorage' | 'cookie';
+  key: string;
+  raw: string | null;
+  identity: AutoIdentity | null;
+};
 
 let _autoTimer: ReturnType<typeof setInterval> | null = null;
 let _storageHandler: ((event: StorageEvent) => void) | null = null;
 let _connectedSubscription: SupabaseSubscriptionLike | null = null;
+// Keep the location across logout. Configuration changes require a restart;
+// the bridge does not keep searching for a newer session once it has a key.
+let _autoSession: SessionLocation | null = null;
 
 function _getLocalStorage(): Storage | null {
   try {
@@ -67,7 +85,7 @@ function _getLocalStorage(): Storage | null {
 
 function _identityFromSession(
   session: SupabaseSessionLike,
-): { email: string | null; userId: string } | null {
+): AutoIdentity | null {
   const user = session?.user;
   const id = user?.id;
   if (typeof id !== 'string' || id.length === 0) return null;
@@ -103,50 +121,150 @@ function _parseStorageValue(raw: string): unknown {
   return parsed;
 }
 
-function _sessionFromParsedValue(parsed: unknown): SupabaseSessionLike {
-  if (!parsed || typeof parsed !== 'object') return null;
+function _sessionCandidates(parsed: unknown): SupabaseSessionLike[] {
+  if (!parsed || typeof parsed !== 'object') return [];
 
   const record = parsed as Record<string, unknown>;
-  const candidates = [
+  return [
     parsed,
     record['session'],
     record['currentSession'],
     (record['data'] as Record<string, unknown> | undefined)?.['session'],
-  ];
-
-  for (const candidate of candidates) {
-    if (_identityFromSession(candidate as SupabaseSessionLike)) {
-      return candidate as SupabaseSessionLike;
-    }
-  }
-
-  return null;
+  ] as SupabaseSessionLike[];
 }
 
-function _readStoredSupabaseSession(): SupabaseSessionLike {
-  const storage = _getLocalStorage();
-  if (!storage) return null;
+/** Recognize GoTrue locally; this is not signature or authentication verification. */
+function _customSessionIssuedAt(
+  session: SupabaseSessionLike,
+  discovering: boolean,
+): number | null {
+  const stored = session as {
+    access_token?: unknown;
+    user?: { id?: unknown; aud?: unknown; role?: unknown };
+  };
+  const user = stored.user;
+  if (
+    typeof stored.access_token !== 'string' ||
+    typeof user?.id !== 'string' ||
+    !UUID_RE.test(user.id) ||
+    (user.aud !== 'authenticated' && user.role !== 'authenticated')
+  ) return null;
 
+  const parts = stored.access_token.split('.');
+  if (parts.length !== 3 || parts.some((part) => !part)) return null;
+  const parsed: unknown = JSON.parse(_decodeBase64Url(parts[1]));
+  if (!parsed || typeof parsed !== 'object') return null;
+  const claims = parsed as Record<string, unknown>;
+  if (
+    typeof claims.iss !== 'string' ||
+    !claims.iss.endsWith('/auth/v1') ||
+    claims.sub !== user.id ||
+    claims.role !== 'authenticated' ||
+    typeof claims.exp !== 'number' ||
+    !Number.isFinite(claims.exp) ||
+    typeof claims.iat !== 'number' ||
+    !Number.isFinite(claims.iat) ||
+    (discovering && claims.exp <= Date.now() / 1000)
+  ) return null;
+
+  return claims.iat;
+}
+
+function _candidateFromValue(
+  key: string,
+  raw: string | null,
+  source: SessionLocation['source'],
+  discovering: boolean,
+): SessionCandidate | null {
+  if (!raw) return null;
+  const knownKey = _looksLikeSupabaseAuthKey(key);
   try {
-    for (let i = 0; i < storage.length; i += 1) {
-      const key = storage.key(i);
-      if (!key || !_looksLikeSupabaseAuthKey(key)) continue;
+    if (!knownKey && source === 'cookie' && raw.length > MAX_ENCODED_COOKIE_LENGTH) return null;
+    const value = source === 'cookie' ? _decodeAuthCookieValue(raw) : raw;
+    if (!knownKey && (
+      value.length < MIN_SESSION_LENGTH ||
+      value.length > MAX_SESSION_LENGTH ||
+      // The unquoted marker also admits the existing double-encoded JSON format.
+      !value.includes('access_token')
+    )) return null;
 
-      const raw = storage.getItem(key);
-      if (!raw) continue;
-
+    for (const session of _sessionCandidates(_parseStorageValue(value))) {
+      const identity = _identityFromSession(session);
+      if (!identity) continue;
+      if (knownKey) return { identity, issuedAt: 0 };
       try {
-        const session = _sessionFromParsedValue(_parseStorageValue(raw));
-        if (session) return session;
+        const issuedAt = _customSessionIssuedAt(session, discovering);
+        if (issuedAt !== null) return { identity, issuedAt };
       } catch {
-        // Ignore malformed app-owned storage entries.
+        // A malformed outer candidate must not hide a valid nested session.
       }
     }
   } catch {
-    return null;
+    // Ignore malformed app-owned storage entries and cookies.
+  }
+  return null;
+}
+
+function _discoverSession(
+  keys: string[],
+  read: (key: string) => string | null,
+  source: SessionLocation['source'],
+): SessionLocation | null {
+  let best: SessionLocation | null = null;
+  let latestIssuedAt = -Infinity;
+  // Known names retain their permissive legacy reader and priority. Only the
+  // fallback scans arbitrary values and compares JWT issue times.
+  for (const knownKey of [true, false]) {
+    for (const key of keys) {
+      if (_looksLikeSupabaseAuthKey(key) !== knownKey) continue;
+      const raw = read(key);
+      const candidate = _candidateFromValue(key, raw, source, true);
+      if (!candidate) continue;
+      if (knownKey) return { source, key, raw, identity: candidate.identity };
+      if (candidate.issuedAt > latestIssuedAt) {
+        best = { source, key, raw, identity: candidate.identity };
+        latestIssuedAt = candidate.issuedAt;
+      }
+    }
+  }
+  return best;
+}
+
+function _updateSelectedSession(raw: string | null): void {
+  if (!_autoSession || raw === _autoSession.raw) return;
+  _autoSession.raw = raw;
+  // Expiration helps discover the right key; Supabase owns token refresh and
+  // logout after that. Cache only the identity, not the parsed session/claims.
+  _autoSession.identity = _candidateFromValue(
+    _autoSession.key, raw, _autoSession.source, false,
+  )?.identity ?? null;
+}
+
+function _readStoredSupabaseSession(eventKey?: string): void {
+  const storage = _getLocalStorage();
+  if (!storage) {
+    _updateSelectedSession(null);
+    return;
   }
 
-  return null;
+  try {
+    if (_autoSession) {
+      _updateSelectedSession(storage.getItem(_autoSession.key));
+      return;
+    }
+    const keys: string[] = [];
+    if (eventKey !== undefined) {
+      keys.push(eventKey);
+    } else {
+      for (let i = 0; i < storage.length; i += 1) {
+        const key = storage.key(i);
+        if (key !== null) keys.push(key);
+      }
+    }
+    _autoSession = _discoverSession(keys, (key) => storage.getItem(key), 'localStorage');
+  } catch {
+    _updateSelectedSession(null);
+  }
 }
 
 const AUTH_COOKIE_PREFIX = 'base64-';
@@ -154,7 +272,6 @@ const AUTH_COOKIE_PREFIX = 'base64-';
 // Reused across decodes so the 2s poll does not allocate a decoder each tick.
 let _textDecoder: TextDecoder | null = null;
 let _lastCookieString: string | null = null;
-let _lastCookieSession: SupabaseSessionLike = null;
 
 function _readDocumentCookie(): string {
   try {
@@ -194,14 +311,14 @@ function _decodeAuthCookieValue(rawValue: string): string {
 }
 
 /**
- * Each sb-*-auth-token value from document.cookie, reassembling chunked cookies
- * (`sb-*-auth-token.0`, `.1`, …) in index order. @supabase/ssr splits large
- * sessions across numbered cookies; the parts concatenate back to one value.
+ * Cookie values by name, including custom names and reassembled `.0`/`.1` chunks.
+ * Once selected, collect only that cookie and its chunks.
  */
-function _collectAuthCookieValues(cookieString: string): string[] {
-  if (!cookieString) return [];
-
-  const singles: string[] = [];
+function _collectAuthCookieValues(
+  cookieString: string,
+  selectedKey?: string,
+): Map<string, string> {
+  const singles = new Map<string, string>();
   const chunkGroups = new Map<string, Array<{ index: number; value: string }>>();
 
   for (const part of cookieString.split(';')) {
@@ -211,56 +328,53 @@ function _collectAuthCookieValues(cookieString: string): string[] {
     if (!name) continue;
     const value = part.slice(eq + 1).trim();
 
-    // A trailing `.N` marks a chunk; the base name owns the auth-key shape, so
-    // _looksLikeSupabaseAuthKey stays the single source of truth for it.
     const chunk = /^(.+)\.(\d+)$/.exec(name);
-    if (chunk && _looksLikeSupabaseAuthKey(chunk[1])) {
+    if (selectedKey !== undefined && name !== selectedKey && chunk?.[1] !== selectedKey) continue;
+    singles.set(name, value);
+    if (chunk) {
       const group = chunkGroups.get(chunk[1]) ?? [];
       group.push({ index: Number(chunk[2]), value });
       chunkGroups.set(chunk[1], group);
-    } else if (_looksLikeSupabaseAuthKey(name)) {
-      singles.push(value);
     }
   }
 
-  const values = [...singles];
-  for (const group of chunkGroups.values()) {
+  const values = new Map<string, string>();
+  for (const [name, group] of chunkGroups) {
+    if (singles.has(name)) continue;
     group.sort((a, b) => a.index - b.index);
-    values.push(group.map((entry) => entry.value).join(''));
+    if (group.some((entry, index) => entry.index !== index)) continue;
+    if (!_looksLikeSupabaseAuthKey(name) &&
+      group.reduce((size, entry) => size + entry.value.length, 0) > MAX_ENCODED_COOKIE_LENGTH) continue;
+    values.set(name, group.map((entry) => entry.value).join(''));
   }
+  // Prefer reconstructed groups to their individual parts, while still allowing
+  // a literal custom cookie name ending in `.N` when it holds a whole session.
+  for (const [name, value] of singles) values.set(name, value);
   return values;
 }
 
-function _readCookieSupabaseSession(): SupabaseSessionLike {
+function _readCookieSupabaseSession(): void {
   const cookieString = _readDocumentCookie();
   // The cookie rarely changes between 2s ticks; skip the decode when it has not.
-  if (cookieString === _lastCookieString) return _lastCookieSession;
+  if (cookieString === _lastCookieString) return;
   _lastCookieString = cookieString;
 
-  let result: SupabaseSessionLike = null;
-  for (const rawValue of _collectAuthCookieValues(cookieString)) {
-    try {
-      const session = _sessionFromParsedValue(
-        _parseStorageValue(_decodeAuthCookieValue(rawValue)),
-      );
-      if (session) {
-        result = session;
-        break;
-      }
-    } catch {
-      // Ignore malformed or non-Supabase cookies.
-    }
+  const values = _collectAuthCookieValues(cookieString, _autoSession?.key);
+  if (_autoSession) {
+    _updateSelectedSession(values.get(_autoSession.key) ?? null);
+  } else {
+    _autoSession = _discoverSession([...values.keys()], (key) => values.get(key) ?? null, 'cookie');
   }
-  _lastCookieSession = result;
-  return result;
 }
 
-function _syncAutoIdentity(): void {
-  // Cookie first: an @supabase/ssr app's live session is in the cookie, and a
-  // stale localStorage token must not shadow it. localStorage apps have no auth
-  // cookie, so they fall through to the stored session unchanged.
-  const session = _readCookieSupabaseSession() ?? _readStoredSupabaseSession();
-  _applySession(AUTO_SOURCE, session);
+function _syncAutoIdentity(eventKey?: string): void {
+  // Cookie first during discovery so stale localStorage cannot shadow SSR.
+  // Once found, follow that location even through logout and subsequent login.
+  if (_autoSession?.source !== 'localStorage') _readCookieSupabaseSession();
+  if (!_autoSession || _autoSession.source === 'localStorage') _readStoredSupabaseSession(eventKey);
+  const identity = _autoSession?.identity;
+  if (identity) setIdentitySource(AUTO_SOURCE, identity.email, identity.userId);
+  else clearIdentitySource(AUTO_SOURCE);
 }
 
 function _unsubscribeConnectedClient(): void {
@@ -291,8 +405,12 @@ export function startSupabaseIdentityBridge(): void {
 
   _syncAutoIdentity();
   _storageHandler = (event: StorageEvent) => {
-    if (!event.key || _looksLikeSupabaseAuthKey(event.key)) {
-      _syncAutoIdentity();
+    if (_autoSession?.source === 'cookie') return;
+    if (event.storageArea && event.storageArea !== _getLocalStorage()) return;
+    if (event.key === null || !_autoSession || event.key === _autoSession.key) {
+      // During discovery a storage event examines only the changed key. The
+      // poll also finds logins in this tab, which emit no storage event here.
+      _syncAutoIdentity(event.key ?? undefined);
     }
   };
   window.addEventListener('storage', _storageHandler);
@@ -338,8 +456,8 @@ export function stopSupabaseIdentityBridge(): void {
     _storageHandler = null;
   }
   _unsubscribeConnectedClient();
+  _autoSession = null;
   _lastCookieString = null;
-  _lastCookieSession = null;
   clearIdentitySource(AUTO_SOURCE);
   clearIdentitySource(CONNECTED_SOURCE);
 }

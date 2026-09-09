@@ -41,7 +41,7 @@ CI: Node 22, runs on main/next push + PRs (type-check, build, test).
 | `src/replay-chunk-plan.ts` | Pure chunk planner over per-event byte estimates (prefix sum, bootstrap split at the FullSnapshot, bisection). Zero imports, lives in the replay chunk |
 | `src/session-state.ts` | Shared replay-session id holder. replay writes, error-capture reads at enqueue. Zero imports |
 | `src/identity-state.ts` | Shared identity holder. `index.ts` writes, replay payload reads |
-| `src/supabase-identity-bridge.ts` | Zero-config Supabase auth detection: reads the session from localStorage and `@supabase/ssr` cookies (`sb-*-auth-token`, chunked `.0`/`.1` + `base64-` base64url), 2s poll. `connectSupabase()` for explicit clients |
+| `src/supabase-identity-bridge.ts` | Supabase auth identity from localStorage and readable cookies, including custom names and chunked base64url cookies. Discovery checks custom session/JWT shape; the 2s poll then follows the selected location and caches identity until its value changes. `connectSupabase()` for explicit clients |
 | `src/visitor-state.ts` | Stable anonymous visitor id, persisted in `localStorage` (`bworlds-visitor-id`), origin-scoped. Replay payload reads it so the backend groups a returning visitor's sessions. globalThis-backed, fail-open |
 | `src/uuid.ts` | UUID v4 generator shared by session id + visitor id |
 | `src/badge-widget.ts` | Shadow DOM badge. Fetches `/api/telemetry/badge-counts` |
