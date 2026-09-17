@@ -249,7 +249,7 @@ describe('replay telemetry', () => {
     expect(message).toContain('"b":{"v":1}');
   });
 
-  it('captures requests to look-alike origins and skips only the real SDK origin', async () => {
+  it('skips SDK telemetry while capturing product APIs and look-alikes', async () => {
     window.fetch = vi.fn().mockResolvedValue(new Response('OK', { status: 200 }));
 
     startReplayTelemetry('test-app', 'http://localhost:3941', {
@@ -258,12 +258,16 @@ describe('replay telemetry', () => {
     });
 
     await fetch('http://localhost:39410/foo'); // longer port -> different origin
-    await fetch('http://localhost:3941/self'); // same origin as apiEndpoint
+    await fetch('http://localhost:3941/api/audit-runs/123/events');
+    await fetch('http://localhost:3941/api/telemetry/replay-telemetry');
+    await fetch('http://localhost:3941/api/telemetry-preview/events');
     vi.advanceTimersByTime(10_000);
 
     const urls = lastTelemetryEvents().map((event) => event.url);
     expect(urls).toContain('http://localhost:39410/foo');
-    expect(urls).not.toContain('http://localhost:3941/self');
+    expect(urls).toContain('http://localhost:3941/api/audit-runs/123/events');
+    expect(urls).toContain('http://localhost:3941/api/telemetry-preview/events');
+    expect(urls).not.toContain('http://localhost:3941/api/telemetry/replay-telemetry');
   });
 
   it('keeps forwarding host console after telemetry stops through a retained wrapper', () => {

@@ -166,6 +166,39 @@ describe('startNetworkCapture / stopNetworkCapture', () => {
     expect(mockEnqueue).not.toHaveBeenCalled();
   });
 
+  it('captures product API network failures on the telemetry origin and redacts secrets', async () => {
+    const failure = new TypeError('Failed to fetch');
+    window.fetch = vi.fn().mockRejectedValue(failure);
+
+    startNetworkCapture('https://api.bworlds.co');
+    await expect(
+      fetch('https://api.bworlds.co/api/audit-runs/123/events?accessToken=secret&after=4'),
+    ).rejects.toBe(failure);
+
+    expect(mockEnqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message:
+          'Network error - GET https://api.bworlds.co/api/audit-runs/123/events?accessToken=%5BREDACTED%5D&after=4: Failed to fetch',
+        metadata: expect.objectContaining({
+          status: 0,
+          requestUrl:
+            'https://api.bworlds.co/api/audit-runs/123/events?accessToken=%5BREDACTED%5D&after=4',
+        }),
+      }),
+    );
+  });
+
+  it('captures telemetry look-alike paths instead of treating them as SDK calls', async () => {
+    window.fetch = vi.fn().mockResolvedValue(
+      new Response('Error', { status: 500, statusText: 'Error' }),
+    );
+
+    startNetworkCapture('https://api.bworlds.co');
+    await fetch('https://api.bworlds.co/api/telemetry-preview/errors');
+
+    expect(mockEnqueue).toHaveBeenCalledOnce();
+  });
+
   it('returns the original Response object to the caller', async () => {
     const mockResponse = new Response('body content', { status: 403, statusText: 'Forbidden' });
     window.fetch = vi.fn().mockResolvedValue(mockResponse);
