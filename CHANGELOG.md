@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.18.3] - 2026-09-21
+
+### Fixed
+
+- **Replay sessions kept alive by passive page activity**: session inactivity now follows interaction events instead of every rrweb event, so DOM mutations, timers and other background page updates no longer keep a replay alive indefinitely. After 15 minutes without interaction, the current tail is flushed, passive events are ignored and errors are left unlinked until activity returns; the resumed recording starts under a fresh session id with a new FullSnapshot. Programmatic input changes do not resume recording, while the 60-minute maximum remains a hard boundary for continuously active sessions.
+
 ## [1.18.2] - 2026-09-21
 
 ### Fixed

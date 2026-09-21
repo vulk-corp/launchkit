@@ -16,10 +16,10 @@
  * player can explain it to the viewer. Stops recording on 429 (daily cap
  * reached).
  *
- * Session rotation: if no rrweb events fire for longer than IDLE_TIMEOUT_MS or
- * the active session reaches MAX_SESSION_MS, the SDK rotates to a fresh session
- * id, flushes the tail of the old one under its original identity, and forces a
- * new FullSnapshot so the new session is independently replayable.
+ * Session lifecycle follows human activity. After IDLE_TIMEOUT_MS without an
+ * interaction, passive rrweb events are ignored until a human returns. The
+ * resumed recording gets a fresh session id and FullSnapshot. MAX_SESSION_MS
+ * remains a hard boundary for continuously active sessions.
  */
 
 import type { eventWithTime, record as rrwebRecord } from 'rrweb';
@@ -106,6 +106,15 @@ const REPLAY_SLIM_DOM_OPTIONS = {
 // same replay session. Server-side assembly is independent and append-only.
 const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_SESSION_MS = 60 * 60 * 1000; // 60 min — rotate session after this duration
+const RRWEB_TYPE_INCREMENTAL_SNAPSHOT = 3;
+const RRWEB_SOURCE_MOUSE_MOVE = 1;
+const RRWEB_SOURCE_MOUSE_INTERACTION = 2;
+const RRWEB_SOURCE_SCROLL = 3;
+const RRWEB_SOURCE_INPUT = 5;
+const RRWEB_SOURCE_TOUCH_MOVE = 6;
+const RRWEB_SOURCE_DRAG = 12;
+const RRWEB_MOUSE_FOCUS = 5;
+const RRWEB_MOUSE_BLUR = 6;
 const STORAGE_KEY = 'bworlds-replay-session';
 const BOOTSTRAP_STORAGE_KEY = 'bworlds-replay-bootstrap-chunk';
 const TOKEN_COOKIE = 'bworlds_token';
@@ -129,7 +138,9 @@ const VITE_DEV_CSS_READY_TIMEOUT_MS = 1_500;
 let _sessionId: string | null = null;
 let _sequenceNumber = 0;
 let _sessionStartedAt = 0;
-let _lastEventAt = 0;
+let _lastHumanActivityAt = 0;
+let _lastBufferedEventAt = 0;
+let _dormant = false;
 let _eventBuffer: BufferedEvent[] = [];
 let _bufferedBytes = 0;
 let _pendingChunks: ReplayChunk[] = [];
@@ -190,8 +201,8 @@ let _getIdentity: GetIdentity = _defaultGetIdentity;
 export interface StartReplayOptions {
   getIdentity?: GetIdentity;
   enableReplayDiagnostics?: boolean;
-  // Invoked whenever recording stops — manual stop, idle teardown, or the 429
-  // daily-cap stop that runs inside this module. The orchestrator wires it to
+  // Invoked whenever recording stops — manual stop or the 429 daily-cap stop
+  // that runs inside this module. The orchestrator wires it to
   // tear down the console/network telemetry wrappers it installed alongside
   // recording; passing a callback (rather than importing the telemetry module
   // here) keeps a single wrapper instance under CDN bundle splitting.
@@ -365,6 +376,81 @@ async function _waitForViteDevCssReady(): Promise<void> {
 
 function _isFullSnapshotEvent(event: eventWithTime): boolean {
   return event.type === (_EventType?.FullSnapshot ?? 2);
+}
+
+function _isHumanActivityEvent(event: eventWithTime): boolean {
+  if (event.type !== (_EventType?.IncrementalSnapshot ?? RRWEB_TYPE_INCREMENTAL_SNAPSHOT)) {
+    return false;
+  }
+  const data = event.data as {
+    source?: number;
+    type?: number;
+    isTrusted?: boolean;
+    userTriggered?: boolean;
+  };
+  switch (data.source) {
+    case RRWEB_SOURCE_MOUSE_MOVE:
+    case RRWEB_SOURCE_SCROLL:
+    case RRWEB_SOURCE_TOUCH_MOVE:
+    case RRWEB_SOURCE_DRAG:
+      return true;
+    case RRWEB_SOURCE_MOUSE_INTERACTION:
+      return (
+        data.isTrusted !== false &&
+        data.type !== RRWEB_MOUSE_FOCUS &&
+        data.type !== RRWEB_MOUSE_BLUR
+      );
+    case RRWEB_SOURCE_INPUT:
+      return data.userTriggered === true;
+    default:
+      return false;
+  }
+}
+
+function _enterDormantState(): void {
+  if (_dormant || !_sessionId) return;
+  _dormant = true;
+  _saveSession();
+  setReplaySessionId(null);
+  _cancelResyncSnapshot();
+  _cancelDegradationMarker();
+  _pendingDegradation.clear();
+  void _flush().catch(() => {});
+}
+
+function _sessionBoundaryExpired(now: number): boolean {
+  if (_dormant || !_sessionId || _lastBufferedEventAt === 0) return false;
+  const idleExpired =
+    _lastHumanActivityAt > 0 && now - _lastHumanActivityAt >= IDLE_TIMEOUT_MS;
+  const ageExpired = _sessionStartedAt > 0 && now - _sessionStartedAt >= MAX_SESSION_MS;
+  return idleExpired || ageExpired;
+}
+
+function _suspendExpiredSession(now: number): void {
+  if (_sessionBoundaryExpired(now)) _enterDormantState();
+}
+
+function _prepareSessionForEvent(event: eventWithTime, now: number): boolean {
+  const isHumanActivity = _isHumanActivityEvent(event);
+  if (_sessionBoundaryExpired(now)) {
+    if (isHumanActivity) {
+      _lastHumanActivityAt = now;
+      _rotateSession(_isFullSnapshotEvent(event));
+      return _sessionId !== null;
+    }
+    _enterDormantState();
+  }
+
+  if (_dormant) {
+    if (!isHumanActivity) return false;
+    _dormant = false;
+    _lastHumanActivityAt = now;
+    _rotateSession(_isFullSnapshotEvent(event));
+  } else if (isHumanActivity) {
+    _lastHumanActivityAt = now;
+  }
+
+  return _sessionId !== null;
 }
 
 function _snapshotNodeHasViteDevCss(node: SnapshotNodeLike): boolean {
@@ -807,7 +893,7 @@ function _saveSession(): void {
       id: _sessionId,
       seq: _sequenceNumber,
       startedAt: _sessionStartedAt,
-      lastActivityAt: Date.now(),
+      lastActivityAt: _lastHumanActivityAt || _sessionStartedAt,
       firstChunkAcked: _firstChunkAcked,
     };
     sessionStorage.setItem(STORAGE_KEY, JSON.stringify(data));
@@ -820,6 +906,9 @@ function _openNewSession(now: number): void {
   _sessionId = generateUuid();
   _sequenceNumber = 0;
   _sessionStartedAt = now;
+  _lastHumanActivityAt = now;
+  _lastBufferedEventAt = 0;
+  _dormant = false;
   _firstChunkAcked = false;
   _firstChunkAttempts = 0;
   _firstChunkRetryAfter = 0;
@@ -849,6 +938,8 @@ function _resolveSession(): boolean {
         _sessionId = stored.id;
         _sequenceNumber = Math.max(stored.seq, 1);
         _sessionStartedAt = stored.startedAt;
+        _lastHumanActivityAt = stored.lastActivityAt;
+        _dormant = false;
         _firstChunkAcked = false;
         setReplaySessionId(_sessionId);
         _sendReplayDiagnostic('session_resumed', _sessionId, 'info');
@@ -864,6 +955,8 @@ function _resolveSession(): boolean {
       _sessionId = stored.id;
       _sequenceNumber = stored.seq;
       _sessionStartedAt = stored.startedAt;
+      _lastHumanActivityAt = stored.lastActivityAt;
+      _dormant = false;
       _firstChunkAcked = stored.firstChunkAcked === true;
       setReplaySessionId(_sessionId);
       _sendReplayDiagnostic('session_resumed', _sessionId, 'info');
@@ -875,6 +968,8 @@ function _resolveSession(): boolean {
     _sessionId = storedBootstrap.sessionId;
     _sequenceNumber = 1;
     _sessionStartedAt = storedBootstrap.createdAt;
+    _lastHumanActivityAt = storedBootstrap.createdAt;
+    _dormant = false;
     _firstChunkAcked = false;
     setReplaySessionId(_sessionId);
     _saveSession();
@@ -1871,10 +1966,9 @@ function _beaconFlush(): void {
 }
 
 /**
- * Close the current session and open a fresh one when the emit gap exceeds
- * IDLE_TIMEOUT_MS or its total age reaches MAX_SESSION_MS. The next event starts
- * from a FullSnapshot so replay assembly can resume with an independently
- * replayable session.
+ * Close the current session when a human returns after dormancy or reaches the
+ * active session's hard age limit. The next session starts from a FullSnapshot
+ * so replay assembly can play it independently.
  *
  * Sequence:
  *   1. capture the old identity + buffered events
@@ -2193,7 +2287,9 @@ export function stopReplay(): void {
   _sessionId = null;
   _sequenceNumber = 0;
   _sessionStartedAt = 0;
-  _lastEventAt = 0;
+  _lastHumanActivityAt = 0;
+  _lastBufferedEventAt = 0;
+  _dormant = false;
   _eventBuffer = [];
   _bufferedBytes = 0;
   _pendingChunks = [];
@@ -2239,7 +2335,8 @@ export async function startReplay(
     _bufferedBytes = 0;
     _pendingChunks = [];
     _capReached = false;
-    _lastEventAt = 0;
+    _lastBufferedEventAt = 0;
+    _dormant = false;
     _droppedAtCeilingCount = 0;
     _viteDevCssFullSnapshotSeen = false;
     _viteDevCssSnapshotRetryScheduled = false;
@@ -2281,23 +2378,13 @@ export async function startReplay(
     const stop = record({
       emit(event: eventWithTime) {
         const now = Date.now();
-        const hasReachedMaxAge =
-          _sessionStartedAt > 0 && now - _sessionStartedAt >= MAX_SESSION_MS;
-        const shouldRotate =
-          _lastEventAt > 0 &&
-          (now - _lastEventAt > IDLE_TIMEOUT_MS || hasReachedMaxAge);
-        _lastEventAt = now;
-        if (shouldRotate) {
-          // Rotation may synchronously call takeFullSnapshot, which re-enters
-          // this emit callback with a type-2 event. Updating _lastEventAt first
-          // prevents that nested call from re-triggering rotation.
-          _rotateSession(_isFullSnapshotEvent(event));
-        }
+        if (!_prepareSessionForEvent(event, now)) return;
         if (!_shouldBufferReplayEvent(event)) return;
         _scrubEventInlineData(event);
         const bytes = _approxEventBytes(event);
         if (!_admitEventUnderCeiling(event, bytes)) return;
         _bufferEvent(event, bytes);
+        _lastBufferedEventAt = now;
         if (_shouldFlushEagerly(event)) {
           _scheduleEagerFlush();
         }
@@ -2305,6 +2392,7 @@ export async function startReplay(
       maskInputOptions: {
         password: true,
       },
+      userTriggeredOnInput: true,
       slimDOMOptions: REPLAY_SLIM_DOM_OPTIONS,
       blockSelector: '[data-rrweb-block]',
       maskTextSelector: '[data-rrweb-mask]',
@@ -2338,13 +2426,16 @@ export async function startReplay(
     }
 
     _flushTimer = setInterval(() => {
+      _suspendExpiredSession(Date.now());
       _flush().catch(() => {});
     }, FLUSH_INTERVAL_MS);
 
     _lastPeriodicSnapshotAt = Date.now();
     _snapshotTimer = setInterval(() => {
+      _suspendExpiredSession(Date.now());
+      if (_dormant) return;
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-      if (_lastEventAt <= _lastPeriodicSnapshotAt) return;
+      if (_lastBufferedEventAt <= _lastPeriodicSnapshotAt) return;
       try {
         _record?.takeFullSnapshot(true);
         _lastPeriodicSnapshotAt = Date.now();
