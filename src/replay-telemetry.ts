@@ -1,6 +1,12 @@
 import { getReplaySessionId } from './session-state';
 import { sendTelemetry } from './telemetry-sender';
-import { MAX_MESSAGE_LENGTH, MAX_URL_LENGTH, normalizeThrown, sanitizeAndTruncate } from './normalize-thrown';
+import {
+  isSdkTelemetryUrl,
+  isSensitiveNetworkKey,
+  REDACTED,
+  redactNetworkUrl,
+} from './network-url';
+import { MAX_MESSAGE_LENGTH, normalizeThrown, sanitizeAndTruncate } from './normalize-thrown';
 
 declare const __SDK_VERSION__: string;
 
@@ -15,28 +21,6 @@ const MAX_METHOD_LENGTH = 32;
 // telemetry would echo the SDK's warnings back through the pipeline and burn the
 // per-minute rate-limit budget meant for genuine host logs.
 const SDK_LOG_PREFIX = '[@bworlds/launchkit]';
-const REDACTED = '[REDACTED]';
-// Words that mark a query parameter or header as carrying a credential. Matched
-// against camelCase / snake_case / kebab-case segments so accessToken,
-// access_token, and x-access-token all redact, not only dash/underscore-bounded
-// forms — the previous single boundary regex leaked camelCase secrets.
-const SENSITIVE_KEY_WORDS = new Set([
-  'token',
-  'access',
-  'refresh',
-  'auth',
-  'authorization',
-  'authentication',
-  'password',
-  'passwd',
-  'secret',
-  'key',
-  'apikey',
-  'jwt',
-  'session',
-  'cookie',
-]);
-
 type ConsoleMethod = 'log' | 'info' | 'warn' | 'error' | 'debug';
 type ReplayTelemetryType = 'console' | 'network';
 type NetworkInitiator = 'fetch' | 'xmlhttprequest';
@@ -270,7 +254,7 @@ async function captureFetch(
   try {
     url = resolveFetchUrl(input);
     method = resolveFetchMethod(input, init);
-    if (isSdkEndpoint(url)) return original(input, init);
+    if (isSdkTelemetryUrl(url, _apiEndpoint)) return original(input, init);
   } catch {
     // Instrumentation must never keep the host request from going out, even in
     // an environment where fetch exists but the Request/URL globals do not.
@@ -284,7 +268,7 @@ async function captureFetch(
       initiator: 'fetch',
       requestType: 'fetch',
       method,
-      url: redactUrl(url),
+      url: redactNetworkUrl(url),
       status: response.status,
       durationMs: Math.max(0, Date.now() - startedAt),
       headers: redactHeaders(headers),
@@ -296,7 +280,7 @@ async function captureFetch(
       initiator: 'fetch',
       requestType: 'fetch',
       method,
-      url: redactUrl(url),
+      url: redactNetworkUrl(url),
       status: 0,
       durationMs: Math.max(0, Date.now() - startedAt),
       failureReason: sanitizeAndTruncate(normalizeThrown(error).message, MAX_MESSAGE_LENGTH),
@@ -337,13 +321,13 @@ function captureXhrSend(this: XMLHttpRequest, body?: Document | XMLHttpRequestBo
     if (state) {
       state.startedAt = Date.now();
       const finalize = () => {
-        if (isSdkEndpoint(state.url)) return;
+        if (isSdkTelemetryUrl(state.url, _apiEndpoint)) return;
         enqueueReplayTelemetry({
           type: 'network',
           initiator: 'xmlhttprequest',
           requestType: 'xmlhttprequest',
           method: state.method,
-          url: redactUrl(state.url),
+          url: redactNetworkUrl(state.url),
           status: this.status || 0,
           durationMs: Math.max(0, Date.now() - state.startedAt),
           failureReason: this.status === 0 ? 'XMLHttpRequest failed' : undefined,
@@ -369,44 +353,12 @@ function resolveFetchMethod(input: RequestInfo | URL, init?: RequestInit): strin
   return sanitizeAndTruncate(String(raw).toUpperCase(), MAX_METHOD_LENGTH);
 }
 
-function isSdkEndpoint(url: string): boolean {
-  if (_apiEndpoint === '') return false;
-  try {
-    // Compare origins, not a raw string prefix: a look-alike host
-    // (api.bworlds.company.com) or a longer port (localhost:39410) must not be
-    // misread as an SDK self-call and dropped from network telemetry.
-    const base = typeof location !== 'undefined' ? location.href : undefined;
-    return new URL(url, base).origin === new URL(_apiEndpoint, base).origin;
-  } catch {
-    return false;
-  }
-}
-
-function isSensitiveKey(key: string): boolean {
-  // Split camelCase (accessToken -> access, Token) and any non-alphanumeric
-  // delimiter (access_token, x-access-token) into words, then match each.
-  const words = key.replace(/([a-z0-9])([A-Z])/g, '$1 $2').split(/[^a-z0-9]+/i);
-  return words.some((word) => SENSITIVE_KEY_WORDS.has(word.toLowerCase()));
-}
-
-function redactUrl(url: string): string {
-  try {
-    const parsed = new URL(url, typeof location !== 'undefined' ? location.href : undefined);
-    for (const key of Array.from(parsed.searchParams.keys())) {
-      if (isSensitiveKey(key)) parsed.searchParams.set(key, REDACTED);
-    }
-    return sanitizeAndTruncate(parsed.href, MAX_URL_LENGTH);
-  } catch {
-    return sanitizeAndTruncate(url, MAX_URL_LENGTH);
-  }
-}
-
 function redactHeaders(headers: HeadersInit | undefined): Record<string, string> | undefined {
   if (!headers) return undefined;
   try {
     const redacted: Record<string, string> = {};
     new Headers(headers).forEach((value, key) => {
-      redacted[key] = isSensitiveKey(key) ? REDACTED : sanitizeAndTruncate(value, 200);
+      redacted[key] = isSensitiveNetworkKey(key) ? REDACTED : sanitizeAndTruncate(value, 200);
     });
     return Object.keys(redacted).length > 0 ? redacted : undefined;
   } catch {

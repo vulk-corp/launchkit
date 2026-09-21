@@ -1,6 +1,6 @@
 {
   "name": "@bworlds/launchkit",
-  "version": "1.18.1",
+  "version": "1.18.2",
   "description": "Splits browser error capture from session replay so apps can collect client errors without recording sessions",
   "type": "module",
   "main": "./dist/launchkit.js",

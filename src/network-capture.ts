@@ -1,4 +1,5 @@
 import { enqueueError } from './error-capture';
+import { isSdkTelemetryUrl, redactNetworkUrl } from './network-url';
 import { normalizeThrown } from './normalize-thrown';
 
 let _originalFetch: typeof fetch | null = null;
@@ -24,7 +25,7 @@ export function startNetworkCapture(apiEndpoint: string): void {
     try {
       url = resolveUrl(input);
       method = init?.method?.toUpperCase() || 'GET';
-      if (isSdkEndpoint(url)) return original(input, init);
+      if (isSdkTelemetryUrl(url, _apiEndpoint)) return original(input, init);
     } catch {
       // Instrumentation must never keep the host request from going out.
       return original(input, init);
@@ -35,15 +36,16 @@ export function startNetworkCapture(apiEndpoint: string): void {
 
       if (response.status >= 400) {
         try {
+          const requestUrl = truncateUrl(redactNetworkUrl(url));
           enqueueError({
-            message: `HTTP ${response.status} ${response.statusText} - ${method} ${truncateUrl(url)}`,
+            message: `HTTP ${response.status} ${response.statusText} - ${method} ${requestUrl}`,
             stack: null,
             url: window.location.href,
             source: 'network',
             metadata: {
               status: response.status,
               method,
-              requestUrl: truncateUrl(url),
+              requestUrl,
               statusText: response.statusText,
             },
           });
@@ -56,15 +58,16 @@ export function startNetworkCapture(apiEndpoint: string): void {
     } catch (error: unknown) {
       try {
         const { message, stack } = normalizeThrown(error);
+        const requestUrl = truncateUrl(redactNetworkUrl(url));
         enqueueError({
-          message: `Network error - ${method} ${truncateUrl(url)}: ${message}`,
+          message: `Network error - ${method} ${requestUrl}: ${message}`,
           stack,
           url: window.location.href,
           source: 'network',
           metadata: {
             status: 0,
             method,
-            requestUrl: truncateUrl(url),
+            requestUrl,
             statusText: 'Network Error',
           },
         });
@@ -89,19 +92,6 @@ function resolveUrl(input: RequestInfo | URL): string {
   if (typeof URL !== 'undefined' && input instanceof URL) return input.href;
   if (typeof Request !== 'undefined' && input instanceof Request) return input.url;
   return String(input);
-}
-
-function isSdkEndpoint(url: string): boolean {
-  if (_apiEndpoint === '') return false;
-  try {
-    // Compare origins, not a raw string prefix: a look-alike host or a longer
-    // port that merely starts with the endpoint string must not be misread as an
-    // SDK self-call and dropped from capture.
-    const base = typeof location !== 'undefined' ? location.href : undefined;
-    return new URL(url, base).origin === new URL(_apiEndpoint, base).origin;
-  } catch {
-    return false;
-  }
 }
 
 function truncateUrl(url: string): string {

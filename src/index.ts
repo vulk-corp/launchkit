@@ -170,7 +170,7 @@ export function init(config: LaunchKitConfig): LaunchKitInstance {
   _initialized = true;
 
   _buildSlug = config.buildSlug;
-  _apiEndpoint = config.apiEndpoint ?? DEFAULT_API_ENDPOINT;
+  _apiEndpoint = (config.apiEndpoint ?? DEFAULT_API_ENDPOINT).replace(/\/+$/, '');
   _gateOrigin = config.gateOrigin ?? DEFAULT_GATE_ORIGIN;
 
   if (typeof window !== 'undefined') {
