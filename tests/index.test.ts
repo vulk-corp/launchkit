@@ -99,6 +99,19 @@ describe('init()', () => {
     });
   });
 
+  it('normalizes a trailing slash from apiEndpoint before configuring subsystems', () => {
+    init({ buildSlug: 'test-app', apiEndpoint: 'https://custom.api/proxy/', gate: false });
+
+    expect(configureSender).toHaveBeenCalledWith({
+      buildSlug: 'test-app',
+      apiEndpoint: 'https://custom.api/proxy',
+    });
+    expect(mockFetchRemoteConfig).toHaveBeenCalledWith(
+      'https://custom.api/proxy',
+      'test-app',
+    );
+  });
+
   it('starts heartbeat by default after config fetch resolves', async () => {
     init({ buildSlug: 'test-app', gate: false });
     await flushMicrotasks();

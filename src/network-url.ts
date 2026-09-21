@@ -27,7 +27,9 @@ export function isSdkTelemetryUrl(url: string, apiEndpoint: string): boolean {
     const base = typeof location !== 'undefined' ? location.href : undefined;
     const target = new URL(url, base);
     const endpoint = new URL(apiEndpoint, base);
-    return target.origin === endpoint.origin && target.pathname.startsWith('/api/telemetry/');
+    const endpointPath = endpoint.pathname.replace(/\/+$/, '');
+    const telemetryPath = `${endpointPath}/api/telemetry/`;
+    return target.origin === endpoint.origin && target.pathname.startsWith(telemetryPath);
   } catch {
     return false;
   }

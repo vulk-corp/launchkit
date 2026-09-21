@@ -166,6 +166,28 @@ describe('startNetworkCapture / stopNetworkCapture', () => {
     expect(mockEnqueue).not.toHaveBeenCalled();
   });
 
+  it('does not capture SDK telemetry behind an endpoint path with a trailing slash', async () => {
+    window.fetch = vi.fn().mockResolvedValue(
+      new Response('Error', { status: 500, statusText: 'Error' }),
+    );
+
+    startNetworkCapture('https://api.bworlds.co/proxy/');
+    await fetch('https://api.bworlds.co/proxy/api/telemetry/errors');
+
+    expect(mockEnqueue).not.toHaveBeenCalled();
+  });
+
+  it('captures same-origin telemetry paths outside the configured endpoint base', async () => {
+    window.fetch = vi.fn().mockResolvedValue(
+      new Response('Error', { status: 500, statusText: 'Error' }),
+    );
+
+    startNetworkCapture('https://api.bworlds.co/proxy');
+    await fetch('https://api.bworlds.co/api/telemetry/errors');
+
+    expect(mockEnqueue).toHaveBeenCalledOnce();
+  });
+
   it('captures product API network failures on the telemetry origin and redacts secrets', async () => {
     const failure = new TypeError('Failed to fetch');
     window.fetch = vi.fn().mockRejectedValue(failure);

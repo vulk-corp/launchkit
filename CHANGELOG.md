@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.18.2] - 2026-09-21
+
+### Fixed
+
+- **Network telemetry scope**: client error capture and replay telemetry no longer discard every request made to the configured SDK origin. Only SDK-owned `/api/telemetry/*` calls under the configured endpoint base path are excluded, so product API requests, look-alike paths, neighboring ports and unrelated routes remain observable.
+- **Custom endpoint self-capture**: `apiEndpoint` is normalized before subsystem startup, and telemetry URL classification derives its path from the configured endpoint base. Trailing slashes and reverse-proxy prefixes such as `/bworlds` therefore cannot turn SDK uploads into recursively captured network telemetry.
+
+### Privacy
+
+- **Shared credential redaction**: client errors now use the same query-parameter redaction as replay telemetry before recording a request URL. Credential-bearing names across camelCase, snake_case and kebab-case forms, including access tokens, authorization values, passwords, secrets, API keys, JWTs, sessions and cookies, are replaced with `[REDACTED]`.
+
 ## [1.18.1] - 2026-09-09
 
 ### Fixed
