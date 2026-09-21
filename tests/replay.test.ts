@@ -505,6 +505,86 @@ describe('Vite dev CSS readiness', () => {
 });
 
 describe('session rotation', () => {
+  it('does not create sessions from passive events after human inactivity', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    expect(emit).not.toBeNull();
+
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 2, type: 2 } });
+    const activeSessionId = readStoredSession().id;
+
+    setNow(START_NOW + IDLE_TIMEOUT_MS);
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 0, adds: [] } });
+    setNow(START_NOW + MAX_SESSION_MS);
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 0, adds: [] } });
+
+    expect(readStoredSession().id).toBe(activeSessionId);
+    expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
+  });
+
+  it('opens a fresh session only when a human interaction returns after inactivity', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 2, type: 2 } });
+    const activeSessionId = readStoredSession().id;
+
+    setNow(START_NOW + IDLE_TIMEOUT_MS);
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 0, adds: [] } });
+    expect(readStoredSession().id).toBe(activeSessionId);
+
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 3, id: 1, x: 0, y: 100 } });
+
+    expect(readStoredSession().id).not.toBe(activeSessionId);
+    expect(hoisted.takeFullSnapshot).toHaveBeenCalledWith(true);
+  });
+
+  it('ignores programmatic input when deciding whether to resume', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    expect(hoisted.recordFactory.mock.calls[0]?.[0]).toMatchObject({
+      userTriggeredOnInput: true,
+    });
+
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 2, type: 2 } });
+    const activeSessionId = readStoredSession().id;
+
+    setNow(START_NOW + IDLE_TIMEOUT_MS);
+    emit!({
+      type: 3,
+      timestamp: Date.now(),
+      data: { source: 5, id: 1, text: 'automatic', isChecked: false, userTriggered: false },
+    });
+    expect(readStoredSession().id).toBe(activeSessionId);
+
+    emit!({
+      type: 3,
+      timestamp: Date.now(),
+      data: { source: 5, id: 1, text: 'human', isChecked: false, userTriggered: true },
+    });
+    expect(readStoredSession().id).not.toBe(activeSessionId);
+  });
+
+  it('persists human activity time instead of passive flush time', async () => {
+    stubIntervalCapture();
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+
+    emit!({ type: 2, timestamp: Date.now(), data: {} });
+    await flushMacrotask();
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 2, type: 2 } });
+    flushTick();
+    await flushMacrotask();
+    const lastHumanActivityAt = readStoredSession().lastActivityAt;
+
+    setNow(START_NOW + 5 * 60 * 1000);
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 0, adds: [] } });
+    flushTick();
+    await flushMacrotask();
+
+    expect(readStoredSession().lastActivityAt).toBe(lastHumanActivityAt);
+  });
+
   it('rotates to a new session id when emit fires after the idle threshold', async () => {
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();
@@ -584,7 +664,11 @@ describe('session rotation', () => {
       .mockResolvedValue(okResponse());
 
     setNow(START_NOW + IDLE_TIMEOUT_MS + 1_000);
-    emit!({ type: 3, timestamp: Date.now(), data: { marker: 'new-before-snapshot' } });
+    emit!({
+      type: 3,
+      timestamp: Date.now(),
+      data: { source: 2, type: 2, marker: 'new-before-snapshot' },
+    });
     await flushMacrotask();
 
     const newSessionId = readStoredSession().id;
@@ -635,7 +719,7 @@ describe('session rotation', () => {
     expect(hoisted.takeFullSnapshot).toHaveBeenCalledWith(true);
   });
 
-  it('reuses a periodic FullSnapshot that triggers the hard-limit rotation', async () => {
+  it('waits for human activity instead of rotating on a periodic snapshot at the hard limit', async () => {
     stubIntervalCapture();
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();
@@ -653,6 +737,10 @@ describe('session rotation', () => {
     setNow(START_NOW + MAX_SESSION_MS);
     snapshotTick();
 
+    expect(readStoredSession().id).toBe(firstSessionId);
+    expect(hoisted.takeFullSnapshot).not.toHaveBeenCalled();
+
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 2, type: 2 } });
     const secondSessionId = readStoredSession().id;
     expect(secondSessionId).not.toBe(firstSessionId);
     expect(hoisted.takeFullSnapshot).toHaveBeenCalledTimes(1);
@@ -665,8 +753,8 @@ describe('session rotation', () => {
       expect(bootstrap).toMatchObject({
         sessionId: secondSessionId,
         sequenceNumber: 0,
-        events: [{ type: 2 }],
       });
+      expect(bootstrap?.events).toMatchObject([{ type: 2 }, { type: 3 }]);
     });
   });
 
@@ -675,7 +763,7 @@ describe('session rotation', () => {
     const emit = hoisted.getEmit();
 
     // Even if "now" has jumped relative to the session start, the first emit
-    // has no prior _lastEventAt so rotation logic is skipped.
+    // establishes the recording before lifecycle boundaries apply.
     setNow(START_NOW + IDLE_TIMEOUT_MS * 10);
     emit!({ type: 2, timestamp: Date.now(), data: {} });
 
@@ -739,6 +827,37 @@ describe('session rotation', () => {
 });
 
 describe('error–session stamping', () => {
+  it('leaves errors unlinked while replay is dormant and relinks after human activity', async () => {
+    await startReplay(BUILD_SLUG, API_ENDPOINT);
+    const emit = hoisted.getEmit();
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 2, type: 2 } });
+
+    setNow(START_NOW + IDLE_TIMEOUT_MS);
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 0, adds: [] } });
+
+    startErrorCapture(BUILD_SLUG);
+    enqueueError({
+      message: 'during dormancy',
+      stack: null,
+      url: null,
+      source: 'uncaught',
+    });
+    stopErrorCapture();
+    expect(lastFlushedErrors()[0]?.sessionId).toBeNull();
+
+    emit!({ type: 3, timestamp: Date.now(), data: { source: 3, id: 1, x: 0, y: 50 } });
+    const resumedSessionId = readStoredSession().id;
+    startErrorCapture(BUILD_SLUG);
+    enqueueError({
+      message: 'after human activity',
+      stack: null,
+      url: null,
+      source: 'uncaught',
+    });
+    stopErrorCapture();
+    expect(lastFlushedErrors()[0]?.sessionId).toBe(resumedSessionId);
+  });
+
   it('test_req_error_session_stamp: error captured while replay is recording carries the active session id and capture timestamp', async () => {
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const activeSessionId = readStoredSession().id;
@@ -2031,14 +2150,14 @@ describe('stopReplay cleanup', () => {
     await vi.waitFor(() => expect(onStopped).toHaveBeenCalled());
   });
 
-  it('clears the rrweb record reference and last-event timestamp', async () => {
+  it('clears the rrweb record reference and buffered-activity timestamp', async () => {
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();
     emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
     stopReplay();
 
-    // After stop, a restart should not detect any leftover _lastEventAt and
-    // therefore should not rotate on the first new emit.
+    // A restart must not carry buffered activity from the prior recording and
+    // rotate on the first new emit.
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit2 = hoisted.getEmit();
     setNow(START_NOW + IDLE_TIMEOUT_MS * 5);
@@ -2372,7 +2491,7 @@ describe('navigation watcher', () => {
     await startReplay(BUILD_SLUG, API_ENDPOINT);
     const emit = hoisted.getEmit();
 
-    // Prime _lastEventAt with a real rrweb event (the first event never rotates).
+    // Prime the recording with a real rrweb event (the first event never rotates).
     emit!({ type: 3, timestamp: Date.now(), data: { source: 2 } });
 
     // Navigate: the dedup baseline becomes '/dash'.
