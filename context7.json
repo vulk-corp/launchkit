@@ -1,0 +1,13 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "BWorlds LaunchKit",
+  "description": "Browser SDK for AI-built apps: uptime heartbeat, error capture, session replay, and access gating, reported to BWorlds",
+  "folders": [],
+  "excludeFolders": ["dist", "node_modules", "tests"],
+  "excludeFiles": ["CHANGELOG.md"],
+  "rules": [
+    "Call init() with a buildSlug and nothing else: every other behaviour is configured remotely from the BWorlds dashboard, not from client-side options.",
+    "The SDK never breaks the host app. Every feature fails open when the backend is unreachable.",
+    "Operator documentation for the bworlds CLI and the SDK install lives at https://docs.bworlds.co/docs."
+  ]
+}

@@ -8,6 +8,8 @@ Monitoring, error capture, and access gating SDK for AI-built apps. Drop-in inte
 
 **Available on npm**: [`@bworlds/launchkit`](https://www.npmjs.com/package/@bworlds/launchkit)
 
+**Documentation**: [docs.bworlds.co/docs/guides/sdk](https://docs.bworlds.co/docs/guides/sdk) covers both install paths and what each signal reports.
+
 ## Features
 
 - **Heartbeat monitoring**: automatic uptime tracking, sends a pulse every 5 minutes
