@@ -79,7 +79,7 @@ function mount(buildSlug: string, trustOrigin: string): void {
   anchor.setAttribute('href', `${trustOrigin}/builds/${encodeURIComponent(buildSlug)}/trust`);
   anchor.setAttribute('target', '_blank');
   anchor.setAttribute('rel', 'noopener noreferrer');
-  anchor.setAttribute('aria-label', 'View trust page for this app on BWORLDS');
+  anchor.setAttribute('aria-label', "Runs on BWORLDS: view this app's trust page (opens in a new tab)");
 
   // Hammer icon — lucide-react source, 24px viewBox, 2px stroke.
   anchor.appendChild(buildHammerIcon());
