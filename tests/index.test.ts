@@ -371,6 +371,28 @@ describe('init()', () => {
 
     expect(startBadgeWidget).not.toHaveBeenCalled();
   });
+
+  it('still mounts access gating when the badge widget throws', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: true,
+      sessionReplay: false,
+      badge: true,
+      gatingEnabled: true,
+      allowedOrigin: null,
+    });
+    mockReadCachedGatingEnabled.mockReturnValue(true);
+    vi.mocked(startBadgeWidget).mockImplementationOnce(() => {
+      throw new Error('attachShadow is not available');
+    });
+    vi.mocked(check).mockReturnValueOnce(new Promise(() => {}));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    init({ buildSlug: 'test-app' });
+
+    await vi.waitFor(() => {
+      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+    });
+  });
 });
 
 describe('LaunchKitInstance', () => {

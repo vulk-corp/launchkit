@@ -254,7 +254,12 @@ function activateSubsystems(
   // Apply remote toggles if available.
   if (remote) {
     if (remote.badge && !sandboxed) {
-      startBadgeWidget(buildSlug, _gateOrigin);
+      // A badge failure must never keep access gating below from mounting.
+      try {
+        startBadgeWidget(buildSlug, _gateOrigin);
+      } catch (err) {
+        console.warn('[@bworlds/launchkit] trust badge failed to mount:', err);
+      }
     }
   }
 
