@@ -254,7 +254,7 @@ function activateSubsystems(
   // Apply remote toggles if available.
   if (remote) {
     if (remote.badge && !sandboxed) {
-      void startBadgeWidget(buildSlug, apiEndpoint, _gateOrigin);
+      startBadgeWidget(buildSlug, _gateOrigin);
     }
   }
 

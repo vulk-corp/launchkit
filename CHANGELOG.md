@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **Trust badge without a score**: the floating badge reads "Runs on BWORLDS" and links to the Build's Trust Page, which lists only the Controls BWORLDS verified. The badge makes no network request; the `/api/telemetry/badge-counts` endpoint it used to read is removed from the BWORLDS API.
+
 ## [1.18.5] - 2026-10-09
 
 ### Fixed

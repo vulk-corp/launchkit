@@ -55,7 +55,7 @@ vi.mock('../src/remote-config', () => ({
 }));
 
 vi.mock('../src/badge-widget', () => ({
-  startBadgeWidget: vi.fn().mockResolvedValue(undefined),
+  startBadgeWidget: vi.fn(),
   stopBadgeWidget: vi.fn(),
 }));
 
@@ -352,11 +352,7 @@ describe('init()', () => {
     init({ buildSlug: 'test-app', gate: false });
 
     await vi.waitFor(() => {
-      expect(startBadgeWidget).toHaveBeenCalledWith(
-        'test-app',
-        'https://api.bworlds.co',
-        'https://app.bworlds.co'
-      );
+      expect(startBadgeWidget).toHaveBeenCalledWith('test-app', 'https://app.bworlds.co');
     });
   });
 
