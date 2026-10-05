@@ -95,7 +95,6 @@ Footage the SDK alters at capture is marked inside the recording as an rrweb cus
 | `/api/telemetry/errors` | error-capture | POST |
 | `/api/telemetry/replay-events` | replay | POST + sendBeacon on unload |
 | `/api/telemetry/sdk-config` | remote-config | GET |
-| `/api/telemetry/badge-counts` | badge-widget | GET |
 | `/api/monetization/validate-token` | check | POST |
 
 ## Config naming
