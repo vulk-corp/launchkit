@@ -144,6 +144,36 @@ and other error statuses remain reportable. A 404 read within five seconds of a
 successful DELETE of the same URL also remains an error; `successfulDeleteAgeMs`
 records that correlation without treating it as an expected absence.
 
+## Expected request cancellations
+
+Mark cancellations at the point where the request owner stops needing the work:
+
+```ts
+import { abortExpectedRequest } from '@bworlds/launchkit/cancellation';
+
+const controller = new AbortController();
+const request = fetch('/api/builds/my-build/events', { signal: controller.signal });
+// Handle the rejection in the caller as usual.
+request.catch(error => {
+  if (error?.name !== 'AbortError') console.error(error);
+});
+
+// In the owning component's cleanup:
+abortExpectedRequest(controller, 'cleanup');
+```
+
+Use `navigation` when leaving the owning page and `replacement` when newer work
+supersedes the request. The helper is also exported from `@bworlds/launchkit`;
+the `/cancellation` entry point does not load monitoring or replay code.
+
+The original fetch rejection is preserved. Only a rejection identical to the
+aborted request signal's explicitly marked reason is omitted from network
+product errors. When replay network telemetry is enabled, the raw request stays
+available with status `0`, its failure reason and `expectedState: "cancelled"`.
+Unknown aborts, `AbortSignal.timeout`, other timeout controllers, genuine network
+failures, and HTTP error responses remain reportable. Do not use the helper for
+timeouts. Unhandled rejections and console errors are still captured normally.
+
 ## License
 
 MIT

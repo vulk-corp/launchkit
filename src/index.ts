@@ -19,6 +19,7 @@ import type { LaunchKitConfig } from './types';
 export type { LaunchKitConfig } from './types';
 export type { SupabaseClientLike } from './supabase-identity-bridge';
 export type { CheckResult } from './check';
+export { abortExpectedRequest, type ExpectedCancellationReason } from './cancellation';
 
 const DEFAULT_API_ENDPOINT = 'https://api.bworlds.co';
 const DEFAULT_GATE_ORIGIN = 'https://app.bworlds.co';

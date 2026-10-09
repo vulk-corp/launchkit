@@ -12,12 +12,15 @@ export default defineConfig({
   },
   build: {
     lib: {
-      entry: resolve(__dirname, 'src/index.ts'),
+      entry: {
+        launchkit: resolve(__dirname, 'src/index.ts'),
+        cancellation: resolve(__dirname, 'src/cancellation.ts'),
+      },
       name: 'BWorldsLaunchKit',
       formats: ['es', 'cjs'],
-      fileName: (format) => {
-        if (format === 'es') return 'launchkit.js';
-        return 'launchkit.cjs';
+      fileName: (format, entryName) => {
+        if (format === 'es') return `${entryName}.js`;
+        return `${entryName}.cjs`;
       },
     },
     rollupOptions: {

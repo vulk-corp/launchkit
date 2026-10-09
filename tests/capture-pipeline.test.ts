@@ -2,6 +2,8 @@ import { startErrorCapture, stopErrorCapture, type CapturedError } from '../src/
 import { startNetworkCapture, stopNetworkCapture } from '../src/network-capture';
 import { MAX_MESSAGE_LENGTH } from '../src/normalize-thrown';
 import { sendTelemetry } from '../src/telemetry-sender';
+import { startReplayTelemetry, stopReplayTelemetry } from '../src/replay-telemetry';
+import { abortExpectedRequest } from '../src/cancellation';
 
 // Integration pipeline: real error-capture + real network-capture, only the
 // wire transport mocked. Unlike network-capture.test.ts (which mocks
@@ -55,6 +57,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  stopReplayTelemetry();
   stopErrorCapture();
   stopNetworkCapture();
   window.fetch = realFetch;
@@ -63,6 +66,36 @@ afterEach(() => {
 });
 
 describe('capture pipeline (capture path -> enqueue -> batch -> sender payload)', () => {
+  it('keeps an expected cancellation in replay diagnostics while omitting its network product error', async () => {
+    const controller = new AbortController();
+    window.fetch = vi.fn((_input, init) => Promise.reject(init?.signal?.reason));
+    startErrorCapture('pipeline-app');
+    startNetworkCapture('https://api.bworlds.co');
+    startReplayTelemetry('pipeline-app', 'https://api.bworlds.co', { consoleTelemetry: false });
+    abortExpectedRequest(controller, 'cleanup');
+
+    await expect(fetch('https://example.com/live', { signal: controller.signal })).rejects.toBe(controller.signal.reason);
+    vi.advanceTimersByTime(10_000);
+
+    expect(mockSendTelemetry.mock.calls.filter(([path]) => path === '/api/telemetry/errors')).toEqual([]);
+    const diagnostics = mockSendTelemetry.mock.calls.find(([path]) => path === '/api/telemetry/replay-telemetry')?.[1];
+    expect(diagnostics).toMatchObject({ events: [{
+      type: 'network', status: 0, expectedState: 'cancelled', failureReason: controller.signal.reason.message,
+    }] });
+  });
+
+  it('keeps an unhandled rejection reportable even when its cancellation was expected at network level', () => {
+    const controller = new AbortController();
+    startErrorCapture('pipeline-app');
+    abortExpectedRequest(controller, 'cleanup');
+
+    rejectWith(controller.signal.reason);
+
+    expect(flushedErrors()).toEqual([expect.objectContaining({
+      source: 'unhandled-rejection', message: controller.signal.reason.message,
+    })]);
+  });
+
   it('pipeline_payload_shape: every path delivers wire-safe items in an encodable batch', async () => {
     window.fetch = vi
       .fn()
