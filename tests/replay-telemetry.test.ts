@@ -126,6 +126,77 @@ describe('replay telemetry', () => {
     ]);
   });
 
+  it('retains expected empty responses as marked network diagnostics', async () => {
+    const response = new Response('{"detail":"No result"}', {
+      status: 404,
+      headers: { 'X-BWorlds-Expected-State': 'empty' },
+    });
+    window.fetch = vi.fn().mockResolvedValue(response);
+    startReplayTelemetry('test-app', 'https://api.bworlds.co', { consoleTelemetry: false });
+
+    expect(await fetch('https://api.bworlds.co/api/builds/sample/profile-inspections/latest')).toBe(response);
+    vi.advanceTimersByTime(10_000);
+
+    expect(lastTelemetryEvents()).toEqual([
+      expect.objectContaining({ type: 'network', status: 404, expectedState: 'empty' }),
+    ]);
+    expect(await response.json()).toEqual({ detail: 'No result' });
+  });
+
+  it('preserves the response and diagnostic when its headers accessor throws', async () => {
+    const response = new Response('Missing', { status: 404 });
+    Object.defineProperty(response, 'headers', { get() { throw new Error('Headers unavailable'); } });
+    window.fetch = vi.fn().mockResolvedValue(response);
+    startReplayTelemetry('test-app', 'https://api.bworlds.co', { consoleTelemetry: false });
+
+    expect(await fetch('https://example.com/resource')).toBe(response);
+    vi.advanceTimersByTime(10_000);
+
+    expect(lastTelemetryEvents()).toEqual([
+      expect.objectContaining({ type: 'network', status: 404 }),
+    ]);
+    expect(lastTelemetryEvents()[0]?.expectedState).toBeUndefined();
+  });
+
+  it.each([
+    { status: 404, method: 'GET', marker: undefined },
+    { status: 404, method: 'GET', marker: 'unknown' },
+    { status: 500, method: 'GET', marker: 'empty' },
+    { status: 404, method: 'POST', marker: 'empty' },
+  ])('keeps unexpected failures unclassified: $status $method $marker', async ({ status, method, marker }) => {
+    const response = new Response('Failure', {
+      status,
+      headers: marker ? { 'X-BWorlds-Expected-State': marker } : {},
+    });
+    window.fetch = vi.fn().mockResolvedValue(response);
+    startReplayTelemetry('test-app', 'https://api.bworlds.co', { consoleTelemetry: false });
+
+    expect(await fetch('https://api.bworlds.co/api/builds/missing', { method })).toBe(response);
+    vi.advanceTimersByTime(10_000);
+
+    const [event] = lastTelemetryEvents();
+    expect(event?.status).toBe(status);
+    expect(event?.expectedState).toBeUndefined();
+  });
+
+  it('retains XMLHttpRequest expected empty diagnostics', () => {
+    XMLHttpRequest.prototype.send = vi.fn(function (this: XMLHttpRequest) {
+      Object.defineProperty(this, 'status', { value: 404 });
+      vi.spyOn(this, 'getResponseHeader').mockReturnValue('empty');
+      this.dispatchEvent(new Event('loadend'));
+    });
+    startReplayTelemetry('test-app', 'https://api.bworlds.co', { consoleTelemetry: false });
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://example.com/resource');
+    xhr.send();
+    vi.advanceTimersByTime(10_000);
+
+    expect(lastTelemetryEvents()).toEqual([
+      expect.objectContaining({ type: 'network', status: 404, expectedState: 'empty' }),
+    ]);
+  });
+
   it('does not break host fetch when the Request global is absent', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('OK', { status: 200 }));
     window.fetch = fetchMock;

@@ -16,6 +16,7 @@ beforeEach(() => {
 afterEach(() => {
   stopNetworkCapture();
   window.fetch = originalFetch;
+  vi.useRealTimers();
 });
 
 describe('startNetworkCapture / stopNetworkCapture', () => {
@@ -56,6 +57,133 @@ describe('startNetworkCapture / stopNetworkCapture', () => {
         metadata: expect.objectContaining({ status: 500 }),
       }),
     );
+  });
+
+  it.each([
+    '/api/builds/sample/profile-inspections/latest',
+    '/api/builds/sample/conversations/subject?subjectKey=finding',
+    '/api/builds/sample/audits/first-look/state',
+  ])('keeps the expected empty response readable without reporting an error: %s', async (path) => {
+    const response = new Response('{"detail":"No result"}', {
+      status: 404,
+      headers: { 'X-BWorlds-Expected-State': 'empty' },
+    });
+    window.fetch = vi.fn().mockResolvedValue(response);
+    startNetworkCapture('https://api.bworlds.co');
+
+    const result = await fetch(`https://api.bworlds.co${path}`);
+
+    expect(result).toBe(response);
+    expect(await result.json()).toEqual({ detail: 'No result' });
+    expect(mockEnqueue).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    '/api/builds/sample/profile-inspections/latest',
+    '/api/builds/sample/conversations/subject?subjectKey=finding',
+    '/api/builds/sample/audits/first-look/state',
+    '/api/builds/sample/profile-inspections/inspection-id',
+    '/api/builds/creations/creation-id/events',
+    '/api/builds/missing',
+    '/unrelated',
+  ])('reports an unmarked 404 even on a known empty-state URL: %s', async (path) => {
+    const response = new Response('Missing', { status: 404 });
+    window.fetch = vi.fn().mockResolvedValue(response);
+    startNetworkCapture('https://api.bworlds.co');
+
+    expect(await fetch(`https://api.bworlds.co${path}`)).toBe(response);
+    expect(mockEnqueue).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ status: 404 }),
+    }));
+  });
+
+  it.each([
+    { status: 403, method: 'GET', marker: 'empty' },
+    { status: 500, method: 'GET', marker: 'empty' },
+    { status: 404, method: 'POST', marker: 'empty' },
+    { status: 404, method: 'GET', marker: 'unknown' },
+  ])('reports failures outside the expected empty contract: $status $method $marker', async ({ status, method, marker }) => {
+    const response = new Response('Failure', {
+      status,
+      headers: { 'X-BWorlds-Expected-State': marker },
+    });
+    window.fetch = vi.fn().mockResolvedValue(response);
+    startNetworkCapture('https://api.bworlds.co');
+
+    expect(await fetch('https://api.bworlds.co/resource', { method })).toBe(response);
+    expect(mockEnqueue).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ status, method }),
+    }));
+  });
+
+  it.each(['headers', 'get'])('still reports the response if reading %s fails', async (accessor) => {
+    const response = new Response('Missing', { status: 404 });
+    const fail = () => { throw new Error('Headers unavailable'); };
+    if (accessor === 'headers') Object.defineProperty(response, 'headers', { get: fail });
+    else vi.spyOn(response.headers, 'get').mockImplementation(fail);
+    window.fetch = vi.fn().mockResolvedValue(response);
+    startNetworkCapture('https://api.bworlds.co');
+
+    expect(await fetch('https://example.com/resource')).toBe(response);
+    expect(mockEnqueue).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ status: 404 }),
+    }));
+  });
+
+  it('reports a post-delete read with factual correlation, including a Request method', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const missing = new Response('Missing', { status: 404 });
+    window.fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(missing);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await fetch(new Request('https://api.bworlds.co/api/builds/sample', { method: 'DELETE' }));
+    vi.advanceTimersByTime(200);
+    expect(await fetch('https://api.bworlds.co/api/builds/sample')).toBe(missing);
+
+    expect(mockEnqueue).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ status: 404, successfulDeleteAgeMs: 200 }),
+    }));
+  });
+
+  it.each([
+    { deleteStatus: 500, readUrl: 'https://api.bworlds.co/resource?id=1', delayMs: 200 },
+    { deleteStatus: 204, readUrl: 'https://api.bworlds.co/other?id=1', delayMs: 200 },
+    { deleteStatus: 204, readUrl: 'https://api.bworlds.co/resource?id=2', delayMs: 200 },
+    { deleteStatus: 204, readUrl: 'https://other.example/resource?id=1', delayMs: 200 },
+    { deleteStatus: 204, readUrl: 'https://api.bworlds.co/resource?id=1', delayMs: 5_001 },
+  ])('keeps unrelated missing resources distinct from post-delete reads: $deleteStatus $readUrl $delayMs', async ({ deleteStatus, readUrl, delayMs }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const missing = new Response('Missing', { status: 404 });
+    window.fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(deleteStatus === 204 ? null : 'Failure', { status: deleteStatus }))
+      .mockResolvedValueOnce(missing);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await fetch('https://api.bworlds.co/resource?id=1', { method: 'DELETE' });
+    mockEnqueue.mockClear();
+    vi.advanceTimersByTime(delayMs);
+    expect(await fetch(readUrl)).toBe(missing);
+
+    const error = mockEnqueue.mock.calls[0]?.[0];
+    expect(error?.metadata?.status).toBe(404);
+    expect(error?.metadata).not.toHaveProperty('successfulDeleteAgeMs');
+  });
+
+  it('clears delete correlations when capture stops', async () => {
+    window.fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response('Missing', { status: 404 }));
+    startNetworkCapture('https://api.bworlds.co');
+    await fetch('https://api.bworlds.co/resource', { method: 'DELETE' });
+    stopNetworkCapture();
+    startNetworkCapture('https://api.bworlds.co');
+
+    expect((await fetch('https://api.bworlds.co/resource')).status).toBe(404);
+    expect(mockEnqueue.mock.calls[0]?.[0].metadata).not.toHaveProperty('successfulDeleteAgeMs');
   });
 
   it('does not capture successful responses (200)', async () => {

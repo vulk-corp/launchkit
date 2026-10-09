@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.18.4] - 2026-10-09
+
+### Fixed
+
+- **Expected empty network responses**: a GET 404 explicitly marked by the backend with `X-BWorlds-Expected-State: empty` stays available in enabled replay network diagnostics without creating a product error. Unmarked 404s, other methods and other error statuses remain reportable. Header access failures preserve the original response and error reporting.
+
+### Added
+
+- **Post-delete context**: a GET 404 within five seconds of a successful DELETE of the same URL carries `successfulDeleteAgeMs` in its error metadata. The response remains reportable; the metadata records an observed correlation without inferring causality. Capture respects methods carried by `Request` objects.
+
 ## [1.18.3] - 2026-09-21
 
 ### Fixed
