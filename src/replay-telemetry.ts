@@ -7,7 +7,9 @@ import {
   redactNetworkUrl,
 } from './network-url';
 import { MAX_MESSAGE_LENGTH, normalizeThrown, sanitizeAndTruncate } from './normalize-thrown';
-import { expectedNetworkState, type ExpectedNetworkState } from './network-outcome';
+import {
+  effectiveFetchSignal, expectedNetworkState, isExpectedRequestCancellation, type ExpectedNetworkState,
+} from './network-outcome';
 
 declare const __SDK_VERSION__: string;
 
@@ -262,6 +264,7 @@ async function captureFetch(
     // an environment where fetch exists but the Request/URL globals do not.
     return original(input, init);
   }
+  const signal = effectiveFetchSignal(input, init);
   const headers = requestHeaders(input, init);
   try {
     const response = await original(input, init);
@@ -287,6 +290,7 @@ async function captureFetch(
       method,
       url: redactNetworkUrl(url),
       status: 0,
+      expectedState: isExpectedRequestCancellation(error, signal) ? 'cancelled' : undefined,
       durationMs: Math.max(0, Date.now() - startedAt),
       failureReason: sanitizeAndTruncate(normalizeThrown(error).message, MAX_MESSAGE_LENGTH),
       headers: redactHeaders(headers),

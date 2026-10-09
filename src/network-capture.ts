@@ -1,7 +1,7 @@
 import { enqueueError } from './error-capture';
 import { isSdkTelemetryUrl, redactNetworkUrl } from './network-url';
 import { normalizeThrown } from './normalize-thrown';
-import { expectedNetworkState } from './network-outcome';
+import { effectiveFetchSignal, expectedNetworkState, isExpectedRequestCancellation } from './network-outcome';
 
 const DELETE_CORRELATION_WINDOW_MS = 5_000;
 const MAX_DELETE_CORRELATIONS = 100;
@@ -41,6 +41,7 @@ export function startNetworkCapture(apiEndpoint: string): void {
       return original(input, init);
     }
 
+    const signal = effectiveFetchSignal(input, init);
     const startedAt = Date.now();
     try {
       const response = await original(input, init);
@@ -98,6 +99,7 @@ export function startNetworkCapture(apiEndpoint: string): void {
 
       return response;
     } catch (error: unknown) {
+      if (isExpectedRequestCancellation(error, signal)) throw error;
       try {
         const { message, stack } = normalizeThrown(error);
         const requestUrl = truncateUrl(redactNetworkUrl(url));

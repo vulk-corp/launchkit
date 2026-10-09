@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.18.5] - 2026-10-09
+
+### Fixed
+
+- **Expected request cancellations**: callers can explicitly identify UI cleanup, navigation, or replacement cancellations with `abortExpectedRequest`. Only fetch rejections matching the marked request signal's exact reason are omitted from product errors. Raw replay network diagnostics retain status zero, the failure reason and `expectedState: cancelled`. Unknown aborts, timeouts, unrelated network failures and HTTP error responses remain reportable.
+
+### Added
+
+- **Lightweight cancellation helper**: import `abortExpectedRequest` from `@bworlds/launchkit/cancellation` without loading the monitoring SDK. The helper is also available from the main entry point, and its provenance survives separate SDK bundles.
+
 ## [1.18.4] - 2026-10-09
 
 ### Fixed

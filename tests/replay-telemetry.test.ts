@@ -1,6 +1,7 @@
 import { startReplayTelemetry, stopReplayTelemetry } from '../src/replay-telemetry';
 import { setReplaySessionId } from '../src/session-state';
 import { sendTelemetry } from '../src/telemetry-sender';
+import { abortExpectedRequest } from '../src/cancellation';
 
 vi.mock('../src/telemetry-sender', () => ({
   sendTelemetry: vi.fn(),
@@ -40,6 +41,54 @@ function lastTelemetryEvents(): Array<Record<string, unknown>> {
 }
 
 describe('replay telemetry', () => {
+  it('retains explicitly marked cancellation as raw expected-state diagnostics', async () => {
+    const controller = new AbortController();
+    const cancellation = new DOMException('Expected lifecycle cancellation', 'AbortError');
+    Object.defineProperty(cancellation, Symbol.for('@bworlds/launchkit/expected-cancellation'), { value: 'cleanup' });
+    window.fetch = vi.fn().mockRejectedValue(cancellation);
+    startReplayTelemetry('test-app', 'https://api.bworlds.co', { consoleTelemetry: false });
+
+    controller.abort(cancellation);
+    await expect(fetch('https://example.com/live', { signal: controller.signal })).rejects.toBe(cancellation);
+    vi.advanceTimersByTime(10_000);
+
+    expect(lastTelemetryEvents()).toEqual([
+      expect.objectContaining({ type: 'network', status: 0, expectedState: 'cancelled', failureReason: cancellation.message }),
+    ]);
+  });
+
+  it.each(['unknown-abort', 'timeout', 'network'])('retains unexpected Supabase replay failures as unclassified diagnostics: %s', async (kind) => {
+    const controller = new AbortController();
+    const failure = kind === 'network'
+      ? new TypeError('Failed to fetch')
+      : new DOMException('Request failed', kind === 'timeout' ? 'TimeoutError' : 'AbortError');
+    if (kind !== 'network') controller.abort(failure);
+    window.fetch = vi.fn().mockRejectedValue(failure);
+    startReplayTelemetry('test-app', 'https://api.bworlds.co', { consoleTelemetry: false });
+
+    await expect(fetch('https://supabase.example/storage/v1/object/replay/chunk', { signal: controller.signal })).rejects.toBe(failure);
+    vi.advanceTimersByTime(10_000);
+
+    const [event] = lastTelemetryEvents();
+    expect(event).toMatchObject({ status: 0, failureReason: failure.message });
+    expect(event?.expectedState).toBeUndefined();
+  });
+
+  it('keeps raw diagnostics unclassified when a real failure races a later cleanup', async () => {
+    const controller = new AbortController();
+    const failure = new TypeError('Failed to fetch');
+    window.fetch = vi.fn().mockRejectedValue(failure);
+    startReplayTelemetry('test-app', 'https://api.bworlds.co', { consoleTelemetry: false });
+
+    const request = fetch('https://example.com/live', { signal: controller.signal });
+    abortExpectedRequest(controller, 'cleanup');
+    await expect(request).rejects.toBe(failure);
+    vi.advanceTimersByTime(10_000);
+
+    expect(lastTelemetryEvents()[0]).toMatchObject({ status: 0, failureReason: 'Failed to fetch' });
+    expect(lastTelemetryEvents()[0]?.expectedState).toBeUndefined();
+  });
+
   it('captures console methods without breaking native console behavior', () => {
     const nativeLog = vi.fn();
     console.log = nativeLog;

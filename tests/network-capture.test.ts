@@ -1,5 +1,6 @@
 import { startNetworkCapture, stopNetworkCapture } from '../src/network-capture';
 import { enqueueError } from '../src/error-capture';
+import { abortExpectedRequest } from '../src/cancellation';
 
 vi.mock('../src/error-capture', () => ({
   enqueueError: vi.fn(),
@@ -20,6 +21,168 @@ afterEach(() => {
 });
 
 describe('startNetworkCapture / stopNetworkCapture', () => {
+  it.each(['cleanup', 'navigation', 'replacement'])('omits an explicitly marked %s cancellation from product errors', async (cause) => {
+    const controller = new AbortController();
+    const cancellation = new DOMException('Expected lifecycle cancellation', 'AbortError');
+    Object.defineProperty(cancellation, Symbol.for('@bworlds/launchkit/expected-cancellation'), { value: cause });
+    window.fetch = vi.fn().mockRejectedValue(cancellation);
+    startNetworkCapture('https://api.bworlds.co');
+
+    controller.abort(cancellation);
+    await expect(fetch('https://example.com/live', { signal: controller.signal })).rejects.toBe(cancellation);
+
+    expect(mockEnqueue).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('uses the following signal on a Request (cloned: %s)', async (clone) => {
+    const controller = new AbortController();
+    const input = new Request('https://example.com/live', { signal: controller.signal });
+    abortExpectedRequest(controller, 'navigation');
+    const cancellation = controller.signal.reason;
+    window.fetch = vi.fn().mockRejectedValue(cancellation);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch(clone ? input.clone() : input)).rejects.toBe(cancellation);
+
+    expect(mockEnqueue).not.toHaveBeenCalled();
+  });
+
+  it.each([null, new AbortController().signal])('honors init.signal override instead of the Request signal: %s', async (signal) => {
+    const controller = new AbortController();
+    const input = new Request('https://example.com/live', { signal: controller.signal });
+    abortExpectedRequest(controller, 'cleanup');
+    const cancellation = controller.signal.reason;
+    window.fetch = vi.fn().mockRejectedValue(cancellation);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch(input, { signal })).rejects.toBe(cancellation);
+
+    expect(mockEnqueue).toHaveBeenCalledOnce();
+  });
+
+  it('uses an explicitly supplied expected signal instead of an unmarked Request signal', async () => {
+    const input = new Request('https://example.com/live');
+    const controller = new AbortController();
+    abortExpectedRequest(controller, 'replacement');
+    window.fetch = vi.fn().mockRejectedValue(controller.signal.reason);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch(input, { signal: controller.signal })).rejects.toBe(controller.signal.reason);
+
+    expect(mockEnqueue).not.toHaveBeenCalled();
+  });
+
+  it('keeps a genuine network rejection when cleanup occurs before its catch runs', async () => {
+    const controller = new AbortController();
+    const failure = new TypeError('Failed to fetch');
+    window.fetch = vi.fn().mockRejectedValue(failure);
+    startNetworkCapture('https://api.bworlds.co');
+
+    const result = fetch('https://example.com/live', { signal: controller.signal });
+    abortExpectedRequest(controller, 'cleanup');
+
+    await expect(result).rejects.toBe(failure);
+    expect(mockEnqueue).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('Failed to fetch') }));
+  });
+
+  it('keeps a different AbortError even when the request signal has expected provenance', async () => {
+    const controller = new AbortController();
+    abortExpectedRequest(controller, 'cleanup');
+    const unrelated = new DOMException(controller.signal.reason.message, 'AbortError');
+    window.fetch = vi.fn().mockRejectedValue(unrelated);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch('https://example.com/live', { signal: controller.signal })).rejects.toBe(unrelated);
+
+    expect(mockEnqueue).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    undefined,
+    new DOMException('The operation was aborted.', 'AbortError'),
+    new DOMException('Replay request timed out.', 'TimeoutError'),
+    new Error('Agent stream timed out'),
+    new TypeError('Failed to fetch'),
+  ])('reports an unmarked signal rejection, including timeouts: %s', async (reason) => {
+    const controller = new AbortController();
+    controller.abort(reason);
+    const failure = controller.signal.reason;
+    window.fetch = vi.fn().mockRejectedValue(failure);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch('https://supabase.example/storage/v1/object/replay/chunk', { signal: controller.signal })).rejects.toBe(failure);
+
+    expect(mockEnqueue).toHaveBeenCalledOnce();
+  });
+
+  it('reports native AbortSignal.timeout and a composite signal where the timeout wins', async () => {
+    const controller = new AbortController();
+    const timeout = AbortSignal.timeout(0);
+    const signal = AbortSignal.any([controller.signal, timeout]);
+    await new Promise<void>(resolve => timeout.addEventListener('abort', () => resolve(), { once: true }));
+    abortExpectedRequest(controller, 'cleanup');
+    window.fetch = vi.fn().mockRejectedValue(signal.reason);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch('https://example.com/live', { signal })).rejects.toBe(timeout.reason);
+
+    expect(mockEnqueue).toHaveBeenCalledOnce();
+  });
+
+  it('recognizes a composite signal only when the explicit lifecycle cancellation wins', async () => {
+    const controller = new AbortController();
+    const other = new AbortController();
+    const signal = AbortSignal.any([controller.signal, other.signal]);
+    abortExpectedRequest(controller, 'cleanup');
+    other.abort(new DOMException('Timed out', 'TimeoutError'));
+    window.fetch = vi.fn().mockRejectedValue(signal.reason);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch('https://example.com/live', { signal })).rejects.toBe(controller.signal.reason);
+
+    expect(mockEnqueue).not.toHaveBeenCalled();
+  });
+
+  it.each(['timeout', 'unknown'])('does not trust an unsupported provenance reason: %s', async (cause) => {
+    const controller = new AbortController();
+    const failure = new DOMException('Aborted', 'AbortError');
+    Object.defineProperty(failure, Symbol.for('@bworlds/launchkit/expected-cancellation'), { value: cause });
+    controller.abort(failure);
+    window.fetch = vi.fn().mockRejectedValue(failure);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch('https://example.com/live', { signal: controller.signal })).rejects.toBe(failure);
+
+    expect(mockEnqueue).toHaveBeenCalledOnce();
+  });
+
+  it('does not execute a provenance getter or hide its error', async () => {
+    const controller = new AbortController();
+    const failure = new DOMException('Aborted', 'AbortError');
+    const getter = vi.fn(() => 'cleanup');
+    Object.defineProperty(failure, Symbol.for('@bworlds/launchkit/expected-cancellation'), { get: getter });
+    controller.abort(failure);
+    window.fetch = vi.fn().mockRejectedValue(failure);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await expect(fetch('https://example.com/live', { signal: controller.signal })).rejects.toBe(failure);
+
+    expect(getter).not.toHaveBeenCalled();
+    expect(mockEnqueue).toHaveBeenCalledOnce();
+  });
+
+  it('keeps an HTTP failure even if the signal is marked as expected cancellation', async () => {
+    const controller = new AbortController();
+    abortExpectedRequest(controller, 'cleanup');
+    const response = new Response('Server error', { status: 500 });
+    window.fetch = vi.fn().mockResolvedValue(response);
+    startNetworkCapture('https://api.bworlds.co');
+
+    expect(await fetch('https://example.com/live', { signal: controller.signal })).toBe(response);
+
+    expect(mockEnqueue).toHaveBeenCalledWith(expect.objectContaining({ metadata: expect.objectContaining({ status: 500 }) }));
+  });
+
   it('wraps window.fetch on start', () => {
     const before = window.fetch;
     startNetworkCapture('https://api.bworlds.co');

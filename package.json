@@ -1,6 +1,6 @@
 {
   "name": "@bworlds/launchkit",
-  "version": "1.18.4",
+  "version": "1.18.5",
   "description": "Splits browser error capture from session replay so apps can collect client errors without recording sessions",
   "type": "module",
   "main": "./dist/launchkit.js",
@@ -14,6 +14,13 @@
       "import": "./dist/launchkit.js",
       "require": "./dist/launchkit.cjs",
       "default": "./dist/launchkit.js"
+    },
+    "./cancellation": {
+      "types": "./dist/cancellation.d.ts",
+      "browser": "./dist/cancellation.js",
+      "import": "./dist/cancellation.js",
+      "require": "./dist/cancellation.cjs",
+      "default": "./dist/cancellation.js"
     }
   },
   "sideEffects": false,
