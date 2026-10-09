@@ -7,6 +7,7 @@ import {
   redactNetworkUrl,
 } from './network-url';
 import { MAX_MESSAGE_LENGTH, normalizeThrown, sanitizeAndTruncate } from './normalize-thrown';
+import { expectedNetworkState, type ExpectedNetworkState } from './network-outcome';
 
 declare const __SDK_VERSION__: string;
 
@@ -40,6 +41,7 @@ interface ReplayTelemetryEvent {
   method?: string;
   url?: string;
   status?: number;
+  expectedState?: ExpectedNetworkState;
   durationMs?: number;
   failureReason?: string;
   initiator?: NetworkInitiator;
@@ -270,6 +272,9 @@ async function captureFetch(
       method,
       url: redactNetworkUrl(url),
       status: response.status,
+      expectedState: expectedNetworkState(
+        response.status, method, name => response.headers.get(name),
+      ),
       durationMs: Math.max(0, Date.now() - startedAt),
       headers: redactHeaders(headers),
     });
@@ -329,6 +334,9 @@ function captureXhrSend(this: XMLHttpRequest, body?: Document | XMLHttpRequestBo
           method: state.method,
           url: redactNetworkUrl(state.url),
           status: this.status || 0,
+          expectedState: expectedNetworkState(
+            this.status, state.method, name => this.getResponseHeader(name),
+          ),
           durationMs: Math.max(0, Date.now() - state.startedAt),
           failureReason: this.status === 0 ? 'XMLHttpRequest failed' : undefined,
         });

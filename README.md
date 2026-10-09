@@ -129,6 +129,19 @@ Discovery retries every two seconds until a session is found. The bridge then fo
 
 All requests are write-only and identified by `buildSlug`. No API key required.
 
+## Expected empty network responses
+
+A backend can mark a normal empty lookup with `X-BWorlds-Expected-State: empty`.
+LaunchKit recognizes this marker only on a `GET` response with status `404`.
+It omits the response from product errors and, when replay network telemetry is
+enabled, keeps the request in diagnostics with `expectedState: "empty"`.
+Cross-origin APIs must expose this header
+through `Access-Control-Expose-Headers`.
+
+Set the marker only after access checks confirm that the requested parent resource
+exists and the optional result is absent. Unmarked 404 responses, other methods,
+and other error statuses remain reportable.
+
 ## License
 
 MIT

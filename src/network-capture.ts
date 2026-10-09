@@ -1,6 +1,7 @@
 import { enqueueError } from './error-capture';
 import { isSdkTelemetryUrl, redactNetworkUrl } from './network-url';
 import { normalizeThrown } from './normalize-thrown';
+import { expectedNetworkState } from './network-outcome';
 
 let _originalFetch: typeof fetch | null = null;
 let _installed = false;
@@ -24,7 +25,10 @@ export function startNetworkCapture(apiEndpoint: string): void {
     let method: string;
     try {
       url = resolveUrl(input);
-      method = init?.method?.toUpperCase() || 'GET';
+      const requestMethod = typeof Request !== 'undefined' && input instanceof Request
+        ? input.method
+        : 'GET';
+      method = (init?.method ?? requestMethod).toUpperCase();
       if (isSdkTelemetryUrl(url, _apiEndpoint)) return original(input, init);
     } catch {
       // Instrumentation must never keep the host request from going out.
@@ -34,7 +38,11 @@ export function startNetworkCapture(apiEndpoint: string): void {
     try {
       const response = await original(input, init);
 
-      if (response.status >= 400) {
+      if (response.status >= 400 && !expectedNetworkState(
+        response.status,
+        method,
+        name => response.headers.get(name),
+      )) {
         try {
           const requestUrl = truncateUrl(redactNetworkUrl(url));
           enqueueError({
