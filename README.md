@@ -140,7 +140,9 @@ through `Access-Control-Expose-Headers`.
 
 Set the marker only after access checks confirm that the requested parent resource
 exists and the optional result is absent. Unmarked 404 responses, other methods,
-and other error statuses remain reportable.
+and other error statuses remain reportable. A 404 read within five seconds of a
+successful DELETE of the same URL also remains an error; `successfulDeleteAgeMs`
+records that correlation without treating it as an expected absence.
 
 ## License
 

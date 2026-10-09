@@ -16,6 +16,7 @@ beforeEach(() => {
 afterEach(() => {
   stopNetworkCapture();
   window.fetch = originalFetch;
+  vi.useRealTimers();
 });
 
 describe('startNetworkCapture / stopNetworkCapture', () => {
@@ -127,6 +128,62 @@ describe('startNetworkCapture / stopNetworkCapture', () => {
     expect(mockEnqueue).toHaveBeenCalledWith(expect.objectContaining({
       metadata: expect.objectContaining({ status: 404 }),
     }));
+  });
+
+  it('reports a post-delete read with factual correlation, including a Request method', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const missing = new Response('Missing', { status: 404 });
+    window.fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(missing);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await fetch(new Request('https://api.bworlds.co/api/builds/sample', { method: 'DELETE' }));
+    vi.advanceTimersByTime(200);
+    expect(await fetch('https://api.bworlds.co/api/builds/sample')).toBe(missing);
+
+    expect(mockEnqueue).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ status: 404, successfulDeleteAgeMs: 200 }),
+    }));
+  });
+
+  it.each([
+    { deleteStatus: 500, readUrl: 'https://api.bworlds.co/resource?id=1', delayMs: 200 },
+    { deleteStatus: 204, readUrl: 'https://api.bworlds.co/other?id=1', delayMs: 200 },
+    { deleteStatus: 204, readUrl: 'https://api.bworlds.co/resource?id=2', delayMs: 200 },
+    { deleteStatus: 204, readUrl: 'https://other.example/resource?id=1', delayMs: 200 },
+    { deleteStatus: 204, readUrl: 'https://api.bworlds.co/resource?id=1', delayMs: 5_001 },
+  ])('keeps unrelated missing resources distinct from post-delete reads: $deleteStatus $readUrl $delayMs', async ({ deleteStatus, readUrl, delayMs }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const missing = new Response('Missing', { status: 404 });
+    window.fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(deleteStatus === 204 ? null : 'Failure', { status: deleteStatus }))
+      .mockResolvedValueOnce(missing);
+    startNetworkCapture('https://api.bworlds.co');
+
+    await fetch('https://api.bworlds.co/resource?id=1', { method: 'DELETE' });
+    mockEnqueue.mockClear();
+    vi.advanceTimersByTime(delayMs);
+    expect(await fetch(readUrl)).toBe(missing);
+
+    const error = mockEnqueue.mock.calls[0]?.[0];
+    expect(error?.metadata?.status).toBe(404);
+    expect(error?.metadata).not.toHaveProperty('successfulDeleteAgeMs');
+  });
+
+  it('clears delete correlations when capture stops', async () => {
+    window.fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response('Missing', { status: 404 }));
+    startNetworkCapture('https://api.bworlds.co');
+    await fetch('https://api.bworlds.co/resource', { method: 'DELETE' });
+    stopNetworkCapture();
+    startNetworkCapture('https://api.bworlds.co');
+
+    expect((await fetch('https://api.bworlds.co/resource')).status).toBe(404);
+    expect(mockEnqueue.mock.calls[0]?.[0].metadata).not.toHaveProperty('successfulDeleteAgeMs');
   });
 
   it('does not capture successful responses (200)', async () => {

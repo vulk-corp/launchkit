@@ -3,9 +3,13 @@ import { isSdkTelemetryUrl, redactNetworkUrl } from './network-url';
 import { normalizeThrown } from './normalize-thrown';
 import { expectedNetworkState } from './network-outcome';
 
+const DELETE_CORRELATION_WINDOW_MS = 5_000;
+const MAX_DELETE_CORRELATIONS = 100;
+
 let _originalFetch: typeof fetch | null = null;
 let _installed = false;
 let _apiEndpoint = '';
+let _clearDeleteCorrelations: (() => void) | null = null;
 
 export function startNetworkCapture(apiEndpoint: string): void {
   if (_installed) return;
@@ -14,6 +18,8 @@ export function startNetworkCapture(apiEndpoint: string): void {
 
   const original = window.fetch;
   _originalFetch = original;
+  const successfulDeletes = new Map<string, number>();
+  _clearDeleteCorrelations = () => successfulDeletes.clear();
 
   // Close over the original so a reference retained across teardown still
   // forwards, and never throw before delegating to the host fetch.
@@ -35,6 +41,7 @@ export function startNetworkCapture(apiEndpoint: string): void {
       return original(input, init);
     }
 
+    const startedAt = Date.now();
     try {
       const response = await original(input, init);
 
@@ -45,6 +52,9 @@ export function startNetworkCapture(apiEndpoint: string): void {
       )) {
         try {
           const requestUrl = truncateUrl(redactNetworkUrl(url));
+          const key = correlationUrl(url);
+          const deletedAt = key === null ? undefined : successfulDeletes.get(key);
+          const deleteAge = deletedAt === undefined ? undefined : startedAt - deletedAt;
           enqueueError({
             message: `HTTP ${response.status} ${response.statusText} - ${method} ${requestUrl}`,
             stack: null,
@@ -55,10 +65,34 @@ export function startNetworkCapture(apiEndpoint: string): void {
               method,
               requestUrl,
               statusText: response.statusText,
+              ...(method === 'GET' && response.status === 404
+                && deleteAge !== undefined && deleteAge >= 0
+                && deleteAge <= DELETE_CORRELATION_WINDOW_MS
+                ? { successfulDeleteAgeMs: deleteAge }
+                : {}),
             },
           });
         } catch {
           // never crash the host app
+        }
+      }
+
+      if (method === 'DELETE' && response.ok) {
+        try {
+          const now = Date.now();
+          for (const [key, deletedAt] of successfulDeletes) {
+            if (now - deletedAt > DELETE_CORRELATION_WINDOW_MS) successfulDeletes.delete(key);
+          }
+          const key = correlationUrl(url);
+          if (key === null) return response;
+          successfulDeletes.delete(key);
+          if (successfulDeletes.size >= MAX_DELETE_CORRELATIONS) {
+            const oldest = successfulDeletes.keys().next().value;
+            if (oldest !== undefined) successfulDeletes.delete(oldest);
+          }
+          successfulDeletes.set(key, now);
+        } catch {
+          // Correlation metadata must never affect the host request.
         }
       }
 
@@ -93,6 +127,8 @@ export function stopNetworkCapture(): void {
     _originalFetch = null;
   }
   _installed = false;
+  _clearDeleteCorrelations?.();
+  _clearDeleteCorrelations = null;
 }
 
 function resolveUrl(input: RequestInfo | URL): string {
@@ -104,4 +140,14 @@ function resolveUrl(input: RequestInfo | URL): string {
 
 function truncateUrl(url: string): string {
   return url.length > 200 ? url.slice(0, 200) + '...' : url;
+}
+
+function correlationUrl(url: string): string | null {
+  try {
+    const parsed = new URL(url, window.location.href);
+    parsed.hash = '';
+    return parsed.href;
+  } catch {
+    return null;
+  }
 }
