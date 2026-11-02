@@ -6,6 +6,8 @@
 
 Monitoring, error capture, and access gating SDK for AI-built apps. Drop-in integration for Lovable, Bolt, and Base44.
 
+Part of [BWorlds](https://www.bworlds.co/): audits and 24/7 monitoring for AI-built apps.
+
 **Available on npm**: [`@bworlds/launchkit`](https://www.npmjs.com/package/@bworlds/launchkit)
 
 **Documentation**: [docs.bworlds.co/docs/guides/sdk](https://docs.bworlds.co/docs/guides/sdk) covers both install paths and what each signal reports.
