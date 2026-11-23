@@ -42,7 +42,7 @@ vi.mock('../src/remote-config', () => ({
 }));
 
 vi.mock('../src/badge-widget', () => ({
-  startBadgeWidget: vi.fn().mockResolvedValue(undefined),
+  startBadgeWidget: vi.fn(),
   stopBadgeWidget: vi.fn(),
 }));
 

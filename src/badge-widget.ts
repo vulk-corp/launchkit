@@ -1,14 +1,7 @@
 /**
- * Trust badge: floating "Runs on BWORLDS" pill mounted in shadow DOM.
- * Counts are tab-cached via sessionStorage; CDN caches the endpoint.
+ * Trust badge: floating "Runs on BWORLDS" pill mounted in shadow DOM, linking to
+ * the Build's Trust Page. Public proof surfaces state no score, so it shows no count.
  */
-
-import { fetchJsonWithTimeout } from './fetch-util';
-
-interface BadgeCounts {
-  passed: number;
-  total: number;
-}
 
 let _host: HTMLDivElement | null = null;
 
@@ -17,41 +10,13 @@ const Z_INDEX = 2147483000;
 // Mirrored from apps/bworlds-web/src/app/globals.css.
 const COLOR_ICON = '#e64c3c';
 const COLOR_LABEL = '#1f1f23';
-const COLOR_COUNTS = '#2aa9a1';
 const COLOR_BORDER = '#e7e5e4';
 
-function cacheKey(buildSlug: string): string {
-  return `bworlds-badge-counts-${buildSlug}`;
-}
-
-function readCache(buildSlug: string): BadgeCounts | null {
-  try {
-    const raw = sessionStorage.getItem(cacheKey(buildSlug));
-    if (!raw) return null;
-    return JSON.parse(raw) as BadgeCounts;
-  } catch {
-    return null;
-  }
-}
-
-function writeCache(buildSlug: string, counts: BadgeCounts): void {
-  try {
-    sessionStorage.setItem(cacheKey(buildSlug), JSON.stringify(counts));
-  } catch {
-    // sessionStorage unavailable — skip cache write, not fatal
-  }
-}
-
-export async function startBadgeWidget(
-  buildSlug: string,
-  apiEndpoint: string,
-  trustOrigin: string
-): Promise<void> {
+export function startBadgeWidget(buildSlug: string, trustOrigin: string): void {
   if (typeof document === 'undefined') return;
   if (_host) return;
 
-  const counts = await fetchBadgeCounts(apiEndpoint, buildSlug);
-  mount(buildSlug, trustOrigin, counts);
+  mount(buildSlug, trustOrigin);
 }
 
 export function stopBadgeWidget(): void {
@@ -61,24 +26,7 @@ export function stopBadgeWidget(): void {
   }
 }
 
-async function fetchBadgeCounts(
-  apiEndpoint: string,
-  buildSlug: string
-): Promise<BadgeCounts | null> {
-  const cached = readCache(buildSlug);
-  if (cached) return cached;
-
-  const counts = await fetchJsonWithTimeout<BadgeCounts>(
-    `${apiEndpoint}/api/telemetry/badge-counts?buildSlug=${encodeURIComponent(buildSlug)}`
-  );
-  if (!counts || typeof counts.passed !== 'number' || typeof counts.total !== 'number') {
-    return null;
-  }
-  writeCache(buildSlug, counts);
-  return counts;
-}
-
-function mount(buildSlug: string, trustOrigin: string, counts: BadgeCounts | null): void {
+function mount(buildSlug: string, trustOrigin: string): void {
   if (!document.body) return;
 
   const host = document.createElement('div');
@@ -122,12 +70,6 @@ function mount(buildSlug: string, trustOrigin: string, counts: BadgeCounts | nul
       color: ${COLOR_LABEL};
       line-height: 1;
     }
-    .counts {
-      font-size: 12px;
-      font-weight: 700;
-      color: ${COLOR_COUNTS};
-      line-height: 1;
-    }
   `;
   shadow.appendChild(style);
 
@@ -137,7 +79,7 @@ function mount(buildSlug: string, trustOrigin: string, counts: BadgeCounts | nul
   anchor.setAttribute('href', `${trustOrigin}/builds/${encodeURIComponent(buildSlug)}/trust`);
   anchor.setAttribute('target', '_blank');
   anchor.setAttribute('rel', 'noopener noreferrer');
-  anchor.setAttribute('aria-label', 'View trust page for this app on BWORLDS');
+  anchor.setAttribute('aria-label', "Runs on BWORLDS: view this app's trust page (opens in a new tab)");
 
   // Hammer icon — lucide-react source, 24px viewBox, 2px stroke.
   anchor.appendChild(buildHammerIcon());
@@ -146,13 +88,6 @@ function mount(buildSlug: string, trustOrigin: string, counts: BadgeCounts | nul
   label.className = 'label';
   label.textContent = 'Runs on BWORLDS';
   anchor.appendChild(label);
-
-  if (counts && counts.total > 0) {
-    const countsEl = document.createElement('span');
-    countsEl.className = 'counts';
-    countsEl.textContent = `${counts.passed}/${counts.total}`;
-    anchor.appendChild(countsEl);
-  }
 
   shadow.appendChild(anchor);
 

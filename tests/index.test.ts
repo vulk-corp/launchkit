@@ -55,7 +55,7 @@ vi.mock('../src/remote-config', () => ({
 }));
 
 vi.mock('../src/badge-widget', () => ({
-  startBadgeWidget: vi.fn().mockResolvedValue(undefined),
+  startBadgeWidget: vi.fn(),
   stopBadgeWidget: vi.fn(),
 }));
 
@@ -82,6 +82,10 @@ beforeEach(() => {
   mockFetchRemoteConfig.mockResolvedValue(null);
   // Default: cold cache -> gating enabled -> overlay mounts (fail-safe).
   mockReadCachedGatingEnabled.mockReturnValue(true);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 /** Flush microtask queue so the deferred activation in init() completes. */
@@ -352,11 +356,7 @@ describe('init()', () => {
     init({ buildSlug: 'test-app', gate: false });
 
     await vi.waitFor(() => {
-      expect(startBadgeWidget).toHaveBeenCalledWith(
-        'test-app',
-        'https://api.bworlds.co',
-        'https://app.bworlds.co'
-      );
+      expect(startBadgeWidget).toHaveBeenCalledWith('test-app', 'https://app.bworlds.co');
     });
   });
 
@@ -374,6 +374,29 @@ describe('init()', () => {
     await flushMicrotasks();
 
     expect(startBadgeWidget).not.toHaveBeenCalled();
+  });
+
+  it('still mounts access gating when the badge widget throws', async () => {
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: true,
+      sessionReplay: false,
+      badge: true,
+      gatingEnabled: true,
+      allowedOrigin: null,
+    });
+    mockReadCachedGatingEnabled.mockReturnValue(true);
+    vi.mocked(startBadgeWidget).mockImplementationOnce(() => {
+      throw new Error('attachShadow is not available');
+    });
+    vi.mocked(check).mockReturnValueOnce(new Promise(() => {}));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    init({ buildSlug: 'test-app' });
+
+    await vi.waitFor(() => {
+      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
+    });
+    expect(check).toHaveBeenCalledWith('test-app', 'https://api.bworlds.co');
   });
 });
 

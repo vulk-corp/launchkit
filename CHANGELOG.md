@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.18.6] - 2026-11-23
+
+### Changed
+
+- **Trust badge without a score**: the floating badge reads "Runs on BWORLDS" and links to the Build's Trust Page. It mounts without a network request and ignores cached legacy counts, completing the SDK migration away from the removed `/api/telemetry/badge-counts` endpoint.
+
+### Fixed
+
+- **Access gating after a badge failure**: an error while mounting the badge no longer prevents the access overlay and token check from starting. The badge's accessible name also includes its visible label and announces that the Trust Page opens in a new tab.
+
 ## [1.18.5] - 2026-10-09
 
 ### Fixed
