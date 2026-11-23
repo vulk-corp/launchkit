@@ -18,7 +18,7 @@ Part of [BWorlds](https://www.bworlds.co/): audits and 24/7 monitoring for AI-bu
 - **Error capture**: catches uncaught errors, unhandled rejections, failed network requests, and console errors; batches and forwards them with readable messages for any thrown value. Errors captured while a session recording is active are linked to that recording, so they show up inside the session on the BWORLDS dashboard
 - **Session replay identity**: automatically attaches Supabase Auth `email` / `userId` to replays in Lovable-style apps when available
 - **Access gating**: token-based session validation with redirect to a hosted access page
-- **Trust badge widget**: optional floating "Runs on BWORLDS" pill, toggled from the BWORLDS dashboard (no consumer-side flag)
+- **Trust badge widget**: optional floating "Runs on BWORLDS" link to the Build's Trust Page, without a score or a network request; toggled from the BWORLDS dashboard (no consumer-side flag)
 - **Zero config**: works with a single `buildSlug`, no API key required. All settings are managed remotely from the BWORLDS dashboard.
 - **Lightweight**: works in any browser environment
 - **CDN-ready**: use via npm or a `<script>` tag from unpkg

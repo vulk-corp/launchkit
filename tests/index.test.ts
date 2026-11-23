@@ -84,6 +84,10 @@ beforeEach(() => {
   mockReadCachedGatingEnabled.mockReturnValue(true);
 });
 
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 /** Flush microtask queue so the deferred activation in init() completes. */
 async function flushMicrotasks(): Promise<void> {
   await new Promise((r) => setTimeout(r, 0));
@@ -392,6 +396,7 @@ describe('init()', () => {
     await vi.waitFor(() => {
       expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
     });
+    expect(check).toHaveBeenCalledWith('test-app', 'https://api.bworlds.co');
   });
 });
 

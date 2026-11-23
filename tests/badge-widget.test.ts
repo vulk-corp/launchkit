@@ -10,10 +10,12 @@ function badgeAnchor(): HTMLAnchorElement {
 
 beforeEach(() => {
   document.body.innerHTML = '';
+  sessionStorage.clear();
 });
 
 afterEach(() => {
   stopBadgeWidget();
+  sessionStorage.clear();
   vi.unstubAllGlobals();
 });
 
@@ -53,13 +55,15 @@ describe('badge_widget_mounts_on_flag', () => {
 });
 
 describe('badge_widget_renders_label_and_link', () => {
-  it('shows the label without any score and makes no request', () => {
+  it('ignores cached legacy counts and mounts without a network request', () => {
+    sessionStorage.setItem('bworlds-badge-counts-acme', JSON.stringify({ passed: 7, total: 10 }));
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
 
     startBadgeWidget('acme', TRUST_ORIGIN);
 
     expect(badgeAnchor().textContent).toBe('Runs on BWORLDS');
+    expect(badgeAnchor().querySelector('.counts')).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -75,5 +79,6 @@ describe('badge_widget_renders_label_and_link', () => {
     const anchor = badgeAnchor();
     expect(anchor.getAttribute('target')).toBe('_blank');
     expect(anchor.getAttribute('rel')).toBe('noopener noreferrer');
+    expect(anchor.getAttribute('aria-label')).toContain(anchor.textContent);
   });
 });
