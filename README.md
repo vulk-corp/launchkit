@@ -176,6 +176,30 @@ Unknown aborts, `AbortSignal.timeout`, other timeout controllers, genuine networ
 failures, and HTTP error responses remain reportable. Do not use the helper for
 timeouts. Unhandled rejections and console errors are still captured normally.
 
+## Other session replay tools
+
+Sentry Replay and PostHog session recording are also built on rrweb. Each rrweb
+recorder hooks the browser setters of form field values and the CSSOM methods
+(`insertRule`, `deleteRule`) to see changes made by code. When a recorder stops,
+rrweb restores the setters and methods it found when it started, which removes
+every hook installed after that point.
+
+Sentry Replay stops this way when it pauses after five minutes without user
+activity in full-session sampling (`replaysSessionSampleRate`), and hooks again
+on the next interaction. If Sentry Replay started before LaunchKit, LaunchKit can
+then miss these changes until the page reloads:
+
+- a field value set by code, such as a chat composer cleared after sending,
+  keeps its previous value in the replay;
+- styles inserted through the CSSOM, as CSS-in-JS libraries do in production,
+  are missing from components rendered afterwards.
+
+Typing, clicks, DOM changes, errors and network capture are not affected. Each
+periodic full snapshot, taken every five minutes while the tab is visible and
+active, records the current values and styles again, so a stale value lasts
+until the next snapshot. The restore behavior is tracked upstream in
+[rrweb#1518](https://github.com/rrweb-io/rrweb/issues/1518).
+
 ## License
 
 MIT
