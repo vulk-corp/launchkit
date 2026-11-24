@@ -1,14 +1,14 @@
 # LaunchKit SDK
 
-`@bworlds/launchkit` — client SDK embedded in BWORLDS builders. Heartbeat, error capture, session replay (rrweb), access gating, trust badge. Remote-toggled from dashboard via `/api/telemetry/sdk-config`.
+`@bworlds/launchkit` — client SDK embedded in BWORLDS builders. Heartbeat, error capture, session replay (rrweb), trust badge. Remote-toggled from dashboard via `/api/telemetry/sdk-config`.
 
 **Repo**: `vulk-corp/launchkit` (separate from `vulk-corp/bworlds` monorepo).
 
 ## Invariants
 
 - **Never break the host app.** All features fail-open on backend outage. Telemetry drops silently.
-- **Skip in cross-origin iframes** (Lovable/Bolt editor previews): error capture, replay, gate, badge. Heartbeat still runs.
-- **No local feature flags.** Dashboard drives `errorCapture`, `sessionReplay`, `badge`. The heartbeat is system-owned and starts after origin scope passes. `monitoring` stays in remote config for deployed SDK compatibility. `gate` stays local (behavioral).
+- **Skip in cross-origin iframes** (Lovable/Bolt editor previews): error capture, replay, badge. Heartbeat still runs.
+- **No local feature flags.** Dashboard drives `errorCapture`, `sessionReplay`, `badge`. The heartbeat is system-owned and starts after origin scope passes. `monitoring` stays in remote config for deployed SDK compatibility.
 - **rrweb is external + lazy.** Dynamic `import('./replay')` only on first session. Main bundle ~6.5 kB.
 - **Replay owns the session id; error capture only reads it.** `replay.ts` publishes the active session id through `session-state.ts` (set on open/resume/rotation, cleared on stop, 429 cap stop, and failed start) — never export a getter from `replay.ts`, that defeats the dynamic-import boundary. `enqueueError` stamps `sessionId` + `capturedAt` at capture time, never at flush: a batch can span a session rotation. `backstampQueuedErrors` fills null-session entries only, preserves `capturedAt`, and is called only from `startReplay`'s success path.
 - **Telemetry strings are string-typed, capped, and well-formed.** `enqueueError` is the single enforcement chokepoint for `message` (≤ `MAX_MESSAGE_LENGTH`, 5000), `stack` (≤ `MAX_STACK_LENGTH`, 10000), and `url` (≤ `MAX_URL_LENGTH`, 2048): always strings, lone surrogates replaced with U+FFFD, never cut mid-surrogate-pair. The API rejects the entire `/api/telemetry/errors` batch when one item carries an invalid field. `normalizeThrown` never throws; unreadable values become `[error details could not be read]`.
@@ -30,8 +30,8 @@ CI: Node 22, runs on main/next push + PRs (type-check, build, test).
 
 | File | Role |
 |------|------|
-| `src/index.ts` | Orchestrator. `init()` wires modules, standalone `check()`/`getGateUrl()` |
-| `src/check.ts` | Token validation. Reads `?bworlds_token=` or cookie. Persists cookie, strips URL |
+| `src/index.ts` | Orchestrate monitoring, identity, and cleanup. Preserve v1 access-helper exports. |
+| `src/check.ts` | Resolve deprecated access checks as free access without I/O. |
 | `src/heartbeat.ts` | 5 min interval ping → `/api/telemetry/heartbeat` |
 | `src/error-capture.ts` | `window.onerror` + `unhandledrejection` + `console.error` wrapper. Batches 5 errors OR 10s, flushes on page hidden. Stamps `sessionId` (from session-state) + `capturedAt` at enqueue |
 | `src/network-capture.ts` | `window.fetch` wrapper. Enqueues HTTP ≥ 400 responses and rejected fetches with `Network error - {method} {url}` prefix. Skips only `/api/telemetry/*` on the configured `apiEndpoint` origin (no self-capture); product API routes on that origin remain observable |
@@ -46,7 +46,7 @@ CI: Node 22, runs on main/next push + PRs (type-check, build, test).
 | `src/visitor-state.ts` | Stable anonymous visitor id, persisted in `localStorage` (`bworlds-visitor-id`), origin-scoped. Replay payload reads it so the backend groups a returning visitor's sessions. globalThis-backed, fail-open |
 | `src/uuid.ts` | UUID v4 generator shared by session id + visitor id |
 | `src/badge-widget.ts` | Shadow DOM badge linking to the Trust Page. No network request, no score |
-| `src/remote-config.ts` | `/api/telemetry/sdk-config` fetch, sessionStorage cache |
+| `src/remote-config.ts` | Fetch `/api/telemetry/sdk-config` with a localStorage cache. |
 | `src/telemetry-sender.ts` | POST JSON + `keepalive`, silent fail |
 | `src/fetch-util.ts` | `fetchJsonWithTimeout` (3s AbortController) |
 
@@ -95,17 +95,14 @@ Footage the SDK alters at capture is marked inside the recording as an rrweb cus
 | `/api/telemetry/errors` | error-capture | POST |
 | `/api/telemetry/replay-events` | replay | POST + sendBeacon on unload |
 | `/api/telemetry/sdk-config` | remote-config | GET |
-| `/api/monetization/validate-token` | check | POST |
 
 ## Config naming
 
-- `apiEndpoint` — telemetry + token validation base URL. Not `apiOrigin`.
-- `gateOrigin` — `/access/:slug` redirect target. Defaults to `https://app.bworlds.co`.
-- `gate` — boolean, auto-gating toggle.
+- Use `apiEndpoint` for the telemetry base URL.
 
-Replay payload includes `token` (read from `bworlds_token` cookie) so backend resolves user identity. The token and its `userEmail` fallback are used only when the JWT's `buildSlug` claim matches the current build, so a foreign `bworlds_token` sharing the cookie jar (localhost ports in dev, a parent-scoped cookie) cannot leak another build's user.
+Read replay identity from the injected identity state. Populate it through `identify()`, `connectSupabase()`, or the Supabase identity bridge.
 
-Replay payload also includes `visitorId` on every chunk: a stable anonymous visitor id (UUID) from `visitor-state.ts`, persisted in `localStorage` and origin-scoped. Sent regardless of identity so the backend groups a visitor's sessions and links their earlier anonymous sessions once they identify. The errors endpoint rejects unknown fields (422 the batch), so the visitor id rides the replay payload only.
+Replay payload includes `visitorId` on every chunk: a stable anonymous visitor id (UUID) from `visitor-state.ts`, persisted in `localStorage` and origin-scoped. Sent regardless of identity so the backend groups a visitor's sessions and links their earlier anonymous sessions once they identify. The errors endpoint rejects unknown fields (422 the batch), so the visitor id rides the replay payload only.
 
 ## Testing
 
@@ -113,7 +110,6 @@ Replay payload also includes `visitorId` on every chunk: a stable anonymous visi
 - Mock every sibling module per file. Reset in `beforeEach`.
 - Fake timers for heartbeat/error-capture: `vi.useFakeTimers()` + `vi.advanceTimersByTime()`.
 - Replay tests: hoisted `vi.hoisted()` to capture rrweb emit callback. `vi.setSystemTime()` for session rotation.
-- Always pass `gate: false` in non-gate tests (auto-gate triggers overlay + `check()` side effects).
 
 ## Local testing (unreleased build)
 
@@ -147,18 +143,15 @@ then restart the consumer dev server (Next.js will not hot-swap a relinked packa
 init({
   buildSlug: '<local-slug>',              // must exist in the local BWorlds DB
   apiEndpoint: 'http://localhost:3941',   // local bworlds-api (default port)
-  gateOrigin: 'http://localhost:3939',    // local bworlds-web (default port)
   dev: true,                              // bypass the origin guard on localhost
 });
 ```
 
 Worktree stacks shift the ports (base 4900/5900/6900/7900; web +39, api +41). Without `dev: true` the SDK fetches remote config, sees `localhost` does not match the build's registered origin, and goes fully silent (no console output) — that is the most common "nothing happens" cause.
 
-**Seed the build slug first.** If `buildSlug` is absent from the local DB, `/api/monetization/validate-token` returns `valid: false` for everyone and `/access/<slug>` 404s. Seed it from the BWorlds stack (e.g. `pnpm seed:demo` loads the `market-echo` demo build) before testing.
+**Seed the Build first.** Load the `market-echo` demo Build with `pnpm seed:demo` in the BWorlds stack, or create a Build through the local dashboard.
 
-**Verify.** With the consumer dev server up and DevTools → Network open, a reload should show `POST http://localhost:3941/api/telemetry/heartbeat` and a `validate-token` call hitting the **local** API, not `api.bworlds.co`. For SPA navigation specifically, click through routes and confirm `/api/telemetry/replay-events` payloads carry `navigation` custom events.
-
-**Common failure modes.** Redirect lands on `app.bworlds.co` → consumer env not loaded, restart its dev server. SDK behaves like the old version → stale yalc link, re-run `npm run build && pnpm dlx yalc push` then restart. `git status` shows `file:.yalc/...` → a link was left in place, revert before committing.
+**Verify.** Confirm the consumer sends heartbeat and replay requests to the local API. Navigate between SPA routes and check that replay payloads carry `navigation` custom events. Refresh a stale local SDK link with `npm run build && pnpm dlx yalc push`, then restart the consumer dev server.
 
 Revert in the consumer when done — **never commit** `file:.yalc/...` or `yalc.lock`:
 

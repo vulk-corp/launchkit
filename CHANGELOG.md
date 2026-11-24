@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.19.0] - 2026-11-24
+
+### Changed
+
+- Access checks grant free access without token verification, network requests, or a verification overlay. The SDK does not redirect visitors to a hosted access page.
+- The v1 `check()` / `getGateUrl()` exports, `CheckResult` type, instance methods, and initialization options remain available. Access helpers and the `gate` option are deprecated; `gateOrigin` still configures the Trust Page badge's origin.
+- Remote telemetry configuration accepts responses without an access-gating field. Heartbeat, errors, replays, visitor identity, and the Trust Page badge retain their existing behavior.
+
+### Removed
+
+- Access-cookie reads and JWT forwarding from replay uploads. Replay identity uses `identify()`, `connectSupabase()`, and automatic Supabase identity discovery.
+
 ## [1.18.6] - 2026-11-23
 
 ### Changed

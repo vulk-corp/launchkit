@@ -2615,15 +2615,8 @@ describe('visitor identity', () => {
   });
 });
 
-describe('build-bound token', () => {
-  async function flushOneChunk(): Promise<Record<string, unknown>> {
-    hoisted.getEmit()!({ type: 2, timestamp: Date.now(), data: {} });
-    document.dispatchEvent(new Event('visibilitychange'));
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    return parseFetchBody(fetchMock.mock.calls[0]);
-  }
-
-  it('stamps userEmail and forwards a token bound to this build', async () => {
+describe('replay identity', () => {
+  it('ignores an access cookie when assembling a replay upload', async () => {
     visibilityState = 'hidden';
     document.cookie = `bworlds_token=${makeToken({
       email: 'owner@example.com',
@@ -2631,37 +2624,13 @@ describe('build-bound token', () => {
     })}`;
 
     await startReplay(BUILD_SLUG, API_ENDPOINT);
-    const body = await flushOneChunk();
-
-    expect(body.userEmail).toBe('owner@example.com');
-    expect(typeof body.token).toBe('string');
-  });
-
-  it('ignores a token cookie issued for another build (no email or token leak)', async () => {
-    visibilityState = 'hidden';
-    document.cookie = `bworlds_token=${makeToken({
-      email: 'someone-else@example.com',
-      buildSlug: 'a-different-build',
-    })}`;
-
-    await startReplay(BUILD_SLUG, API_ENDPOINT);
-    const body = await flushOneChunk();
+    hoisted.getEmit()!({ type: 2, timestamp: Date.now(), data: {} });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const body = parseFetchBody(fetchMock.mock.calls[0]);
 
     expect(body).not.toHaveProperty('userEmail');
     expect(body).not.toHaveProperty('token');
-  });
-
-  it('decodes a non-ASCII email from a build-bound token', async () => {
-    visibilityState = 'hidden';
-    document.cookie = `bworlds_token=${makeToken({
-      email: 'josé@example.com',
-      buildSlug: BUILD_SLUG,
-    })}`;
-
-    await startReplay(BUILD_SLUG, API_ENDPOINT);
-    const body = await flushOneChunk();
-
-    expect(body.userEmail).toBe('josé@example.com');
   });
 });
 

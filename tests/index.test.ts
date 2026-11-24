@@ -1,10 +1,8 @@
-import { init, stop } from '../src/index';
+import { check, getGateUrl, init, stop, type CheckResult } from '../src/index';
 import { configureSender } from '../src/telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from '../src/heartbeat';
 import { startErrorCapture, stopErrorCapture } from '../src/error-capture';
-import { check } from '../src/check';
-import type { CheckResult } from '../src/check';
-import { fetchRemoteConfig, readCachedGatingEnabled } from '../src/remote-config';
+import { fetchRemoteConfig } from '../src/remote-config';
 import { startBadgeWidget } from '../src/badge-widget';
 import { startReplay } from '../src/replay';
 import { startReplayTelemetry } from '../src/replay-telemetry';
@@ -23,10 +21,6 @@ vi.mock('../src/heartbeat', () => ({
 vi.mock('../src/error-capture', () => ({
   startErrorCapture: vi.fn(),
   stopErrorCapture: vi.fn(),
-}));
-
-vi.mock('../src/check', () => ({
-  check: vi.fn().mockResolvedValue({ valid: true, email: null, accessType: 'free', expiresAt: null, degraded: false }),
 }));
 
 vi.mock('../src/replay', async () => {
@@ -49,9 +43,6 @@ vi.mock('../src/replay-telemetry', () => ({
 
 vi.mock('../src/remote-config', () => ({
   fetchRemoteConfig: vi.fn().mockResolvedValue(null),
-  // Default: cold cache -> gating enabled -> overlay mounts (fail-safe).
-  // Tests that need ungated behavior can override per-test.
-  readCachedGatingEnabled: vi.fn().mockReturnValue(true),
 }));
 
 vi.mock('../src/badge-widget', () => ({
@@ -71,17 +62,13 @@ vi.mock('../src/supabase-identity-bridge', () => ({
 }));
 
 const mockFetchRemoteConfig = vi.mocked(fetchRemoteConfig);
-const mockReadCachedGatingEnabled = vi.mocked(readCachedGatingEnabled);
 
 beforeEach(() => {
   // Reset SDK state so _initialized is false for each test.
   stop();
   vi.clearAllMocks();
   setReplaySessionId(null);
-  document.getElementById('bworlds-gate-overlay')?.remove();
   mockFetchRemoteConfig.mockResolvedValue(null);
-  // Default: cold cache -> gating enabled -> overlay mounts (fail-safe).
-  mockReadCachedGatingEnabled.mockReturnValue(true);
 });
 
 afterEach(() => {
@@ -94,8 +81,70 @@ async function flushMicrotasks(): Promise<void> {
 }
 
 describe('init()', () => {
+  it('grants free access through the v1 helpers without reading or sending a token', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 401 }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const instance = init({
+        buildSlug: 'test-app',
+        gate: true,
+        gateOrigin: 'https://preview.example',
+      });
+      const result: CheckResult = await instance.check();
+      expect(result).toEqual({
+        valid: true,
+        email: null,
+        accessType: 'free',
+        expiresAt: null,
+        degraded: false,
+      });
+      expect(await check()).toEqual(result);
+      expect(instance.getGateUrl()).toBe('https://preview.example/access/test-app');
+      expect(getGateUrl()).toBe(instance.getGateUrl());
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('keeps access helpers on duplicate and invalid initialization results', async () => {
+    const first = init({ buildSlug: 'test-app' });
+    const duplicate = init({ buildSlug: 'test-app' });
+    stop();
+    const invalid = init({ buildSlug: '' });
+    for (const instance of [first, duplicate, invalid]) {
+      expect(instance.check).toEqual(expect.any(Function));
+      expect(instance.getGateUrl).toEqual(expect.any(Function));
+    }
+  });
+
+  it('links the trust badge to the configured origin', async () => {
+    const badge = await vi.importActual<typeof import('../src/badge-widget')>('../src/badge-widget');
+    vi.mocked(startBadgeWidget).mockImplementationOnce(badge.startBadgeWidget);
+    mockFetchRemoteConfig.mockResolvedValue({
+      monitoring: true,
+      sessionReplay: false,
+      badge: true,
+      allowedOrigin: null,
+    });
+    try {
+      init({
+        buildSlug: 'test-app',
+        gate: false,
+        gateOrigin: 'https://preview.example',
+      });
+      await flushMicrotasks();
+      const anchor = document
+        .getElementById('bworlds-trust-badge')
+        ?.shadowRoot?.querySelector('a');
+      expect(anchor?.href).toBe('https://preview.example/builds/test-app/trust');
+    } finally {
+      badge.stopBadgeWidget();
+    }
+  });
+
   it('calls configureSender with buildSlug and apiEndpoint', () => {
-    init({ buildSlug: 'test-app', apiEndpoint: 'https://custom.api', gate: false });
+    init({ buildSlug: 'test-app', apiEndpoint: 'https://custom.api' });
 
     expect(configureSender).toHaveBeenCalledWith({
       buildSlug: 'test-app',
@@ -104,7 +153,7 @@ describe('init()', () => {
   });
 
   it('normalizes a trailing slash from apiEndpoint before configuring subsystems', () => {
-    init({ buildSlug: 'test-app', apiEndpoint: 'https://custom.api/proxy/', gate: false });
+    init({ buildSlug: 'test-app', apiEndpoint: 'https://custom.api/proxy/' });
 
     expect(configureSender).toHaveBeenCalledWith({
       buildSlug: 'test-app',
@@ -117,13 +166,13 @@ describe('init()', () => {
   });
 
   it('starts heartbeat by default after config fetch resolves', async () => {
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
   });
 
   it('starts error capture by default after config fetch resolves', async () => {
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
     expect(startErrorCapture).toHaveBeenCalledWith('test-app');
   });
@@ -133,11 +182,10 @@ describe('init()', () => {
       monitoring: true,
       sessionReplay: true,
       badge: false,
-      gatingEnabled: false,
       allowedOrigin: null,
     });
 
-    const instance = init({ buildSlug: 'test-app', gate: false });
+    const instance = init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     const replayOptions = vi.mocked(startReplay).mock.calls[0]?.[2] as
@@ -153,7 +201,7 @@ describe('init()', () => {
   });
 
   it('fetches remote config', () => {
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     expect(mockFetchRemoteConfig).toHaveBeenCalledWith('https://api.bworlds.co', 'test-app');
   });
 
@@ -162,11 +210,10 @@ describe('init()', () => {
       monitoring: true,
       sessionReplay: true,
       badge: false,
-      gatingEnabled: false,
       allowedOrigin: null,
     });
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startReplayTelemetry).toHaveBeenCalledWith('test-app', 'https://api.bworlds.co', {
@@ -185,13 +232,11 @@ describe('init()', () => {
       monitoring: true,
       sessionReplay: true,
       badge: false,
-      gatingEnabled: false,
       allowedOrigin: null,
     });
 
     init({
       buildSlug: 'test-app',
-      gate: false,
       enableReplayDiagnostics: false,
       enableConsoleTelemetry: false,
       enableNetworkTelemetry: false,
@@ -214,7 +259,6 @@ describe('init()', () => {
       monitoring: true,
       sessionReplay: true,
       badge: false,
-      gatingEnabled: false,
       allowedOrigin: null,
     });
 
@@ -226,7 +270,7 @@ describe('init()', () => {
       });
     });
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await vi.waitFor(() => expect(startReplay).toHaveBeenCalled());
 
     stop(); // stop while startReplay is mid-flight
@@ -241,7 +285,6 @@ describe('init()', () => {
       monitoring: true,
       sessionReplay: true,
       badge: false,
-      gatingEnabled: false,
       allowedOrigin: null,
     });
 
@@ -251,7 +294,7 @@ describe('init()', () => {
       setReplaySessionId(null);
     });
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startReplay).toHaveBeenCalled();
@@ -259,9 +302,9 @@ describe('init()', () => {
   });
 
   it('starts heartbeat even when remote config disables monitoring', async () => {
-    mockFetchRemoteConfig.mockResolvedValue({ monitoring: false, sessionReplay: true, badge: false, gatingEnabled: false, allowedOrigin: null });
+    mockFetchRemoteConfig.mockResolvedValue({ monitoring: false, sessionReplay: true, badge: false, allowedOrigin: null });
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
@@ -274,20 +317,19 @@ describe('init()', () => {
       uptimeMonitoring: false,
       sessionReplay: true,
       badge: false,
-      gatingEnabled: false,
       allowedOrigin: null,
     });
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
   });
 
   it('does not start error capture or replay when sessionReplay disables the legacy combined feature', async () => {
-    mockFetchRemoteConfig.mockResolvedValue({ monitoring: true, sessionReplay: false, badge: false, gatingEnabled: false, allowedOrigin: null });
+    mockFetchRemoteConfig.mockResolvedValue({ monitoring: true, sessionReplay: false, badge: false, allowedOrigin: null });
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startErrorCapture).not.toHaveBeenCalled();
@@ -301,11 +343,10 @@ describe('init()', () => {
       errorCapture: true,
       sessionReplay: false,
       badge: false,
-      gatingEnabled: false,
       allowedOrigin: null,
     });
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startErrorCapture).toHaveBeenCalledWith('test-app');
@@ -319,11 +360,10 @@ describe('init()', () => {
       errorCapture: false,
       sessionReplay: false,
       badge: false,
-      gatingEnabled: false,
       allowedOrigin: null,
     });
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
@@ -334,7 +374,7 @@ describe('init()', () => {
   it('keeps lower-sensitivity telemetry running when remote config fetch fails', async () => {
     mockFetchRemoteConfig.mockResolvedValue(null);
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
 
     // Let promises settle
     await flushMicrotasks();
@@ -349,11 +389,10 @@ describe('init()', () => {
       monitoring: true,
       sessionReplay: true,
       badge: true,
-      gatingEnabled: false,
       allowedOrigin: null,
     });
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
 
     await vi.waitFor(() => {
       expect(startBadgeWidget).toHaveBeenCalledWith('test-app', 'https://app.bworlds.co');
@@ -365,74 +404,22 @@ describe('init()', () => {
       monitoring: true,
       sessionReplay: true,
       badge: false,
-      gatingEnabled: false,
       allowedOrigin: null,
     });
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
 
     await flushMicrotasks();
 
     expect(startBadgeWidget).not.toHaveBeenCalled();
   });
 
-  it('still mounts access gating when the badge widget throws', async () => {
-    mockFetchRemoteConfig.mockResolvedValue({
-      monitoring: true,
-      sessionReplay: false,
-      badge: true,
-      gatingEnabled: true,
-      allowedOrigin: null,
-    });
-    mockReadCachedGatingEnabled.mockReturnValue(true);
-    vi.mocked(startBadgeWidget).mockImplementationOnce(() => {
-      throw new Error('attachShadow is not available');
-    });
-    vi.mocked(check).mockReturnValueOnce(new Promise(() => {}));
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    init({ buildSlug: 'test-app' });
-
-    await vi.waitFor(() => {
-      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
-    });
-    expect(check).toHaveBeenCalledWith('test-app', 'https://api.bworlds.co');
-  });
 });
 
 describe('LaunchKitInstance', () => {
-  it('check() delegates to the check module', async () => {
-    const instance = init({ buildSlug: 'test-app', gate: false });
-    await instance.check();
-
-    expect(check).toHaveBeenCalledWith('test-app', 'https://api.bworlds.co');
-  });
-
-  it('getGateUrl() returns the correct URL', () => {
-    const instance = init({ buildSlug: 'my-app', gate: false });
-    expect(instance.getGateUrl()).toBe('https://app.bworlds.co/access/my-app');
-  });
-
-  it('getGateUrl() uses the gateOrigin override when provided', () => {
-    const instance = init({
-      buildSlug: 'my-app',
-      gateOrigin: 'http://localhost:3939',
-      gate: false,
-    });
-    expect(instance.getGateUrl()).toBe('http://localhost:3939/access/my-app');
-  });
-
-  it('getGateUrl() falls back to the default origin when gateOrigin is omitted on re-init', () => {
-    // After stop(), re-init with different config resets module state.
-    init({ buildSlug: 'my-app', gateOrigin: 'http://localhost:3939', gate: false });
-    stop();
-    vi.clearAllMocks();
-    const instance = init({ buildSlug: 'my-app', gate: false });
-    expect(instance.getGateUrl()).toBe('https://app.bworlds.co/access/my-app');
-  });
-
   it('stop() calls stopHeartbeat and stopErrorCapture', () => {
-    const instance = init({ buildSlug: 'test-app', gate: false });
+    const instance = init({ buildSlug: 'test-app' });
     vi.clearAllMocks(); // Clear calls from init
     instance.stop();
 
@@ -443,168 +430,11 @@ describe('LaunchKitInstance', () => {
 
 describe('top-level stop()', () => {
   it('calls stopHeartbeat and stopErrorCapture', () => {
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     vi.clearAllMocks(); // Clear calls from init
     stop();
 
     expect(stopHeartbeat).toHaveBeenCalled();
     expect(stopErrorCapture).toHaveBeenCalled();
-  });
-});
-
-describe('gate overlay', () => {
-  it('shows overlay during access check', async () => {
-    // Use a pending check so the overlay stays visible long enough to observe.
-    let resolveCheck!: (v: CheckResult) => void;
-    vi.mocked(check).mockReturnValueOnce(new Promise((r) => { resolveCheck = r; }));
-
-    init({ buildSlug: 'test-app' });
-
-    await vi.waitFor(() => {
-      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
-    });
-
-    // Resolve check -> overlay removed
-    resolveCheck({ valid: true, email: null, accessType: 'free', expiresAt: null, degraded: false });
-
-    await vi.waitFor(() => {
-      expect(document.getElementById('bworlds-gate-overlay')).toBeNull();
-    });
-  });
-
-  it('removes overlay when check returns valid', async () => {
-    // Use a pending check so we can observe the overlay before it's removed.
-    let resolveCheck!: (v: CheckResult) => void;
-    vi.mocked(check).mockReturnValueOnce(new Promise((r) => { resolveCheck = r; }));
-
-    init({ buildSlug: 'test-app' });
-
-    await vi.waitFor(() => {
-      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
-    });
-
-    resolveCheck({ valid: true, email: null, accessType: 'paid', expiresAt: null, degraded: false });
-
-    await vi.waitFor(() => {
-      expect(document.getElementById('bworlds-gate-overlay')).toBeNull();
-    });
-  });
-
-  it('keeps overlay when redirecting (invalid check)', async () => {
-    const hrefSetter = vi.fn();
-    Object.defineProperty(window, 'location', {
-      value: { href: 'http://localhost/' },
-      writable: true,
-      configurable: true,
-    });
-    Object.defineProperty(window.location, 'href', {
-      set: hrefSetter,
-      get: () => 'http://localhost/',
-      configurable: true,
-    });
-
-    vi.mocked(check).mockResolvedValueOnce({
-      valid: false, email: null, accessType: null, expiresAt: null, degraded: false,
-    });
-
-    init({ buildSlug: 'test-app' });
-
-    await vi.waitFor(() => {
-      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
-    });
-
-    await vi.waitFor(() => {
-      expect(hrefSetter).toHaveBeenCalledWith('https://app.bworlds.co/access/test-app');
-    });
-  });
-
-  it('built-in gate redirects to the gateOrigin override when provided', async () => {
-    const hrefSetter = vi.fn();
-    Object.defineProperty(window, 'location', {
-      value: { href: 'http://localhost/' },
-      writable: true,
-      configurable: true,
-    });
-    Object.defineProperty(window.location, 'href', {
-      set: hrefSetter,
-      get: () => 'http://localhost/',
-      configurable: true,
-    });
-
-    vi.mocked(check).mockResolvedValueOnce({
-      valid: false,
-      email: null,
-      accessType: null,
-      expiresAt: null,
-      degraded: false,
-    });
-
-    init({ buildSlug: 'test-app', gateOrigin: 'http://localhost:3939' });
-
-    await vi.waitFor(() => {
-      expect(hrefSetter).toHaveBeenCalledWith('http://localhost:3939/access/test-app');
-    });
-  });
-
-  it('does not show overlay when gate is disabled', async () => {
-    init({ buildSlug: 'test-app', gate: false });
-    await flushMicrotasks();
-    expect(document.getElementById('bworlds-gate-overlay')).toBeNull();
-  });
-
-  // -------------------------------------------------------------------------
-  // gating_enabled_skip_overlay: cached gatingEnabled=false suppresses overlay
-  // -------------------------------------------------------------------------
-
-  it('gating_enabled_skip_overlay: when cached gatingEnabled=false, init does not mount overlay', async () => {
-    // Cached gatingEnabled=false -> build is ungated -> overlay must NOT mount
-    mockReadCachedGatingEnabled.mockReturnValue(false);
-
-    init({ buildSlug: 'test-app' });
-    await flushMicrotasks();
-
-    // Overlay element must not exist in the DOM
-    expect(document.getElementById('bworlds-gate-overlay')).toBeNull();
-  });
-
-  it('gating_enabled_skip_overlay: when cached gatingEnabled=false, check() is not called', async () => {
-    // The validate-token call must be skipped entirely on the ungated path
-    mockReadCachedGatingEnabled.mockReturnValue(false);
-
-    init({ buildSlug: 'test-app' });
-    await flushMicrotasks();
-
-    // check() must not have been invoked (no validate-token call)
-    expect(check).not.toHaveBeenCalled();
-  });
-
-  it('gating_enabled_true_mounts_overlay: when cached gatingEnabled=true, init mounts overlay and calls check()', async () => {
-    // gatingEnabled=true (or cold cache default) -> overlay mounts and check() is called
-    mockReadCachedGatingEnabled.mockReturnValue(true);
-    // Use a pending check so overlay stays visible
-    vi.mocked(check).mockReturnValueOnce(new Promise(() => {}));
-
-    init({ buildSlug: 'test-app' });
-
-    // Overlay is created inside activateSubsystems (after async config fetch)
-    await vi.waitFor(() => {
-      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
-    });
-
-    // check() must be called exactly once
-    expect(check).toHaveBeenCalled();
-  });
-
-  it('cold_cache_mounts_overlay: cold cache (readCachedGatingEnabled=true) proceeds with overlay path', async () => {
-    // Cold cache returns true (fail-safe default) -> overlay mounts
-    mockReadCachedGatingEnabled.mockReturnValue(true);
-    // Use a pending check so overlay stays visible
-    vi.mocked(check).mockReturnValueOnce(new Promise(() => {}));
-
-    init({ buildSlug: 'test-app' });
-
-    await vi.waitFor(() => {
-      expect(document.getElementById('bworlds-gate-overlay')).toBeTruthy();
-    });
   });
 });
