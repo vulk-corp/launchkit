@@ -1,6 +1,5 @@
 /**
  * Tests for identify() API and UA first-chunk-only capture.
- * Slugs: sdk_identify_api, sdk_cookie_email_auto, sdk_ua_first_chunk_only
  */
 
 import { identify, _getIdentity } from '../src/index';
@@ -127,35 +126,6 @@ it('req_sdk_identify_api — identify() stores email/userId; first chunk payload
   const body = parseFetchBody(fetchMock.mock.calls[0]);
   expect(body.userEmail).toBe('alice@example.com');
   expect(body.userId).toBe('user_42');
-});
-
-// ---------------------------------------------------------------------------
-// test_req_sdk_cookie_email_auto
-// ---------------------------------------------------------------------------
-
-it('req_sdk_cookie_email_auto — email from bworlds_token cookie in first chunk', async () => {
-  function makeJwt(payload: Record<string, unknown>): string {
-    // Base64url encode without padding
-    const enc = (s: string) =>
-      btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-    const header = enc(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-    const claims = enc(JSON.stringify(payload));
-    return `${header}.${claims}.fakesig`;
-  }
-
-  const token = makeJwt({ email: 'cookie@example.com', buildSlug: BUILD_SLUG, accessType: 'full' });
-  Object.defineProperty(document, 'cookie', {
-    value: `bworlds_token=${token}`,
-    writable: true,
-    configurable: true,
-  });
-
-  await startReplay(BUILD_SLUG, API_ENDPOINT);
-  await triggerFlush();
-
-  expect(fetchMock).toHaveBeenCalled();
-  const body = parseFetchBody(fetchMock.mock.calls[0]);
-  expect(body.userEmail).toBe('cookie@example.com');
 });
 
 // ---------------------------------------------------------------------------

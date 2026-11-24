@@ -117,7 +117,6 @@ const RRWEB_MOUSE_FOCUS = 5;
 const RRWEB_MOUSE_BLUR = 6;
 const STORAGE_KEY = 'bworlds-replay-session';
 const BOOTSTRAP_STORAGE_KEY = 'bworlds-replay-bootstrap-chunk';
-const TOKEN_COOKIE = 'bworlds_token';
 // Wire contract with the backend distiller: it matches this custom event tag to
 // append SPA route changes to a session's pages_visited. Do not rename.
 const NAVIGATION_TAG = 'navigation';
@@ -981,50 +980,6 @@ function _resolveSession(): boolean {
   return true;
 }
 
-/** Read the bworlds_token cookie (set by check module after validation). */
-function _readToken(): string | null {
-  if (typeof document === 'undefined') return null;
-  const match = document.cookie.match(
-    new RegExp(`(?:^|;\\s*)${TOKEN_COOKIE}=([^;]+)`),
-  );
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-/** Decode a JWT payload without verifying the signature. Null when malformed. */
-function _decodeJwtPayload(token: string): Record<string, unknown> | null {
-  const parts = token.split('.');
-  if (parts.length !== 3) return null;
-  try {
-    const binary = atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'));
-    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-    return JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * The bworlds_token cookie and its email claim, but only when the JWT is bound
- * to the current build (its `buildSlug` claim equals `_buildSlug`).
- *
- * A bworlds_token issued for another build can share this app's cookie jar
- * (localhost ports in dev, or a parent-scoped cookie). Trusting it blindly would
- * stamp that build's user email onto this app's sessions; the server re-verifies
- * the signature, but only after the email has already shipped. The email claim is
- * read without verification, so the server still tags it 'sdk_unverified'.
- */
-function _readBuildBoundToken(): { token: string; email: string | null } | null {
-  const token = _readToken();
-  if (!token) return null;
-  const payload = _decodeJwtPayload(token);
-  if (!payload || payload['buildSlug'] !== _buildSlug) return null;
-  const email = payload['email'];
-  return {
-    token,
-    email: typeof email === 'string' && email.length > 0 ? email : null,
-  };
-}
-
 function _hasErrors(events: eventWithTime[]): boolean {
   if (!_EventType) return false;
   return events.some(
@@ -1057,16 +1012,7 @@ function _buildPayload(
   isFirstChunk: boolean,
   uploadMetadata?: ReplayUploadMetadata,
 ): Record<string, unknown> {
-  // Only a token bound to this build is trusted: a foreign bworlds_token sharing
-  // the cookie jar must not leak another build's user into this app's sessions.
-  const buildToken = _readBuildBoundToken();
-  const token = buildToken?.token ?? null;
-
-  // Identity: prefer explicitly set identity, fall back to the bound token email.
-  let { email, userId } = _getIdentity();
-  if (!email) {
-    email = buildToken?.email ?? null;
-  }
+  const { email, userId } = _getIdentity();
 
   // Sent on every chunk, identified or not. visitor-state.ts owns the rationale.
   const visitorId = getVisitorId();
@@ -1083,7 +1029,6 @@ function _buildPayload(
       transport: uploadMetadata.transport,
       rawBytes: uploadMetadata.rawBytes,
     }),
-    ...(token && { token }),
     events,
     hasErrors: _hasErrors(events),
     ...(visitorId && { visitorId }),
