@@ -1,25 +1,3 @@
-/**
- * Remote SDK config fetcher + localStorage SWR cache.
- *
- * Non-blocking: callers start the fetch and merge when it resolves.
- * Falls back silently on any error — local defaults always win on failure.
- *
- * Cache strategy (stale-while-revalidate):
- * - Synchronous read from localStorage on every init (cross-tab persistence).
- * - Background fetch fires unconditionally; response overwrites cache for next load.
- * - localStorage chosen over sessionStorage: cross-tab persistence is required so
- *   "no overlay on any refresh after the first-ever visit to a fresh tab" holds
- *   even when the user opens a new tab (sessionStorage is per-tab, so it would miss).
- *
- * gatingEnabled fail-safe polarity:
- * - Cold cache / parse error / no `gatingEnabled` field → return null → overlay mounts.
- * - Cached gatingEnabled === false → only then skip overlay (explicit opt-out).
- * - Any other value (true, undefined, missing) → overlay mounts (safe default).
- *
- * localStorage may throw SecurityError in Safari private mode. All access is wrapped
- * in try/catch; any failure is treated as a cache miss (overlay mounts).
- */
-
 import { fetchJsonWithTimeout } from './fetch-util';
 
 export interface SdkRemoteConfig {
@@ -28,11 +6,6 @@ export interface SdkRemoteConfig {
   uptimeMonitoring?: boolean;
   errorCapture?: boolean;
   badge: boolean;
-  /**
-   * When false, the build has no paid pricing — the overlay can be skipped on cache hit.
-   * Fail-safe: absent field is treated as true (overlay mounts).
-   */
-  gatingEnabled: boolean;
   /**
    * Origin derived from the build's registered URL (e.g. "https://myapp.com").
    * SDK compares this against `window.location.origin` to scope telemetry.
@@ -59,9 +32,16 @@ function readCache(buildSlug: string): SdkRemoteConfig | null {
     const raw = localStorage.getItem(cacheKey(buildSlug));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<SdkRemoteConfig>;
-    // Require gatingEnabled to be explicitly present and a boolean.
-    // Missing field → treat as cache miss so overlay mounts (fail-safe).
-    if (typeof parsed.gatingEnabled !== 'boolean') return null;
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      typeof parsed.sessionReplay !== 'boolean' ||
+      typeof parsed.monitoring !== 'boolean' ||
+      typeof parsed.badge !== 'boolean' ||
+      !(parsed.allowedOrigin === null || typeof parsed.allowedOrigin === 'string')
+    ) {
+      return null;
+    }
     return parsed as SdkRemoteConfig;
   } catch {
     // SecurityError (Safari private mode) or JSON parse failure → cache miss.
@@ -101,22 +81,4 @@ export async function fetchRemoteConfig(
     return cached;
   }
   return fetchAndCache;
-}
-
-/**
- * Read the cached gatingEnabled value synchronously.
- *
- * Returns false ONLY when the cache explicitly contains gatingEnabled=false.
- * Returns true (overlay should mount) on:
- *   - cache miss
- *   - parse error
- *   - missing gatingEnabled field
- *   - any localStorage error
- *
- * This is the fail-safe polarity: default to gating on, skip only on explicit false.
- */
-export function readCachedGatingEnabled(buildSlug: string): boolean {
-  const cached = readCache(buildSlug);
-  if (cached === null) return true; // cache miss → overlay mounts
-  return cached.gatingEnabled !== false; // explicit false → skip overlay; anything else → mount
 }

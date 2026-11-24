@@ -1,14 +1,8 @@
-/**
- * Tests for #702 — SDK origin-scope guard.
- *
- * Covers verification map rows: F1, F2, F3, F4, F5, F6, T2, T6.
- */
-
 import { init, stop } from '../src/index';
 import { configureSender } from '../src/telemetry-sender';
 import { startHeartbeat, stopHeartbeat } from '../src/heartbeat';
 import { startErrorCapture, stopErrorCapture } from '../src/error-capture';
-import { fetchRemoteConfig, readCachedGatingEnabled } from '../src/remote-config';
+import { fetchRemoteConfig } from '../src/remote-config';
 import { startBadgeWidget, stopBadgeWidget } from '../src/badge-widget';
 import type { SdkRemoteConfig } from '../src/remote-config';
 
@@ -27,10 +21,6 @@ vi.mock('../src/error-capture', () => ({
   stopErrorCapture: vi.fn(),
 }));
 
-vi.mock('../src/check', () => ({
-  check: vi.fn().mockResolvedValue({ valid: true, email: null, accessType: 'free', expiresAt: null, degraded: false }),
-}));
-
 vi.mock('../src/replay', () => ({
   startReplay: vi.fn().mockResolvedValue(undefined),
   stopReplay: vi.fn(),
@@ -38,7 +28,6 @@ vi.mock('../src/replay', () => ({
 
 vi.mock('../src/remote-config', () => ({
   fetchRemoteConfig: vi.fn().mockResolvedValue(null),
-  readCachedGatingEnabled: vi.fn().mockReturnValue(true),
 }));
 
 vi.mock('../src/badge-widget', () => ({
@@ -58,7 +47,6 @@ vi.mock('../src/supabase-identity-bridge', () => ({
 }));
 
 const mockFetchRemoteConfig = vi.mocked(fetchRemoteConfig);
-const mockReadCachedGatingEnabled = vi.mocked(readCachedGatingEnabled);
 
 /** Helper: create a full SdkRemoteConfig with all features on + given allowedOrigin. */
 function remoteConfig(allowedOrigin: string | null): SdkRemoteConfig {
@@ -66,7 +54,6 @@ function remoteConfig(allowedOrigin: string | null): SdkRemoteConfig {
     monitoring: true,
     sessionReplay: true,
     badge: true,
-    gatingEnabled: false,
     allowedOrigin,
   };
 }
@@ -82,9 +69,7 @@ const originalLocation = window.location;
 beforeEach(() => {
   stop();
   vi.clearAllMocks();
-  document.getElementById('bworlds-gate-overlay')?.remove();
   mockFetchRemoteConfig.mockResolvedValue(null);
-  mockReadCachedGatingEnabled.mockReturnValue(false);
   // Restore original location
   Object.defineProperty(window, 'location', {
     value: originalLocation,
@@ -106,7 +91,7 @@ describe('F1 — origin guard comparison', () => {
     });
     mockFetchRemoteConfig.mockResolvedValue(remoteConfig('https://my-app.com'));
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
@@ -120,7 +105,7 @@ describe('F1 — origin guard comparison', () => {
     });
     mockFetchRemoteConfig.mockResolvedValue(remoteConfig('https://my-app.com'));
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startHeartbeat).not.toHaveBeenCalled();
@@ -135,7 +120,7 @@ describe('F1 — origin guard comparison', () => {
     });
     mockFetchRemoteConfig.mockResolvedValue(remoteConfig(null));
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
@@ -157,19 +142,19 @@ describe('F2 — all subsystems off on mismatch', () => {
   });
 
   it('startHeartbeat is NOT called', async () => {
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
     expect(startHeartbeat).not.toHaveBeenCalled();
   });
 
   it('startErrorCapture is NOT called', async () => {
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
     expect(startErrorCapture).not.toHaveBeenCalled();
   });
 
   it('startBadgeWidget is NOT called even with badge: true', async () => {
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
     expect(startBadgeWidget).not.toHaveBeenCalled();
   });
@@ -191,7 +176,7 @@ describe('F3 — zero outbound requests after config fetch on mismatch', () => {
     // Track all fetch calls via the global mock
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response());
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     // fetchRemoteConfig is mocked, so no real fetch() calls from it.
@@ -218,7 +203,7 @@ describe('F4 — no console output on mismatch', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(warnSpy).not.toHaveBeenCalled();
@@ -242,7 +227,7 @@ describe('F5 — dev:true bypasses origin check', () => {
     });
     mockFetchRemoteConfig.mockResolvedValue(remoteConfig('https://production-app.com'));
 
-    init({ buildSlug: 'test-app', gate: false, dev: true });
+    init({ buildSlug: 'test-app', dev: true });
     await flushMicrotasks();
 
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
@@ -257,7 +242,7 @@ describe('F5 — dev:true bypasses origin check', () => {
     });
     mockFetchRemoteConfig.mockResolvedValue(remoteConfig('https://production-app.com'));
 
-    init({ buildSlug: 'test-app', gate: false, dev: true });
+    init({ buildSlug: 'test-app', dev: true });
     await flushMicrotasks();
 
     expect(startBadgeWidget).toHaveBeenCalled();
@@ -279,7 +264,7 @@ describe('F6 — badge not mounted on mismatch', () => {
     config.badge = true;
     mockFetchRemoteConfig.mockResolvedValue(config);
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startBadgeWidget).not.toHaveBeenCalled();
@@ -301,7 +286,7 @@ describe('T2 — strict origin equality', () => {
     });
     mockFetchRemoteConfig.mockResolvedValue(remoteConfig('https://example.com:443'));
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     // Strict equality: "https://example.com" !== "https://example.com:443"
@@ -316,7 +301,7 @@ describe('T2 — strict origin equality', () => {
     });
     mockFetchRemoteConfig.mockResolvedValue(remoteConfig('https://example.com'));
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startHeartbeat).not.toHaveBeenCalled();
@@ -330,7 +315,7 @@ describe('T2 — strict origin equality', () => {
     });
     mockFetchRemoteConfig.mockResolvedValue(remoteConfig('https://example.com'));
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startHeartbeat).toHaveBeenCalled();
@@ -344,7 +329,7 @@ describe('T2 — strict origin equality', () => {
     });
     mockFetchRemoteConfig.mockResolvedValue(remoteConfig('https://www.example.com'));
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startHeartbeat).toHaveBeenCalled();
@@ -358,7 +343,7 @@ describe('T2 — strict origin equality', () => {
     });
     mockFetchRemoteConfig.mockResolvedValue(remoteConfig('https://example.com'));
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startHeartbeat).toHaveBeenCalled();
@@ -379,7 +364,7 @@ describe('T6 — subsystems deferred until after origin check', () => {
     mockFetchRemoteConfig.mockResolvedValue(remoteConfig('https://my-app.com'));
 
     // Call init but do NOT await flushMicrotasks
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
 
     // Subsystems should NOT have been called yet — they're deferred to after
     // the config fetch promise resolves.
@@ -396,7 +381,7 @@ describe('T6 — subsystems deferred until after origin check', () => {
     });
     mockFetchRemoteConfig.mockResolvedValue(remoteConfig('https://my-app.com'));
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
 
     // Before flush: nothing started
     expect(startHeartbeat).not.toHaveBeenCalled();
@@ -422,8 +407,8 @@ describe('risk-driven: double-init guard', () => {
 
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    init({ buildSlug: 'test-app', gate: false });
-    init({ buildSlug: 'test-app', gate: false }); // second call
+    init({ buildSlug: 'test-app' });
+    init({ buildSlug: 'test-app' }); // second call
 
     await flushMicrotasks();
 
@@ -439,7 +424,7 @@ describe('risk-driven: empty buildSlug', () => {
   it('init() with empty string buildSlug warns and does not start', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    init({ buildSlug: '', gate: false });
+    init({ buildSlug: '' });
     await flushMicrotasks();
 
     expect(warnSpy).toHaveBeenCalledWith(
@@ -455,7 +440,7 @@ describe('risk-driven: config fetch failure (fail-open)', () => {
   it('activates all subsystems when fetchRemoteConfig returns null', async () => {
     mockFetchRemoteConfig.mockResolvedValue(null);
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
@@ -465,7 +450,7 @@ describe('risk-driven: config fetch failure (fail-open)', () => {
   it('activates all subsystems when fetchRemoteConfig rejects', async () => {
     mockFetchRemoteConfig.mockRejectedValue(new Error('Network timeout'));
 
-    init({ buildSlug: 'test-app', gate: false });
+    init({ buildSlug: 'test-app' });
     await flushMicrotasks();
 
     expect(startHeartbeat).toHaveBeenCalledWith('test-app');
